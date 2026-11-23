@@ -250,6 +250,40 @@ def stage(src: str, home: pathlib.Path) -> str:
     return provenance
 
 
+# Account material the CLI and tools write into a staged HOME during a run.
+# A retained run dir is read by reviewers, so it must not keep these.
+HOME_SECRETS = (".claude/backups", ".ssh", ".codex")
+
+
+def scrub_home(home: pathlib.Path) -> None:
+    """Strip a finished run's HOME of account material and of links out of
+    the run dir, keeping the rest (ledgers, notes, transcripts) for review.
+
+    Runs after check.sh, which may still need all of it. Read denies cannot
+    stand in for this: Bash reads past them, and a run dir can sit anywhere.
+    """
+    for rel in LINKS:
+        if (home / rel).is_symlink():
+            (home / rel).unlink()
+    for p in home.glob(".claude.json*"):
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    for rel in HOME_SECRETS:
+        p = home / rel
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p)
+    run = home.parent.resolve()
+    for dirpath, dirnames, filenames in os.walk(home):
+        for name in dirnames + filenames:
+            p = pathlib.Path(dirpath) / name
+            if p.is_symlink() and not p.resolve().is_relative_to(run):
+                p.unlink()
+
+
 def path_guard() -> list[str]:
     """Bind every directory on the harness's own PATH read-only.
 
@@ -418,6 +452,17 @@ def result_event(events: list[dict]) -> dict:
 
 def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             out: pathlib.Path, args) -> dict:
+    """One run, its HOME scrubbed on every way out once check.sh is done."""
+    try:
+        return _run_one(scenario, arm, src, idx, out, args)
+    finally:
+        home = out / arm / str(idx) / "home"
+        if home.is_dir():
+            scrub_home(home)
+
+
+def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
+             out: pathlib.Path, args) -> dict:
     run = out / arm / str(idx)
     cid = config_id(src)
     key = cid and f"{cid}:{scenario_id(scenario)}"

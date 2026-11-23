@@ -264,6 +264,51 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
     assert verdicts[0]["verdict"] == "INCONCLUSIVE"
 
 
+_SECRETS = (".claude.json", ".claude.json.backup", ".claude/backups/.claude.json.backup.1",
+            ".ssh/id_x", ".codex/auth.json")
+
+
+def _assert_home_scrubbed(home: pathlib.Path):
+    left = [rel for rel in _SECRETS if (home / rel).exists()]
+    assert not left, f"retained after the run: {left}"
+    run = home.parent.resolve()
+    links = [str(p.relative_to(home)) for p in home.rglob("*")
+             if p.is_symlink() and not p.resolve().is_relative_to(run)]
+    assert not links, f"links out of the run dir retained: {links}"
+
+
+def test_retained_home_is_scrubbed_after_check_but_state_survives(tmp_path):
+    # A retained run dir is read by reviewers under a broad Read allow, and its
+    # staged HOME carries links into the real HOME plus account files the CLI
+    # writes there. check.sh must still see them; nothing after it may.
+    _require_sandbox()
+    writes = "\n".join(f'mkdir -p "$(dirname "$HOME/{rel}")"; echo s > "$HOME/{rel}"'
+                       for rel in _SECRETS)
+    claude = fake_claude(tmp_path, f"""{writes}
+mkdir -p "$HOME/.local/state/n"; echo row > "$HOME/.local/state/n/ledger.tsv"
+cat <<'EOF'
+{stream("ok", [])}
+EOF
+""")
+    checks = " && ".join(f'test -f "$1/home/{rel}"' for rel in _SECRETS)
+    sc = _scenario(tmp_path, checks)
+    r, out, verdicts = _run(tmp_path, sc, claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
+    home = out / "sc/new/1/home"
+    _assert_home_scrubbed(home)
+    assert (home / ".local/state/n/ledger.tsv").read_text() == "row\n"
+    assert (home / ".claude/CLAUDE.md").is_file()
+
+
+def test_home_is_scrubbed_when_setup_fails(tmp_path):
+    claude = fake_claude(tmp_path, "exit 0\n")
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "setup.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    _, out, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE"
+    _assert_home_scrubbed(out / "sc/new/1/home")
+
+
 def test_finished_runs_are_not_re_spent(tmp_path):
     _require_sandbox()
     # Inside the run dir: the only path a sandboxed run can write that outlives it.
