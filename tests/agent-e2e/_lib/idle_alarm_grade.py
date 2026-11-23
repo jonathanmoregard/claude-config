@@ -37,7 +37,13 @@ ids |= {p.name.removeprefix("agent-").removesuffix(".jsonl")
         for p in (run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")}
 armed = any(re.search(rf"wait-for agent {re.escape(i)}\b", commands) for i in ids)
 print(f"agent_ids={sorted(ids)}")
-stalled_seen = re.search(r"agent [A-Za-z0-9]+ stalled: no activity", transcript) is not None
+# The parent saw the alarm: it read the waiter's line, or (when it learned of
+# exit 5 from the task notification alone, which carries no stdout) its final
+# reply names the alarm.
+final_path = run / "final.txt"
+final = final_path.read_text(errors="replace") if final_path.exists() else ""
+stalled_seen = re.search(r"agent [A-Za-z0-9]+ stalled: no activity", transcript) is not None \
+    or re.search(r"\bexit(?:ed)?(?: code)?:? 5\b|idle alarm (?:fired|went off)|alarm fired", final, re.I) is not None
 fired = "stalled" in notify
 
 
