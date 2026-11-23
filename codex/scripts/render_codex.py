@@ -649,7 +649,7 @@ precedence.
 Codex mappings:
 - `CLAUDE.md` global instructions map to this `AGENTS.md`.
 - Skills, commands, agents, plugins, MCP servers, and compatible hooks are
-  rendered through `ai-client-config`.
+  rendered by the renderer under `codex/` in the claude-config repo.
 
 Git boundary:
 - Native read-only Git is allowed only with `GIT_OPTIONAL_LOCKS=0`.

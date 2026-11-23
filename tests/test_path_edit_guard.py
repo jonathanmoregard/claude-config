@@ -93,8 +93,9 @@ def assert_codex_denied(payload):
     assert hso["permissionDecision"] == "deny"
     reason = hso["permissionDecisionReason"]
     assert "~/.claude" in reason
-    assert "codex/" in reason
+    assert "codex/ in the config repo ~/Repos/claude-config" in reason
     assert "ai-client-config-codex-sync.service" in reason
+    assert "ai-client-config repo" not in reason
     return reason
 
 

@@ -110,7 +110,7 @@ CODEX_REASON = (
     "Refused: {rel} is under live ~/.codex. Agents must not hand-edit Codex "
     "configuration or runtime state. Change shared configuration through the "
     "~/.claude worktree/PR flow; change Codex-specific rendering under codex/ "
-    "in the same config repo, by the same flow. Let "
+    "in the config repo ~/Repos/claude-config, by the same flow. Let "
     "ai-client-config-codex-sync.service "
     "publish generated output."
 )
