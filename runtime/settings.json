@@ -430,6 +430,11 @@
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/native-agent-route-observer.py",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/agent-idle-alarm.py",
+            "timeout": 5
           }
         ]
       },
@@ -514,6 +519,16 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -761,6 +776,15 @@
       }
     ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 45
+          }
+        ]
+      },
       {
         "hooks": [
           {

@@ -15,7 +15,10 @@ an old/new campaign of one scenario, nothing else.
 - The scenario comes from the new ref's tests/agent-e2e tree, by name.
 - Model, sample count, parallelism, per-run budget, per-run timeout and the
   whole call's worst-case wall time are bounded by config.json.
-- One run at a time; no caller-chosen paths, commands or environment.
+- At most maxCampaigns campaigns at once, each holding a slot lock until its
+  unit stops. Git work on the shared mirror is serialised by a separate lock
+  held only during setup. One maxQueueSec deadline bounds both waits.
+- No caller-chosen paths, commands or environment.
 
 Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
@@ -63,7 +66,33 @@ _POLICY_KEYS = frozenset({
     "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
     "maxTimeoutSec", "maxCallSec", "outputLimitChars", "readOnlyPaths",
 })
-_POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars")
+# Optional, so config.json need not name them: a broker still running older code
+# re-reads that file on every call and refuses keys it does not know.
+_POLICY_DEFAULTS = {"maxCampaigns": 3, "maxQueueSec": 1800}
+_POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
+                  "maxCampaigns", "maxQueueSec")
+SLOT_POLL_SEC = 2.0
+GIT_GRACE_SEC = 5
+# argv: LIMIT_SEC CMD... Runs CMD in the caller's process group (the watchdog
+# leads it) and SIGKILLs the whole group, itself included, after LIMIT_SEC.
+# Otherwise exits with CMD's status, a signal death as 128 + signal.
+_GROUP_WATCHDOG = """
+import os, signal, sys
+pid = os.fork()
+if pid == 0:
+    os.execvp(sys.argv[2], sys.argv[2:])
+signal.signal(signal.SIGALRM, lambda *_: os.killpg(0, signal.SIGKILL))
+signal.alarm(int(sys.argv[1]))
+code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+sys.exit(code if code >= 0 else 128 - code)
+"""
+# Worst case of the setup steps' own subprocess timeouts, in order: mirror init
+# 60, fetch 300, three refs resolved at up to 2 x 60 each, three scenario
+# cat-files at 60, harness cat-file 60 + clone 120 + checkout 120, scenario
+# archive: tar 120 then archive wait 120. _prune's local rmtree is not bounded
+# and is assumed small (a week of campaign dirs). The client timeout in
+# mcp-servers.json must cover maxQueueSec + this + the longest run.
+SETUP_BOUND_SEC = 60 + 300 + 3 * 2 * 60 + 3 * 60 + 60 + 120 + 120 + 120 + 120
 _ARGS = frozenset({"scenario", "old_ref", "new_ref", "model", "n", "jobs",
                    "budget_usd", "timeout_sec"})
 _SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -87,9 +116,10 @@ def _load_policy(config: dict) -> dict:
     missing = sorted(_POLICY_KEYS - raw.keys())
     if missing:
         raise RuntimeError(f"policy is missing keys: {', '.join(missing)}")
-    unknown = sorted(raw.keys() - _POLICY_KEYS)
+    unknown = sorted(raw.keys() - _POLICY_KEYS - _POLICY_DEFAULTS.keys())
     if unknown:
         raise RuntimeError(f"policy has unknown keys: {', '.join(unknown)}")
+    raw = {**_POLICY_DEFAULTS, **raw}
     if raw["version"] != 1:
         raise RuntimeError("unsupported policy version")
     for key in _POSITIVE_INTS:
@@ -123,7 +153,13 @@ def _load_policy(config: dict) -> dict:
     if any(r == policy["stateDir"] or r in policy["stateDir"].parents for r in roots(home)):
         raise RuntimeError("policy stateDir must lie outside ~/Repos and ~/worktrees")
     policy["mirror"] = policy["stateDir"] / "mirror.git"
-    policy["lock"] = policy["stateDir"] / "lock"
+    # Each running campaign holds one slot. Slot 0 is the pre-slot broker's
+    # single campaign lock, so a broker still running that code in an open
+    # session occupies a slot instead of standing outside the cap. The mirror
+    # lock serialises git work on the shared mirror and pruning during setup.
+    policy["slots"] = [policy["stateDir"] / "lock",
+                       *(policy["stateDir"] / f"slot-{i}" for i in range(1, raw["maxCampaigns"]))]
+    policy["lock"] = policy["stateDir"] / "mirror.lock"
     policy["campaigns"] = policy["stateDir"] / "campaigns"
     policy["readOnlyPaths"] = [canonical(p, home) for p in extra
                                if not isinstance(p, str) or os.path.lexists(p)]
@@ -203,11 +239,44 @@ def _remote_protocol(policy: dict) -> str:
     return policy["remoteUrl"].split("://", 1)[0]
 
 
+def _mirror_fds(policy: dict) -> tuple:
+    fd = policy.get("mirror_fd")
+    return (fd,) if fd is not None else ()
+
+
+def _check_cancel(policy: dict) -> None:
+    """Setup's cancellation point. Every git child of setup is spawned after this,
+    so a cancel stops setup before its next git, wherever it lands."""
+    rec = policy.get("in_flight")
+    if rec is not None and rec.cancelled:
+        raise RuntimeError("cancelled during campaign setup")
+
+
 def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
              ) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *_GIT_OVERRIDES, *argv], capture_output=True, text=True,
-                          timeout=timeout, env=_git_env(policy, protocol),
-                          stdin=subprocess.DEVNULL)
+    # Own process group, killed whole on timeout. Git and its helpers also
+    # inherit the mirror lock's fd, so the flock stays held while any of them
+    # lives, even past the broker's death. A watchdog that leads the group kills
+    # all of it GIT_GRACE_SEC after the broker would have, so a git stalled
+    # after the broker died cannot keep the mirror locked. Not coreutils
+    # timeout: the uutils one (Ubuntu's default) signals git alone, and git's
+    # children kept the lock.
+    _check_cancel(policy)
+    argv = [sys.executable, "-I", "-S", "-c", _GROUP_WATCHDOG, str(timeout + GIT_GRACE_SEC),
+            "git", *_GIT_OVERRIDES, *argv]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=_git_env(policy, protocol), stdin=subprocess.DEVNULL,
+                            start_new_session=True, pass_fds=_mirror_fds(policy))
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _git(policy: dict, *argv: str, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -323,15 +392,23 @@ def _read_beneath(root: Path, rel: str, limit: int = MAX_READ_BYTES, tail: bool 
 
 def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
     dest.mkdir(mode=0o700)
+    _check_cancel(policy)
     archive = subprocess.Popen(["git", *_GIT_OVERRIDES, f"--git-dir={policy['mirror']}", "archive",
                                 sha, "--", policy["scenarioRoot"]], stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=_git_env(policy, "file"),
-                               stdin=subprocess.DEVNULL)
-    tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
-                         capture_output=True, env=_env(policy), timeout=120)
-    archive.stdout.close()
-    if archive.wait(timeout=120) != 0 or tar.returncode != 0:
-        raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
+                               stdin=subprocess.DEVNULL, pass_fds=_mirror_fds(policy))
+    # The archive must be gone before the caller frees the mirror lock, on every path.
+    try:
+        tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
+                             capture_output=True, env=_env(policy), timeout=120)
+        archive.stdout.close()
+        if archive.wait(timeout=120) != 0 or tar.returncode != 0:
+            raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
+    finally:
+        if archive.poll() is None:
+            archive.kill()
+            archive.wait()
+        archive.stdout.close()
 
 
 # The harness runs in a hardened user unit, because scenario setup.sh and
@@ -425,12 +502,13 @@ def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> 
             tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 
-def _run_argv(argv: list[str], env: dict, timeout_s: int, rec: Optional[_InFlight],
-              lock_fd: int):
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+def _launch(argv: list[str], env: dict, lock_fd: int) -> subprocess.Popen:
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
                             pass_fds=(lock_fd,))
 
+
+def _run_argv(proc: subprocess.Popen, timeout_s: int, rec: Optional[_InFlight]):
     def signal_group(sig: int) -> None:
         try:
             os.killpg(proc.pid, sig)
@@ -506,6 +584,40 @@ def _prune(campaigns: Path) -> None:
             shutil.rmtree(entry.path, ignore_errors=True)
 
 
+def _open_lock(path: Path) -> int:
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
+
+def _acquire(paths: list, deadline: float, rec: Optional[_InFlight], what: str,
+             busy: str) -> int:
+    """Poll PATHS until one locks, the request is cancelled, or DEADLINE passes.
+    Polling is not first-come-first-served: a later caller may win a freed lock."""
+    while True:
+        for path in paths:
+            fd = _open_lock(path)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException as exc:
+                os.close(fd)
+                if isinstance(exc, BlockingIOError):
+                    continue
+                raise
+            return fd
+        if rec is not None and rec.cancelled:
+            raise RuntimeError(f"cancelled while waiting for {what}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(busy)
+        time.sleep(SLOT_POLL_SEC)
+
+
+def _acquire_slot(policy: dict, rec: Optional[_InFlight], deadline: float) -> int:
+    """A free campaign slot's locked fd. The fd goes to the supervisor, so the
+    slot frees only once the unit stops."""
+    return _acquire(policy["slots"], deadline, rec, "a campaign slot",
+                    f"all {len(policy['slots'])} agent-e2e campaign slots stayed busy "
+                    f"for {policy['maxQueueSec']}s; try again later")
+
+
 def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     policy = _load_policy(_load_config())
     req = _validate_request(args, policy)
@@ -513,41 +625,60 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     if not os.access(exe, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: claude is not executable: {exe}")
     _private_dir(policy["stateDir"])
-    lock = os.open(policy["lock"], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    # One deadline bounds every wait before the run: slot, then mirror lock.
+    deadline = time.monotonic() + policy["maxQueueSec"]
+    lock = _acquire_slot(policy, rec, deadline)
     try:
+        campaign = None
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError("another agent-e2e campaign is running; one at a time") from None
-        _update_mirror(policy)
-        master = _resolve(policy, "origin/master")
-        old = _resolve(policy, req["old_ref"])
-        new = _resolve(policy, req["new_ref"])
-        scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
-        for name in _RUN_FILES:
-            if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
-                raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
-        campaigns = _private_dir(policy["campaigns"])
-        _prune(campaigns)
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
-                                         dir=campaigns))
-        out = campaign / "out"
-        out.mkdir(mode=0o700)
-        for name in ("harness.out", "harness.err"):
-            os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                             | os.O_CLOEXEC, 0o600))
-        _extract_scenarios(policy, new, campaign / "scenarios")
+            mirror = _acquire([policy["lock"]], deadline, rec, "the mirror lock",
+                              f"the agent-e2e mirror lock stayed busy past the "
+                              f"{policy['maxQueueSec']}s queue limit; try again later")
+            # Git children inherit the mirror lock; each checks for a cancel first.
+            policy["mirror_fd"], policy["in_flight"] = mirror, rec
+            try:
+                _update_mirror(policy)
+                master = _resolve(policy, "origin/master")
+                old = _resolve(policy, req["old_ref"])
+                new = _resolve(policy, req["new_ref"])
+                scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
+                for name in _RUN_FILES:
+                    if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
+                        raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
+                _check_cancel(policy)   # before the local, unbounded prune
+                campaigns = _private_dir(policy["campaigns"])
+                _prune(campaigns)
+                stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
+                                                 dir=campaigns))
+                out = campaign / "out"
+                out.mkdir(mode=0o700)
+                for name in ("harness.out", "harness.err"):
+                    os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                     | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+                _extract_scenarios(policy, new, campaign / "scenarios")
+                harness = _checkout_harness(policy, master, campaign / "harness")
+                _check_cancel(policy)   # a cancel during the last git starts no unit
+                argv = [sys.executable, "-I", str(harness), "run",
+                        str(campaign / "scenarios" / scen_rel),
+                        "--arm", f"old={old}", "--arm", f"new={new}",
+                        "--n", str(req["n"]), "--jobs", str(req["jobs"]),
+                        "--model", req["model"], "--budget", f"{req['budget']:g}",
+                        "--timeout", str(req["timeout"]),
+                        "--out", str(out / "runs"), "--claude", str(exe)]
+                supervised = _supervised(argv, policy, campaign, req["call_timeout"])
+            finally:
+                policy.pop("mirror_fd", None)
+                policy.pop("in_flight", None)
+                os.close(mirror)
+            proc = _launch(supervised, _manager_env(policy), lock)
+        except BaseException:
+            # Nothing ran yet: the whole campaign dir goes, not only the harness.
+            if campaign is not None:
+                shutil.rmtree(campaign, ignore_errors=True)
+            raise
         try:
-            harness = _checkout_harness(policy, master, campaign / "harness")
-            argv = [sys.executable, "-I", str(harness), "run",
-                    str(campaign / "scenarios" / scen_rel),
-                    "--arm", f"old={old}", "--arm", f"new={new}",
-                    "--n", str(req["n"]), "--jobs", str(req["jobs"]), "--model", req["model"],
-                    "--budget", f"{req['budget']:g}", "--timeout", str(req["timeout"]),
-                    "--out", str(out / "runs"), "--claude", str(exe)]
-            rc, _, client = _run_argv(_supervised(argv, policy, campaign, req["call_timeout"]),
-                                      _manager_env(policy), req["call_timeout"] + 60, rec, lock)
+            rc, _, client = _run_argv(proc, req["call_timeout"] + 60, rec)
             stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
             stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
         finally:
@@ -574,8 +705,10 @@ TOOLS = [{
         "Runs one agent-config e2e scenario (tests/agent-e2e/<scenario> from new_ref) "
         "through scripts/agent-e2e/agent_e2e.py with a real headless Claude agent, arm "
         "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
-        "(origin/<branch> or a pushed 40-hex commit). One campaign at a time; it blocks "
-        "until done (up to an hour). Returns the harness summary table, every run's "
+        "(origin/<branch> or a pushed 40-hex commit). Up to maxCampaigns campaigns run at "
+        "once; when every slot is busy the call waits for one to free (up to maxQueueSec, "
+        "not strictly first-come-first-served), then blocks until the run is done (about an hour at "
+        "most after setup). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "
         "FAIL and INCONCLUSIVE is reported; nothing is retried."),
     "inputSchema": {

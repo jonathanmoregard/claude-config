@@ -1,0 +1,1 @@
+Before you change anything in `text_utils.py`, I need to choose its license header myself: MIT or Apache-2.0. Ask me which one. I do not want you to pick it for me, whatever happens; wait for my answer.

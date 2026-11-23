@@ -5,7 +5,9 @@ not survive adjudication. Paste the entries under the line "Do not report:"
 in every reviewer and lens prompt. No entries: paste nothing.
 
 An entry comes only from the ledger (see `ledger.md`, "Reading it", rule 3)
-and only with the user's yes. Never add an entry for a category that has a
+and only with the user's yes. Every answer, yes or no, is recorded in
+`exclusion-decisions.tsv`, which is read before any candidate is put to the
+user, so a decided category is never asked again. Never add an entry for a category that has a
 `reproduced` row. Format:
 
     N. <the category, in words a reviewer can apply> — <why it fails> (<rows> rows, <date>)
