@@ -1076,7 +1076,7 @@
     }
   },
   "sandbox": {
-    "enabled": false,
+    "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
