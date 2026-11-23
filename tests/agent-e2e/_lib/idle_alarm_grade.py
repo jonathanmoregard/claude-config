@@ -35,18 +35,18 @@ import sys
 
 
 def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
+    notify_path = run / "notify.log"
+    # The alarm is the waiter's exit 5; the stall toast is a regression in any
+    # mode, so it is checked before every other verdict. Other hooks' toasts
+    # (harness-tripwire) land in the same stub log and are not this scenario's
+    # business, so match the stall toast's title.
+    if notify_path.exists() and \
+            "Background agent stalled" in notify_path.read_text(errors="replace"):
+        return 1, "stall toast sent (notify.log has 'Background agent stalled')"
     try:
         transcript = (run / "transcript.jsonl").read_text(errors="replace")
     except OSError:
         return 2, "no transcript"
-    notify_path = run / "notify.log"
-    # The alarm is the waiter's exit 5; the stall toast is a regression in any
-    # mode. Other hooks' toasts (harness-tripwire) land in the same stub log
-    # and are not this scenario's business, so match the stall toast's title.
-    toasted = notify_path.exists() and \
-        "Background agent stalled" in notify_path.read_text(errors="replace")
-    if toasted:
-        return 1, "stall toast sent (notify.log has 'Background agent stalled')"
 
     events = []
     for line in transcript.splitlines():
@@ -132,7 +132,7 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
     stopped_after = any(watches.get(t) in done_at and n > done_at[watches[t]]
                         for t, n in parent_kills.items())
 
-    summary = (f"agent_ids={sorted(ids)} waiters={sorted(waiters)} toast={toasted} "
+    summary = (f"agent_ids={sorted(ids)} waiters={sorted(waiters)} "
                f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
                f"system_stopped={sorted(system_stopped)} live={live} other_exits={broken}")
     armed = bool(waiters)
@@ -143,7 +143,8 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
     if mode == "stall":
         if armed and seen:
             return 0, summary
-        if armed and system_stopped and not broken and not parent_kills:
+        fired = any(code == 5 for _, _, code in exits)
+        if armed and not fired and system_stopped and not broken and not parent_kills:
             # Claude Code stopped the waiter before it could fire: a resource
             # result of the headless run, not a verdict.
             return 2, summary + " (waiter stopped by Claude Code before the alarm)"

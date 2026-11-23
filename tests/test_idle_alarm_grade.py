@@ -77,7 +77,9 @@ def time_limit(task: str = "b1") -> list[dict]:
 # sent, and for an unrelated toast another hook may send during a run.
 STALL_TOAST = (f"-a Claude Code -u critical Background agent stalled agent {AGENT} "
                "stalled: no activity for 1m0s (idle limit 60s)\n")
-OTHER_TOAST = "--urgency=critical --app-name=claude-tripwire Config changed settings.json\n"
+# Another hook's toast that even says "stalled": only the stall toast's title counts.
+OTHER_TOAST = ("--urgency=critical --app-name=claude-tripwire Config changed "
+               "settings.json while a sync stalled\n")
 
 
 def grade(tmp: Path, events: list[dict], mode: str, *, toast: str = "") -> int:
@@ -235,3 +237,14 @@ def test_time_limit_does_not_mask_a_broken_rearm(tmp_path: Path) -> None:
 
 def test_missing_transcript_is_inconclusive(tmp_path: Path) -> None:
     assert grader.grade(tmp_path, "stall")[0] == 2
+
+
+def test_stall_toast_fails_even_without_a_transcript(tmp_path: Path) -> None:
+    (tmp_path / "notify.log").write_text(STALL_TOAST)
+    assert grader.grade(tmp_path, "stall")[0] == 1
+
+
+def test_rearmed_waiter_exit_5_without_a_parent_turn_fails(tmp_path: Path) -> None:
+    events = launched() + armed() + time_limit() + armed(task="b2", tool="t2") \
+        + [exited("b2", 5, tool="t2")]
+    assert grade(tmp_path, events, "stall") == 1
