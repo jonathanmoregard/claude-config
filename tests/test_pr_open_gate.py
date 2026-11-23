@@ -441,6 +441,38 @@ def test_present_file_with_a_non_utf8_name_still_needs_a_read(sb):
     assert is_deny(out) and "scripts/caf" in reason(out)
 
 
+def test_present_file_with_a_leading_space_still_needs_a_read(sb):
+    # ' x.sh' sorts first in the tip listing, where output stripping once
+    # turned it into 'x.sh' and so passed it for deleted (reproduced).
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit(" x.sh", "".join(f"echo {i}\n" for i in range(40)))
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and " x.sh" in reason(out)
+
+
+def test_tip_listing_failing_inside_the_gate_excuses_nothing(sb, monkeypatch):
+    # Through the real hook: git refuses the tip listing, so the deleted
+    # file is not excused and its missing Read is named.
+    old = _old_script_on_main(sb)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    real = subprocess.run(["sh", "-c", "command -v git"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    shim = sb.tmp / "shim"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do [ "$a" = ls-tree ] && exit 128; done\n'
+        f'exec {real} "$@"\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    out = sb.gate()
+    assert is_deny(out) and old in reason(out)
+
+
 def test_file_replaced_by_a_directory_counts_as_deleted(sb):
     old = _old_script_on_main(sb)
     git(sb.work, "rm", "-q", old)

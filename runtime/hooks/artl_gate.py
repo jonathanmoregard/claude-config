@@ -1079,9 +1079,14 @@ def paths_at_tip(top: str, tip: str) -> set[str] | None:
     """Every file path at TIP, or None when git cannot say. One listing,
     matched literally by the caller: no pathspec is parsed (a file named
     ':x' once passed for deleted), and names are decoded exactly as numstat
-    decodes them, so a non-UTF-8 name still matches itself."""
-    out = git(top, "ls-tree", "-r", "-z", "--name-only", "--full-tree", tip)
-    return None if out is None else set(filter(None, out.split("\0")))
+    decodes them, so a non-UTF-8 name still matches itself. Full entries,
+    not --name-only: git() strips its output, which ate the leading space of
+    a first-listed ' x.sh'; an entry opens with its mode, which strip cannot
+    touch, and the name follows the tab untouched."""
+    out = git(top, "ls-tree", "-r", "-z", "--full-tree", tip)
+    if out is None:
+        return None
+    return {entry.split("\t", 1)[1] for entry in out.split("\0") if "\t" in entry}
 
 
 def _shown(paths: list[str]) -> str:
