@@ -28,8 +28,23 @@
 #   wait-for job <slug> [--timeout <s>] -- <cmd> [args...]
 #                                          launch once as a retained user unit,
 #                                          or adopt its recorded run, then wait
+#   wait-for agent <agent-id> [--idle <s>] a background subagent went quiet (5):
+#                                          neither its transcript nor its meta
+#                                          file changed for --idle seconds
+#                                          (default $WAIT_FOR_AGENT_IDLE or 7200)
 #   common: --timeout <seconds> (default 3600; job default 14400 so a
-#                                          90-minute job does not time out)
+#                                          90-minute job does not time out;
+#                                          agent default 86400, 24 h)
+#
+# `agent` finds the subagent's agent-<id>.jsonl and agent-<id>.meta.json under
+# ~/.claude/projects/*/*/subagents/ and only compares their modification times
+# with now; it never reads their contents and has no "finished" exit. It exits 5
+# when both are older than the idle limit (the agent stalled, or ended its turn
+# waiting on something; a long silent job gives a false alarm by design), after
+# a desktop notification so the stall is seen even when the parent session is
+# gone. The parent stops the waiter (TaskStop) once it has the agent's result.
+# Exit 3 when no transcript appears within 120 s or it disappears; 64 for a bad
+# id or idle limit; 124 when --timeout (default 86400) passes first.
 #
 # A retained unit keeps its result AND its name: `job` adopts it rather than
 # relaunching, so a deliberate rerun of the same slug needs `systemctl --user
@@ -44,7 +59,7 @@
 # Exit: 0 settled fine · 1 settled badly (failed check/run/unit) ·
 #       2 settled but not mergeable (conflict) or PR closed unmerged ·
 #       3 settled, but its outcome could not be read · 124 timed out ·
-#       64 usage error.
+#       5 agent stalled (quiet) · 64 usage error.
 # Exit 3 includes a PR whose checks never reported at all: "no checks" is not
 # a pass, so re-run the wait rather than reading 3 as green.
 # The waiting inside is a loop on purpose: it runs detached in one background
@@ -60,7 +75,7 @@ usage() {
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
 shift 2
-repo=() repo_name="" user=() since="" job_cmd=()
+repo=() repo_name="" user=() since="" job_cmd=() idle=${WAIT_FOR_AGENT_IDLE:-7200} timeout_set=""
 if [ "$mode" = job ]; then timeout=14400; else timeout=3600; fi
 if [ "$mode" = job ]; then
   while [ $# -gt 0 ] && [ "$1" != -- ]; do
@@ -79,12 +94,21 @@ else
       -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); repo_name=$2; shift 2 ;;
       --user) user=(--user); shift ;;
       --since) [ $# -ge 2 ] || usage; since=$2; shift 2 ;;
-      --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
+      --timeout) [ $# -ge 2 ] || usage; timeout=$2; timeout_set=1; shift 2 ;;
+      --idle) [ "$mode" = agent ] && [ $# -ge 2 ] || usage; idle=$2; shift 2 ;;
       *) usage ;;
     esac
   done
 fi
+if [ "$mode" = agent ]; then
+  # Only `agent` reads the idle limit, so only `agent` rejects a bad one: a
+  # stray WAIT_FOR_AGENT_IDLE must not break the other modes.
+  case $idle in ''|*[!0-9]*) usage ;; esac
+  idle=$(( 10#$idle ))  # "08" is eight seconds, not a bad octal number
+  [ -n "$timeout_set" ] || timeout=86400
+fi
 case $timeout in ''|*[!0-9]*) usage ;; esac
+timeout=$(( 10#$timeout ))  # "08" is eight seconds, not a bad octal number
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
 # nap <step>: sleep up to <step> seconds, never past the deadline.
@@ -667,6 +691,56 @@ wait_job() {
   wait_unit
 }
 
+# agent_file <suffix>: the one subagent file agent-<id><suffix>, from any project
+# and session under ~/.claude/projects. Prints nothing when absent.
+agent_file() {
+  local f
+  for f in "$HOME"/.claude/projects/*/*/subagents/agent-"$target""$1"; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+wait_agent() {
+  [[ $target =~ ^[A-Za-z0-9]+$ ]] || {
+    echo "wait-for: invalid agent id '$target' (letters and digits only)" >&2
+    exit 64
+  }
+  [ "$idle" -gt 0 ] || usage
+  [ -n "${HOME:-}" ] || { echo "wait-for: HOME is unavailable, cannot find agent $target"; exit 3; }
+  local step=$(( idle < 120 ? (idle / 4 > 0 ? idle / 4 : 1) : 30 ))
+  local transcript="" meta="" missing=0 now quiet mt mm line
+  while :; do
+    [ -n "$transcript" ] || transcript=$(agent_file .jsonl) || transcript=""
+    [ -n "$meta" ] || meta=$(agent_file .meta.json) || meta=""
+    if [ -z "$transcript" ]; then
+      # The transcript appears with the agent's first entry; give it two
+      # minutes before calling the id unknown.
+      [ "$missing" -lt 120 ] || {
+        echo "wait-for: no transcript for agent $target under $HOME/.claude/projects/*/*/subagents"
+        exit 3
+      }
+      missing=$(( missing + step ))
+      nap "$step"; continue
+    fi
+    missing=0
+    now=$(date +%s)
+    # A transcript that went away (session cleaned up) is looked up again, and
+    # the missing-transcript limit above ends the wait.
+    mt=$(stat -c %Y -- "$transcript" 2>/dev/null) || { transcript=""; continue; }
+    mm=$( [ -n "$meta" ] && stat -c %Y -- "$meta" 2>/dev/null || echo 0)
+    [ "$mm" -gt "$mt" ] && mt=$mm
+    quiet=$(( now - mt ))
+    if [ "$quiet" -ge "$idle" ]; then
+      line="agent $target stalled: no activity for $(( quiet / 60 ))m$(( quiet % 60 ))s (idle limit ${idle}s); check its transcript, then stop or replace it, or re-arm with a longer --idle if it is legitimately busy"
+      echo "$line"
+      notify-send -a "Claude Code" -u critical "Background agent stalled" "$line" >/dev/null 2>&1 || true
+      exit 5
+    fi
+    nap "$step"
+  done
+}
+
 case $mode in
   pr|run)
     if ! gh auth token >/dev/null 2>&1; then wait_host_watch; fi ;;
@@ -677,5 +751,6 @@ case $mode in
   run) wait_run ;;
   unit) wait_unit ;;
   job) wait_job ;;
+  agent) wait_agent ;;
   *) usage ;;
 esac
