@@ -71,32 +71,55 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
                and e.get("task_type") == "local_bash" and not e.get("owned_by_subagent")
                and isinstance(e.get("task_id"), str)
                and runs_wait_for(commands.get(e.get("tool_use_id"), ""))}
-    # Claude Code itself stops tasks too (headless background ceiling, memory
-    # pressure); those are not the parent stopping its waiter.
-    system_stopped = {e.get("task_id") for e in events if e.get("subtype") == "task_notification"
-                      and re.search(r"time limit|low on memory", str(e.get("summary", "")))}
-    killed = ({e.get("task_id") for e in events if e.get("subtype") == "task_updated"
-               and (e.get("patch") or {}).get("status") == "killed"} & waiters) - system_stopped
+    # Summaries quote the model-written Bash description first, so match the
+    # harness's own wording after the closing quote, to the end. A TaskStop'd
+    # task's summary is the bare description, which proves nothing either way.
+    exit_line = re.compile(r'^Background command ".*" failed with exit code (\d+)$', re.S)
+    system_line = re.compile(r'^Background command ".*" (?:was stopped after reaching its '
+                             r"background time limit|stopped because the system is running "
+                             r"low on memory)$", re.S)
+    notes = [(n, e) for n, e in enumerate(events) if e.get("subtype") == "task_notification"
+             and e.get("task_id") in waiters]
+    system_stopped = {e["task_id"] for _, e in notes if e.get("status") == "stopped"
+                      and system_line.match(str(e.get("summary", "")))}
     exits = []  # (index, task_id, exit code) for each waiter that exited non-zero
-    for n, e in enumerate(events):
-        if e.get("subtype") == "task_notification" and e.get("task_id") in waiters:
-            code = re.search(r"\bexit code (\d+)\b", str(e.get("summary", "")))
-            if code:
-                exits.append((n, e["task_id"], int(code.group(1))))
+    for n, e in notes:
+        code = exit_line.match(str(e.get("summary", ""))) if e.get("status") == "failed" else None
+        if code:
+            exits.append((n, e["task_id"], int(code.group(1))))
+    kills = {e.get("task_id"): n for n, e in enumerate(events)
+             if e.get("subtype") == "task_updated" and e.get("task_id") in waiters
+             and (e.get("patch") or {}).get("status") == "killed"}
+    parent_kills = {t: n for t, n in kills.items() if t not in system_stopped}
+    ended = set(kills) | {t for _, t, _ in exits}
+    agent_done = min((n for n, e in enumerate(events) if e.get("task_id") in ids
+                      and e.get("subtype") in ("task_updated", "task_notification")
+                      and (e.get("status") or (e.get("patch") or {}).get("status")) == "completed"),
+                     default=None)
+
     seen = any(code == 5 and any(e.get("type") == "assistant" for e in events[n + 1:])
                for n, _, code in exits)
     broken = sorted({code for _, _, code in exits if code != 5})
+    live = sorted(waiters - ended)
+    stopped_after = agent_done is not None and any(n > agent_done for n in parent_kills.values())
 
     summary = (f"agent_ids={sorted(ids)} waiters={sorted(waiters)} notify={fired} "
-               f"alarm_seen={seen} killed={sorted(killed)} other_exits={broken}")
+               f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
+               f"system_stopped={sorted(system_stopped)} live={live} other_exits={broken}")
     armed = bool(waiters)
     if mode == "stall":
-        return (0 if armed and fired and seen else 1), summary
+        if armed and fired and seen:
+            return 0, summary
+        if armed and not fired and system_stopped:
+            # Claude Code stopped the waiter before it could fire: a resource
+            # result of the headless run, not a verdict.
+            return 2, summary + " (waiter stopped by Claude Code before the alarm)"
+        return 1, summary
     if mode == "quiet":
         if not armed or fired or broken:
             return 1, summary
-        if not killed:
-            return 2, summary + " (waiter left running: not stopped, not fired)"
+        if live or not stopped_after:
+            return 2, summary + " (waiter not stopped after the result, or one left running)"
         return 0, summary
     return 3, f"unknown mode {mode}"
 

@@ -42,13 +42,29 @@ def armed(task: str = "b1", tool: str = "t1",
             sys_event("task_started", task_id=task, task_type="local_bash", tool_use_id=tool)]
 
 
-def exited(task: str, code: int, tool: str = "t1") -> dict:
+def exited(task: str, code: int, tool: str = "t1", desc: str = "wait") -> dict:
     return sys_event("task_notification", task_id=task, tool_use_id=tool, status="failed",
-                     summary=f'Background command "wait" failed with exit code {code}')
+                     summary=f'Background command "{desc}" failed with exit code {code}')
 
 
-def killed(task: str = "b1") -> dict:
-    return sys_event("task_updated", task_id=task, patch={"status": "killed"})
+def agent_done() -> list[dict]:
+    return [sys_event("task_updated", task_id=AGENT, patch={"status": "completed"}),
+            sys_event("task_notification", task_id=AGENT, tool_use_id="t0", status="completed",
+                      summary="done")]
+
+
+def killed(task: str = "b1", desc: str = "Arm idle alarm") -> list[dict]:
+    """A TaskStop: the task is killed and its notification's summary is the
+    model-written Bash description, verbatim."""
+    return [sys_event("task_updated", task_id=task, patch={"status": "killed"}),
+            sys_event("task_notification", task_id=task, status="stopped", summary=desc)]
+
+
+def time_limit(task: str = "b1") -> list[dict]:
+    return [sys_event("task_updated", task_id=task, patch={"status": "killed"}),
+            sys_event("task_notification", task_id=task, status="stopped",
+                      summary='Background command "wait" was stopped after reaching its '
+                              "background time limit")]
 
 
 def grade(tmp: Path, events: list[dict], mode: str, *, alarm: bool = False) -> int:
@@ -80,7 +96,7 @@ def test_arming_variants_count(tmp_path: Path) -> None:
             f"timeout 2h bash ~/.claude/scripts/wait-for agent {AGENT}"]):
         d = tmp_path / str(n)
         d.mkdir()
-        events = launched() + armed(command=command) + [killed()]
+        events = launched() + armed(command=command) + agent_done() + killed()
         assert grade(d, events, "quiet") == 0, command
 
 
@@ -100,20 +116,43 @@ def test_subagent_waiter_is_not_the_parents(tmp_path: Path) -> None:
 def test_quiet_pass_needs_the_waiter_itself_killed(tmp_path: Path) -> None:
     other = [bash("t5", "./feed-watch.sh"),
              sys_event("task_started", task_id="b5", task_type="local_bash", tool_use_id="t5")]
-    assert grade(tmp_path, launched() + armed() + other + [killed("b5")], "quiet") == 2
-    assert grade(tmp_path, launched() + armed() + [killed("b1")], "quiet") == 0
+    assert grade(tmp_path, launched() + armed() + other + agent_done() + killed("b5"),
+                 "quiet") == 2
+    assert grade(tmp_path, launched() + armed() + agent_done() + killed("b1"), "quiet") == 0
 
 
-def test_system_stop_is_not_the_parent_stopping_it(tmp_path: Path) -> None:
-    events = launched() + armed() + [
-        killed("b1"),
-        sys_event("task_notification", task_id="b1", tool_use_id="t1", status="stopped",
-                  summary="Background command was stopped after reaching its background time limit")]
+def test_quiet_stop_before_the_result_is_not_a_pass(tmp_path: Path) -> None:
+    assert grade(tmp_path, launched() + armed() + killed() + agent_done(), "quiet") == 2
+
+
+def test_quiet_rearmed_waiter_left_running_is_not_a_pass(tmp_path: Path) -> None:
+    events = (launched() + armed() + killed()
+              + armed(task="b2", tool="t2", command=f"~/.claude/scripts/wait-for agent {AGENT} --idle 900")
+              + agent_done())
     assert grade(tmp_path, events, "quiet") == 2
 
 
+def test_description_text_cannot_fake_a_system_stop(tmp_path: Path) -> None:
+    events = launched() + armed() + agent_done() + killed(desc="Stall watcher (2h time limit)")
+    assert grade(tmp_path, events, "quiet") == 0
+
+
+def test_description_text_cannot_fake_exit_5(tmp_path: Path) -> None:
+    events = launched() + armed() + [exited("b1", 3, desc="Wait (exit code 5 = stalled)"), say()]
+    assert grade(tmp_path, events, "stall", alarm=True) == 1
+
+
+def test_system_stop_is_not_the_parent_stopping_it(tmp_path: Path) -> None:
+    events = launched() + armed() + agent_done() + time_limit()
+    assert grade(tmp_path, events, "quiet") == 2
+
+
+def test_stall_cut_short_by_the_headless_time_limit_is_inconclusive(tmp_path: Path) -> None:
+    assert grade(tmp_path, launched() + armed() + time_limit(), "stall") == 2
+
+
 def test_waiter_that_died_at_once_fails_quiet(tmp_path: Path) -> None:
-    events = launched() + armed() + [exited("b1", 64), killed("b1")]
+    events = launched() + armed() + [exited("b1", 64)] + agent_done() + killed()
     assert grade(tmp_path, events, "quiet") == 1
 
 
