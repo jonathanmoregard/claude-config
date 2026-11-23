@@ -667,9 +667,15 @@ def test_sync_prunes_what_a_killed_run_left_beside_a_managed_path() -> None:
             assert not path.exists(), path
 
 
-def hook_generation_files(rt) -> dict[Path, bytes]:
+def hook_generation_files(rt) -> dict[Path, tuple[bytes, int]]:
+    """Each hook generation file by bytes and mode: a repair that rewrote a
+    wrapper's bytes but left it unexecutable is no repair."""
     root = rt.codex / "hooks" / "claude-mirror"
-    return {path: path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+    return {
+        path: (path.read_bytes(), path.stat().st_mode & 0o7777)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_sync_repairs_a_modified_content_addressed_hook_file() -> None:
