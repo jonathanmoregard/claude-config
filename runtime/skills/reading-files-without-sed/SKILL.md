@@ -5,17 +5,15 @@ description: Use when about to read, filter, slice or extract part of a file fro
 
 # Reading files without sed
 
-Never use `sed` (or `awk`) to read a file. Use the tool from this table:
+Never use `sed` (or `awk`) to read a file. Use the tool for the job:
 
-| Want | Use |
-|---|---|
-| Lines matching a pattern | Grep tool, or `grep 'pat' file` / `rg 'pat' file` |
-| Matches with context | Grep tool with `-C`, or `grep -C3 'pat' file` |
-| Lines N to M, to look at | Read tool with `offset: N`, `limit: M-N+1` |
-| Lines N to M, piped onward | `tail -n +N file \| head -n K`, K = M-N+1 as a literal number |
-| JSONL entries matching | `grep 'pat' file \| jq -c '…'`, or `jq -c 'select(tostring\|contains("pat")) \| …' file` |
-| JSONL lines N to M | `tail -n +N file \| head -n K \| jq -c '…'` |
-| First / last lines | `head -n K file` / `tail -n K file` |
+1. **Lines matching a pattern** → Grep tool, or `grep 'pat' file` / `rg 'pat' file`.
+2. **Matches with context** → Grep tool with `-C`, or `grep -C3 'pat' file`.
+3. **Lines N to M, to look at** → Read tool with `offset: N`, `limit: M-N+1`.
+4. **Lines N to M, piped onward** → `tail -n +N file | head -n K`, with K = M-N+1 written as a literal number.
+5. **JSONL entries matching** → `grep 'pat' file | jq -c '…'`, or `jq -c 'select(tostring | contains("pat")) | …' file`.
+6. **JSONL lines N to M** → `tail -n +N file | head -n K | jq -c '…'`.
+7. **First / last lines** → `head -n K file` / `tail -n K file`.
 
 Example — lines 2400–2412 of a JSONL, compacted:
 
@@ -27,4 +25,4 @@ tail -n +2400 session.jsonl | head -n 13 | jq -c '{type, timestamp}'
 
 ## Self-check before running Bash
 
-The command contains `sed` or `awk` and only reads? Rewrite it from the table first.
+The command contains `sed` or `awk` and only reads? Rewrite it from the list first.
