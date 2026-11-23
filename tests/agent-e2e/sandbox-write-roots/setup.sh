@@ -62,6 +62,9 @@ import json, sys
 path, enable = sys.argv[1:3]
 settings = json.load(open(path, encoding="utf-8"))
 settings.setdefault("sandbox", {})["enabled"] = enable == "1"
+# Off means the unsandboxed setup, where a bare Bash allow lets commands run.
+if enable != "1" and "Bash" not in settings["permissions"]["allow"]:
+    settings["permissions"]["allow"].append("Bash")
 open(path, "w", encoding="utf-8").write(json.dumps(settings, indent=2) + "\n")
 PY
 echo "sandbox_enable=${SANDBOX_ENABLE:-1}" >"$run/mode"
