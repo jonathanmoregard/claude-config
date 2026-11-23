@@ -96,16 +96,6 @@ def write_fixture(root: Path) -> tuple[dict[str, object], Path, Path, Path]:
     return manifest, manifest_path, codex, plugin
 
 
-def tree_bytes(root: Path) -> dict[str, bytes]:
-    if not root.exists():
-        return {}
-    return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
-
-
 def tree_state(root: Path) -> dict[str, tuple[str, bytes | str, int]]:
     """Every entry under root: a link by target, a file by bytes and mode,
     a directory by mode, so a change of mode alone is a difference too."""
@@ -167,11 +157,13 @@ def isolated_renderer(
 def assert_wrapper_trees_unchanged(
     codex: Path,
     plugin: Path,
-    before_codex: dict[str, bytes],
-    before_plugin: dict[str, bytes],
+    before_codex: dict[str, tuple[str, bytes | str, int]],
+    before_plugin: dict[str, tuple[str, bytes | str, int]],
 ) -> None:
-    assert tree_bytes(codex / "skills") == before_codex
-    assert tree_bytes(plugin / "skills") == before_plugin
+    # By tree_state, not bytes alone: a failed render that changed a
+    # wrapper's mode, a directory or a link target changed the tree too.
+    assert tree_state(codex / "skills") == before_codex
+    assert tree_state(plugin / "skills") == before_plugin
     assert not (codex / "skills" / "new-skill").exists()
     assert not (plugin / "skills" / "new-skill").exists()
 
@@ -193,8 +185,8 @@ def test_invalid_live_config_preserves_both_wrapper_trees() -> None:
         config = codex / "config.toml"
         config.write_text('[projects."/repo"]\ntrust_level = \n', encoding="utf-8")
         original_config = config.read_bytes()
-        before_codex = tree_bytes(codex / "skills")
-        before_plugin = tree_bytes(plugin / "skills")
+        before_codex = tree_state(codex / "skills")
+        before_plugin = tree_state(plugin / "skills")
 
         with isolated_renderer(
             root, manifest_path, codex, plugin, budget_support()
@@ -629,8 +621,8 @@ def test_unclassified_hook_preserves_both_wrapper_trees() -> None:
         manifest, manifest_path, codex, plugin = write_fixture(root)
         manifest["hooks"] = {"FutureHookEvent": []}
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        before_codex = tree_bytes(codex / "skills")
-        before_plugin = tree_bytes(plugin / "skills")
+        before_codex = tree_state(codex / "skills")
+        before_plugin = tree_state(plugin / "skills")
 
         with isolated_renderer(
             root, manifest_path, codex, plugin, budget_support()
@@ -661,8 +653,8 @@ def test_invalid_or_missing_budget_mapping_preserves_both_wrapper_trees() -> Non
                     "skill_listing_budget_fraction": 0
                 }
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            before_codex = tree_bytes(codex / "skills")
-            before_plugin = tree_bytes(plugin / "skills")
+            before_codex = tree_state(codex / "skills")
+            before_plugin = tree_state(plugin / "skills")
 
             with isolated_renderer(root, manifest_path, codex, plugin, support):
                 try:
@@ -681,8 +673,8 @@ def test_second_wrapper_preparation_failure_publishes_neither_copy() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _, manifest_path, codex, plugin = write_fixture(root)
-        before_codex = tree_bytes(codex / "skills")
-        before_plugin = tree_bytes(plugin / "skills")
+        before_codex = tree_state(codex / "skills")
+        before_plugin = tree_state(plugin / "skills")
         calls = 0
 
         def fail_second_copy(*args: object, **kwargs: object) -> str:
@@ -720,8 +712,8 @@ def test_missing_source_fails_before_wrapper_publication() -> None:
         manifest, manifest_path, codex, plugin = write_fixture(root)
         # arftl-allow: suppression-marker (fixture manifest is an untyped dict)
         Path(manifest["skills"][0]["skill_md"]).unlink()  # type: ignore[index]
-        before_codex = tree_bytes(codex / "skills")
-        before_plugin = tree_bytes(plugin / "skills")
+        before_codex = tree_state(codex / "skills")
+        before_plugin = tree_state(plugin / "skills")
 
         with isolated_renderer(
             root, manifest_path, codex, plugin, budget_support()
