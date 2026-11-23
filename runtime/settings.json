@@ -76,6 +76,7 @@
   },
   "permissions": {
     "allow": [
+      "Bash",
       "Bash(~/.claude/scripts/unit-read *)",
       "Bash(/home/jonathan/.claude/scripts/unit-read *)",
       "Bash(~/.claude/scripts/wait-for unit *)",
