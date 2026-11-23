@@ -1,0 +1,93 @@
+# Real review-ledger rows (claude-config, 2026-11-23), copied verbatim except column 6: every `where` is rewritten to the verdict-schema form /abs/path:<line> by prefixing /repo/. No finding row lacked a line; `-` stays on none rows.
+date	source	run	check	trigger	where	claim	outcome	fixed	fp_reason
+2026-11-23	artl	afb78c3/r1	A	always	/repo/tests/agent-e2e/grep-over-sed-pattern/check.sh:9	answer grader matched a prompt-supplied word so wrong answers passed	reproduced	yes	-
+2026-11-23	artl	afb78c3/r1	A	always	/repo/tests/agent-e2e/grep-over-sed-range/check.sh:8	any single in-range timestamp passed an off-by-one slice	reproduced	yes	-
+2026-11-23	artl	afb78c3/r1	A	always	/repo/tests/agent-e2e/grep-over-sed-range/check.sh:5	forbidden-command regex missed awk and path-prefixed sed	reproduced	yes	-
+2026-11-23	artl	afb78c3/r1	G9	tests added	/repo/tests/agent-e2e/grep-over-sed-pattern/check.sh:9	same as A: wrong answer passes	reproduced	yes	-
+2026-11-23	artl	afb78c3/r1	D5	always	/repo/tests/agent-e2e/grep-over-sed-pattern/check.sh:2	header claimed narrower check than regex performed	reproduced	yes	-
+2026-11-23	artl	afb78c3/r2	A	always	/repo/tests/agent-e2e/grep-over-sed-pattern/check.sh:11	OR of tokens let a negated answer pass	reproduced	yes	-
+2026-11-23	artl	afb78c3/r2	A	always	/repo/tests/agent-e2e/grep-over-sed-range/check.sh:6	sed after a quote slipped past the regex	reproduced	yes	-
+2026-11-23	artl	afb78c3/r2	G9	tests added	/repo/runtime/skills/reading-files-without-sed/SKILL.md:15	table commands carried escaped pipes and did not run as written	reproduced	yes	-
+2026-11-23	artl	afb78c3/r3	A	always	/repo/tests/agent-e2e/grep-over-sed-range/prompt.md:1	prompt duplicated the skill's worked example	reproduced	yes	-
+2026-11-23	artl	afb78c3/r3	A	always	/repo/tests/agent-e2e/grep-over-sed-pattern/check.sh:15	answer-text grader passed wrong verdicts and failed correct ones	reproduced	yes	-
+2026-11-23	artl	afb78c3/r3	G9	tests added	/repo/tests/agent-e2e/grep-over-sed-range/check.sh:10	range grader pinned only end timestamps	reproduced	yes	-
+2026-11-23	artl	afb78c3/r4	A	always	/repo/tests/agent-e2e/_lib/no_sed_awk.py:51	shell keywords taken as program word so do sed in loops passes	unconfirmed	deferred	-
+2026-11-23	artl	afb78c3/r4	A	always	/repo/tests/agent-e2e/_lib/no_sed_awk.py:56	sed inside a double-quoted substitution is missed	unconfirmed	deferred	-
+2026-11-23	artl	afb78c3/r4	A	always	/repo/tests/agent-e2e/_lib/no_sed_awk.py:43	wrapper flags (xargs -n1, sudo -u, find -exec) end the skip and sed is missed	unconfirmed	deferred	-
+2026-11-23	artl	afb78c3/r4	G9	tests added	/repo/tests/agent-e2e/_lib/no_sed_awk.py:65	flattened multi-line command hides sed on later lines	unconfirmed	deferred	-
+2026-11-23	artl	afb78c3/r4	G9	tests added	/repo/tests/agent-e2e/_lib/no_sed_awk.py:0	synthetic grader cases not committed as a regression test	unconfirmed	deferred	-
+2026-11-23	artl	afb78c3/r4	D5	always	/repo/runtime/skills/reading-files-without-sed/SKILL.md:14	jq examples contain a literal ellipsis and do not run as written	unconfirmed	deferred	-
+2026-11-23	artl	be216cc/r3	A	always	/repo/runtime/mcps/agent-e2e-broker/server.py:144	pre-change broker fetches the mirror without mirror.lock during rollout	advisory	no	-
+2026-11-23	artl	be216cc/r3	variant	sibling of r2 lock-protocol finding	/repo/runtime/mcps/agent-e2e-broker/server.py:577	same rollout fetch collision	advisory	no	-
+2026-11-23	artl	be216cc/r3	variant	sibling of r2 child-outlives-lock finding	/repo/runtime/mcps/agent-e2e-broker/server.py:255	timed-out fetch left helper processes writing the mirror	reproduced	yes	-
+2026-11-23	artl	be216cc/r3	variant	sibling of r2 cancel finding	/repo/runtime/mcps/agent-e2e-broker/server.py:581	cancel not checked between setup steps	reproduced	yes	-
+2026-11-23	artl	be216cc/r3	D5	always	/repo/runtime/mcps/agent-e2e-broker/server.py:78	setup bound comment overcounted git calls per ref	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	A	always	/repo/runtime/scripts/runtime-layout.py:57	sandbox-soak.json unclassified; layout --verify and enforced test fail	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	A	always	/repo/runtime/settings.json:1090	allowWrite keeps owner-read ~/.cargo ~/.cache/nix ~/.cache/uv	reproduced	deferred	-
+2026-11-23	artl	e1836c3/r3	A	always	/repo/runtime/scripts/claude-worktree.sh:79	FETCH_HEAD mtime proves a fetch, not a fetch of master	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	A	always	/repo/runtime/hooks/sandbox-aid.py:53	gitmodules hint fails: sandbox ignore hides .gitmodules, plain add refused	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	D5	always	/repo/runtime/hooks/sandbox-aid.py:67	soak session via --settings gets no hints; hook reads settings.json only	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	G11	env redirect as poisoning control	/repo/runtime/settings.json:1090	env redirect does not stop writes to owner caches still in allowWrite	reproduced	deferred	-
+2026-11-23	artl	e1836c3/r3	variant	sibling: permission change makes silent commands prompt	/repo/tests/test_bash_guards.py:504	test passes with bare Bash allow removed while sandbox on	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	D5	always	/repo/runtime/hooks/sandbox-env.py:23	core.excludesFile env entry replaces the global ignore	refuted	-	designed file already carries the global ignore
+2026-11-23	artl	e1836c3/r3	G9	tests added	/repo/tests/agent-e2e/_lib/sandbox-on.sh:7	no e2e runs the --settings soak route	advisory	open	-
+2026-11-23	artl	e1836c3/r3	D3	FETCH_HEAD check then branch	/repo/runtime/scripts/claude-worktree.sh:79	FETCH_HEAD freshness does not prove master was fetched	reproduced	yes	-
+2026-11-23	artl	e1836c3/r3	D7	allowWrite additions	-	-	none	-	-
+2026-11-23	artl	e1836c3/r3	D1	error handling paths	-	-	none	-	-
+2026-11-23	artl	a8c1e99/r8	A	always	-	none	none	-	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:109	quiet passed when the waiter died at once and a later TaskStop hit the dead task	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:40	arm regex missed env-prefixed, quoted-path and wrapped wait-for calls	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:98	pgrep-then-kill across segments graded INCONCLUSIVE	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:0	grader had no fixture tests	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:75	stalled-line fallback searched subagent events and reply text	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:91	denied TaskStop counted as stopped	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:71	alarm notification counted without a later parent turn	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:27	missing transcript crashed and graded FAIL	reproduced	yes	-
+2026-11-23	artl	4b4fbf1/r8	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:87	background id regex over a whole multi-result line	reproduced	yes	-
+2026-11-23	artl	4e1785d/r9	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:98	quiet passed on a stop before the result or a re-armed waiter left running	reproduced	yes	-
+2026-11-23	artl	4e1785d/r9	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:77	description text could fake a system stop	reproduced	yes	-
+2026-11-23	artl	4e1785d/r9	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:83	description text could fake exit code 5	reproduced	yes	-
+2026-11-23	artl	4e1785d/r9	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:94	stall stopped by the headless time limit graded FAIL, not INCONCLUSIVE	reproduced	yes	-
+2026-11-23	artl	4e1785d/r9	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:86	alarm_seen relies on task_notification, unconfirmed if TaskOutput polling suppresses it	unconfirmed	no	-
+2026-11-23	artl	4e1785d/r9	A	always	/repo/tests/test_idle_alarm_grade.py:50	killed fixture lacked the stop notification real TaskStop emits	reproduced	yes	-
+2026-11-23	artl	2eb6bc1/r10	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:95	completion taken from any agent, not the watched one	reproduced	yes	-
+2026-11-23	artl	2eb6bc1/r10	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:93	parent kill was any kill not matching two system wordings	reproduced	yes	-
+2026-11-23	artl	2eb6bc1/r10	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:113	system stop masked a broken re-arm as INCONCLUSIVE	reproduced	yes	-
+2026-11-23	artl	2eb6bc1/r10	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:16	docstring stated old rules	reproduced	yes	-
+2026-11-23	artl	c4726a9/r1	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:56	toast with no dispatch grades INCONCLUSIVE, check after early returns	reproduced	yes	-
+2026-11-23	artl	c4726a9/r1	A	always	/repo/tests/test_idle_alarm_grade.py:79	toast fixture cannot tell any-entry check from weaker 'stalled' match	reproduced	yes	-
+2026-11-23	artl	c4726a9/r1	D4	setup notify.log stub read by grader	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:42	tripwire toast in shared stub log fails a valid stall run	reproduced	yes	-
+2026-11-23	artl	c4726a9/r1	D5	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:20	quiet+toast FAIL unpinned and undocumented	reproduced	yes	-
+2026-11-23	artl	c4726a9/r1	G9	-	-	-	none	-	-
+2026-11-23	artl	eb134fe/r2	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:146	dropping fired lets unanswered exit 5 after system stop grade INCONCLUSIVE	reproduced	yes	-
+2026-11-23	artl	eb134fe/r2	A	always	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:41	no-transcript return precedes toast check	reproduced	yes	-
+2026-11-23	artl	eb134fe/r2	variant	sibling of r1 fixture shape	/repo/tests/test_idle_alarm_grade.py:80	OTHER_TOAST lacks 'stalled' so weak match stays green	reproduced	yes	-
+2026-11-23	artl	eb134fe/r2	G9	-	-	-	none	-	-
+2026-11-23	artl	eb134fe/r2	D4	-	-	-	none	-	-
+2026-11-23	artl	eb134fe/r2	D5	-	-	-	none	-	-
+2026-11-23	artl	bb57dc5/r3	A	always	-	-	none	-	-
+2026-11-23	artl	bb57dc5/r3	variant	sibling of r2 guard-lost-flag shape	/repo/tests/agent-e2e/_lib/idle_alarm_grade.py:139	exit-3 INCONCLUSIVE guard lost fired; exit5+exit3 grades 2 not 1	reproduced	yes	-
+2026-11-23	artl	bb57dc5/r3	D5	-	-	-	none	-	-
+2026-11-23	artl	bb57dc5/r3	D1	-	-	-	none	-	-
+2026-11-23	artl	bb57dc5/r3	G9	-	-	-	none	-	-
+2026-11-23	artl	9e1a08a/r4	A	always	-	-	none	-	-
+2026-11-23	artl	9e1a08a/r4	G9	-	-	-	none	-	-
+2026-11-23	artl	9e1a08a/r4	D5	-	-	-	none	-	-
+2026-11-23	artl	9e1a08a/r4	D1	-	-	-	none	-	-
+2026-11-23	artl	9e1a08a/r4	variant	-	-	-	none	-	-
+2026-11-23	artl	4c469b4/r1	A	falsify	/repo/tests/agent-e2e/codex-render-location/check.sh:11	grader fails correct answer naming retired repo	reproduced	yes	fab7dcc
+2026-11-23	artl	4c469b4/r1	A	falsify	/repo/runtime/hooks/path-edit-guard.py:112	refusal never names ~/Repos/claude-config	reproduced	yes	fab7dcc
+2026-11-23	artl	4c469b4/r1	B	D5	/repo/codex/scripts/render_codex.py:652	AGENTS preamble routes to ai-client-config	reproduced	yes	fab7dcc
+2026-11-23	artl	4c469b4/r1	B	G9	/repo/tests/test_path_edit_guard.py:96	guard test passes with wrong routing	reproduced	yes	fab7dcc
+2026-11-23	artl	fab7dcc/r2	A	falsify	/repo/tests/agent-e2e/codex-render-location/check.sh:11	grader passes wrong path answer	reproduced	yes	8e63172
+2026-11-23	artl	fab7dcc/r2	B	sibling 1	/repo/codex/scripts/render_codex.py:1313	hooks.json/plugin/MCP header credit ai-client-config	reproduced	yes	8e63172
+2026-11-23	artl	fab7dcc/r2	B	G9	/repo/codex/scripts/render_codex.py:652	preamble routing untested	reproduced	yes	8e63172
+2026-11-23	artl	fab7dcc/r2	B	G9	/repo/tests/test_path_edit_guard.py:98	negative assert pins one phrase	reproduced	yes	8e63172
+2026-11-23	artl	fab7dcc/r2	B	sibling 2	/repo/tests/agent-e2e/codex-render-location/check.sh:7	grader requires literal Repos/claude-config	reproduced	yes	8e63172
+2026-11-23	artl	8e63172/r3	A+B	falsify/D5	/repo/runtime/CLAUDE.md:81	CLAUDE.md/SKILL routing untested	reproduced	yes	f041646
+2026-11-23	artl	8e63172/r3	B	sibling 2	/repo/tests/agent-e2e/codex-render-location/check.sh:15	grader passes 'ai-client-config repo, its codex/'	reproduced	yes	f041646 (strict grader)
+2026-11-23	artl	8e63172/r3	B	G10	/repo/runtime/CLAUDE.md:81	routing fact in 4 copies, 2 unchecked	design	yes	f041646 test checks all four
+2026-11-23	artl	f041646/r4	A+B	falsify/sibling 2	/repo/tests/agent-e2e/codex-render-location/check.sh:13	token grader passes answer routing to runtime/ that names both tokens	reproduced	no	inherent to text grading; documented in check.sh (1ba0393)
+2026-11-23	artl	f041646/r4	A	falsify	/repo/tests/agent-e2e/codex-render-location/check.sh:15	codex/ regex accepts runtime/codex/	reproduced	no	same limit; correct full path ~/Repos/claude-config/codex/ must pass
+2026-11-23	artl	f041646/r4	B	sibling 1	/repo/tests/test_codex_routing_text.py:59	route test checks tokens not phrase	reproduced	yes	1ba0393
+2026-11-23	artl	f041646/r4	B	G9	/repo/tests/agent-e2e/codex-render-location/check.sh:13	sentence-final period fails correct answer	reproduced	yes	1ba0393
