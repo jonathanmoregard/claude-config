@@ -693,9 +693,14 @@ def test_rollback_that_cannot_restore_keeps_its_snapshot_and_names_it() -> None:
 def test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot() -> None:
     # A stop signal held off during a rollback must not then replace the
     # error that names the kept snapshot: the run ends either way, and only
-    # that error says where the pre-publish state is.
-    def stop(signum: int, frame: object) -> None:
-        raise SystemExit(128 + signum)
+    # that error says where the pre-publish state is. Every stop signal.
+    for signum in render_codex.STOP_SIGNALS:
+        assert_a_failed_rollback_drops(signum)
+
+
+def assert_a_failed_rollback_drops(signum: signal.Signals) -> None:
+    def stop(number: int, frame: object) -> None:
+        raise SystemExit(128 + number)
 
     with tempfile.TemporaryDirectory() as td:
         target = Path(td) / "AGENTS.md"
@@ -705,12 +710,12 @@ def test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot() -> None:
 
         def copy2(source: object, destination: object, *args: object, **kwargs: object) -> object:
             if rolling_back:
-                os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signum)
                 raise OSError("injected restore failure")
             return real_copy2(source, destination, *args, **kwargs)
 
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-        previous = signal.signal(signal.SIGTERM, stop)
+        previous = signal.signal(signum, stop)
         failure: BaseException | None = None
         try:
             with patch.object(render_codex.shutil, "copy2", side_effect=copy2):
@@ -727,13 +732,13 @@ def test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot() -> None:
             left_pending = signal.sigpending()
         finally:
             # Ignoring a signal drops it if still pending; then put back both.
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signum, signal.SIG_IGN)
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-            signal.signal(signal.SIGTERM, previous)
+            signal.signal(signum, previous)
 
-        assert isinstance(failure, RuntimeError), repr(failure)
+        assert isinstance(failure, RuntimeError), (signum.name, repr(failure))
         assert left_mask == mask, left_mask
-        assert signal.SIGTERM not in left_pending, left_pending
+        assert signum not in left_pending, (signum.name, left_pending)
         message = str(failure)
         kept = Path(message.split("snapshot is kept at ", 1)[1].split()[0].rstrip(";,."))
         try:
@@ -804,10 +809,11 @@ def test_a_parent_the_rollback_cannot_remove_never_replaces_the_failure() -> Non
 
 def test_a_parent_the_rollback_cannot_remove_still_delivers_a_held_stop() -> None:
     # A stop held off during the rollback is delivered once the restore has
-    # finished, a cleanup that cannot finish notwithstanding.
-    caught, _failure = rollback_with_a_refilled_parent(signal.SIGTERM)
-    assert isinstance(caught, SystemExit), repr(caught)
-    assert caught.code == 128 + signal.SIGTERM, caught.code
+    # finished, a cleanup that cannot finish notwithstanding. Every stop signal.
+    for signum in render_codex.STOP_SIGNALS:
+        caught, _failure = rollback_with_a_refilled_parent(signum)
+        assert isinstance(caught, SystemExit), (signum.name, repr(caught))
+        assert caught.code == 128 + signum, (signum.name, caught.code)
 
 
 def test_rollback_never_leaves_a_restored_path_missing() -> None:
