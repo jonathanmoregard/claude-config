@@ -524,30 +524,52 @@ def _scrub_runs(runs: Path) -> str:
     return ""
 
 
-def _unit_settled(policy: dict, unit: str) -> bool:
-    """Whether UNIT is gone or stopped for good; anything else may still write."""
+SCRUBBED_MARK = "scrubbed"   # in the campaign dir, which no unit can write
+
+
+def _unit_state(policy: dict, unit: str) -> str:
+    """UNIT's ActiveState. Raises when systemd cannot be asked."""
     systemctl = shutil.which("systemctl", path=":".join(policy["path"]))
     if not systemctl:
-        return False
-    try:
-        p = subprocess.run([systemctl, "--user", "show", "-p", "ActiveState", "--value",
-                            f"{unit}.service"], stdin=subprocess.DEVNULL,
-                           capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return p.returncode == 0 and p.stdout.strip() in ("inactive", "failed")
+        raise RuntimeError("systemctl is not on the policy path")
+    p = subprocess.run([systemctl, "--user", "show", "-p", "ActiveState", "--value",
+                        f"{unit}.service"], stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, timeout=30, env=_manager_env(policy))
+    if p.returncode != 0:
+        raise RuntimeError(f"systemctl exit {p.returncode}: {p.stderr.strip()}")
+    return p.stdout.strip()
 
 
-def _scrub_settled(policy: dict, campaigns: Path) -> str:
-    """Scrub every campaign whose unit has stopped. A broker that exits
-    mid-campaign takes its unit down (pdeathsig) before its own post-unit
-    scrub runs; the next campaign on any broker catches that one here."""
+def _mark_scrubbed(campaign: Path) -> None:
+    os.close(os.open(campaign / SCRUBBED_MARK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600))
+
+
+def _scrub_settled(policy: dict, campaigns: Path, skip: Path) -> str:
+    """Scrub every campaign whose unit ran and has stopped, once. A broker that
+    exits mid-campaign takes its unit down (pdeathsig) before its own
+    post-unit scrub runs; the next campaign on any broker catches it here.
+    A campaign with no runs/ yet is still in setup, so it is left unmarked."""
     reports = []
     for entry in os.scandir(campaigns):
-        if entry.is_dir(follow_symlinks=False) and _unit_settled(policy, UNIT_PREFIX + entry.name):
-            report = _scrub_runs(Path(entry.path) / "out" / "runs")
-            if report:
-                reports.append(report)
+        campaign = Path(entry.path)
+        if (campaign == skip or not entry.is_dir(follow_symlinks=False)
+                or os.path.lexists(campaign / SCRUBBED_MARK)
+                or not os.path.lexists(campaign / "out" / "runs")):
+            continue
+        try:
+            state = _unit_state(policy, UNIT_PREFIX + entry.name)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            reports.append(f"{TAG} sweep stopped: cannot ask systemd about "
+                           f"{entry.name}: {exc}")
+            break
+        if state not in ("inactive", "failed"):
+            continue
+        report = _scrub_runs(campaign / "out" / "runs")
+        if report:
+            reports.append(report)
+        else:
+            _mark_scrubbed(campaign)
     return "\n".join(reports)
 
 
@@ -697,7 +719,6 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 _check_cancel(policy)   # before the local, unbounded prune
                 campaigns = _private_dir(policy["campaigns"])
                 _prune(campaigns)
-                swept = _scrub_settled(policy, campaigns)
                 stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
                 campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
                                                  dir=campaigns))
@@ -721,6 +742,8 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 policy.pop("mirror_fd", None)
                 policy.pop("in_flight", None)
                 os.close(mirror)
+            # Outside the mirror lock: no other campaign's setup waits on it.
+            swept = _scrub_settled(policy, campaigns, campaign)
             proc = _launch(supervised, _manager_env(policy), lock)
         except BaseException:
             # Nothing ran yet: the whole campaign dir goes, not only the harness.
@@ -733,14 +756,18 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
         finally:
             scrubbed = _scrub_runs(out / "runs")
+            if not scrubbed:
+                _mark_scrubbed(campaign)
             shutil.rmtree(campaign / "harness", ignore_errors=True)
-        stderr = "\n".join(part for part in (stderr.rstrip(), client.strip(), swept, scrubbed)
-                           if part)
+        stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
     finally:
         os.close(lock)
+    # First, so a response cut at outputLimitChars still carries it.
+    scrub_report = "\n".join(part for part in (scrubbed, swept) if part)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
-              f"harness = origin/master = {master}\n"
+              + (f"{scrub_report}\n" if scrub_report else "")
+              + f"harness = origin/master = {master}\n"
               f"old = {req['old_ref']} = {old}\nnew = {req['new_ref']} = {new}\n"
               f"output: {out}\n")
     body = "\n".join([header, stdout.rstrip(), "--- per run ---",

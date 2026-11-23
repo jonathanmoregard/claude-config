@@ -286,10 +286,12 @@ def scrub_dir(path: pathlib.Path) -> list[str]:
         return errors
     except OSError as exc:  # a link planted at PATH (ELOOP) included
         return [f"{path}: {exc}"]
+    def record(exc: BaseException) -> None:
+        errors.append(f"{path}: {exc}")
+
     try:
         for dirpath, dirnames, filenames, dfd in os.fwalk(
-                dir_fd=root, follow_symlinks=False,
-                onerror=lambda exc: errors.append(f"{path}: {exc}")):
+                dir_fd=root, follow_symlinks=False, onerror=record):
             parent = os.path.basename(os.path.normpath(dirpath))
             for name in [*dirnames, *filenames]:
                 where = path / dirpath / name
@@ -300,13 +302,18 @@ def scrub_dir(path: pathlib.Path) -> list[str]:
                     if name in dirnames:
                         dirnames.remove(name)
                     if stat.S_ISDIR(st.st_mode):
-                        shutil.rmtree(name, dir_fd=dfd)
+                        # Past an unremovable entry, so its siblings still go.
+                        shutil.rmtree(name, dir_fd=dfd,
+                                      onexc=lambda _f, p, exc, w=where: errors.append(
+                                          f"{w}: {p}: {exc}"))
                     else:
                         os.unlink(name, dir_fd=dfd)
                 except FileNotFoundError:
                     continue  # gone already: nothing left to scrub
                 except OSError as exc:
                     errors.append(f"{where}: {exc}")
+    except OSError as exc:  # the root itself could not be listed
+        record(exc)
     finally:
         os.close(root)
     return errors
@@ -507,10 +514,17 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         errors = scrub_dir(run)
         if errors:
             print(f"scrub incomplete in {run}:\n  " + "\n  ".join(errors), file=sys.stderr)
-            write_run_file(run, "scrub-errors.txt", "\n".join(errors) + "\n")
             if verdict is not None:
                 verdict["scrub_errors"] = errors
-                write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
+            # Recording must not cost the verdict: a raise here would replace it.
+            for name, text in (("scrub-errors.txt", "\n".join(errors) + "\n"),
+                               *((("verdict.json", json.dumps(verdict, indent=2)),)
+                                 if verdict is not None else ())):
+                try:
+                    write_run_file(run, name, text)
+                except OSError as exc:
+                    print(f"could not record scrub errors in {run / name}: {exc}",
+                          file=sys.stderr)
 
 
 def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
@@ -684,7 +698,7 @@ def cmd_run(args) -> int:
             verdicts.append(v)
             print(f"{name}#{i} {v['verdict']} {v.get('why', '')}", flush=True)
     summary = summarise(scenario, verdicts, [a for a, _ in arms])
-    (out / "summary.md").write_text(summary, encoding="utf-8")
+    write_run_file(out, "summary.md", summary)
     print("\n" + summary + f"\nruns kept under {out}")
     return 0
 

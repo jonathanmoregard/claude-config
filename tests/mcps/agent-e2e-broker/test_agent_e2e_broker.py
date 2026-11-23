@@ -219,15 +219,63 @@ class ScrubRunsTests(unittest.TestCase):
             self.assertIn("incomplete", load_server()._scrub_runs(Path(tmp) / "runs"))
             self.assertTrue((home / ".claude.json").is_file())
 
-    def test_sweep_scrubs_only_campaigns_whose_unit_stopped(self) -> None:
+    def _campaign(self, root: Path, name: str, runs: bool = True) -> Path:
+        campaign = root / name
+        (campaign / "out").mkdir(parents=True)
+        return self._run_tree(campaign / "out/runs") if runs else campaign
+
+    def test_sweep_scrubs_settled_campaigns_once_and_leaves_the_rest(self) -> None:
         server = load_server()
-        server._unit_settled = lambda policy, unit: unit.endswith("-done")
+        asked = []
+
+        def state(policy, unit):
+            asked.append(unit)
+            return "inactive" if unit.endswith("done") else "active"
+        server._unit_state = state
         with tempfile.TemporaryDirectory() as tmp:
-            done = self._run_tree(Path(tmp) / "c-done/out/runs")
-            live = self._run_tree(Path(tmp) / "c-live/out/runs")
-            self.assertEqual(server._scrub_settled({}, Path(tmp)), "")
+            root = Path(tmp)
+            done = self._campaign(root, "c-done")
+            live = self._campaign(root, "c-live")
+            setup = self._campaign(root, "c-setup-done", runs=False)
+            mine = self._campaign(root, "c-mine-done")
+            self.assertEqual(server._scrub_settled({}, root, root / "c-mine-done"), "")
             self.assertFalse((done / ".claude.json").exists())
+            self.assertTrue((root / "c-done/scrubbed").exists())
             self.assertTrue((live / ".claude.json").is_file())
+            self.assertTrue((mine / ".claude.json").is_file())
+            self.assertFalse((setup / "scrubbed").exists())
+            asked.clear()
+            server._scrub_settled({}, root, root / "c-mine-done")
+            self.assertNotIn(server.UNIT_PREFIX + "c-done", asked)
+
+    def test_sweep_reports_a_failed_probe_instead_of_skipping_silently(self) -> None:
+        server = load_server()
+
+        def broken(policy, unit):
+            raise RuntimeError("no bus")
+        server._unit_state = broken
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-done")
+            self.assertIn("no bus", server._scrub_settled({}, Path(tmp), Path(tmp) / "x"))
+            self.assertTrue((home / ".claude.json").is_file())
+
+    def test_probe_asks_the_user_manager_env(self) -> None:
+        server = load_server()
+        seen = {}
+        real = subprocess.run
+
+        def spy(argv, **kw):
+            seen.update(kw.get("env") or {})
+            return real(["true"], capture_output=True, text=True)
+        server.subprocess.run = spy
+        try:
+            server._unit_state({"path": os.environ["PATH"].split(":"), "envPassthrough": []},
+                               "x")
+        except (KeyError, RuntimeError):
+            pass
+        finally:
+            server.subprocess.run = real
+        self.assertEqual(seen.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}")
 
 
 class KilledCampaignTests(Fixture):
@@ -256,6 +304,7 @@ class KilledCampaignTests(Fixture):
         self.server._tool_run(self.req(n=1), rec)
         self.assertTrue(list(self.out.glob("*/out/runs/*/*/*/planted")), "stub never ran")
         self.assertEqual(list(self.out.glob("*/out/runs/**/.claude.json")), [])
+        self.assertTrue(list(self.out.glob("*/scrubbed")), "clean campaign left unmarked")
 
 
 class ValidationTests(Fixture):

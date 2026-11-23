@@ -337,6 +337,7 @@ def test_run_is_scrubbed_when_setup_fails(tmp_path):
 
 
 def test_secrets_outside_home_are_scrubbed_too(tmp_path):
+    _require_sandbox()
     # A nested harness's runs, the work tree, a HOME the run moved: all are
     # inside the run dir and none is its home/.
     claude = fake_claude(tmp_path, _ok(
@@ -357,6 +358,7 @@ def test_secrets_outside_home_are_scrubbed_too(tmp_path):
     'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"',
 ])
 def test_scrub_and_writes_never_follow_a_link_the_run_planted(tmp_path, swap):
+    _require_sandbox()
     # The harness acts outside the sandbox on a tree the run could rewrite: a
     # planted link must not aim its deletes or its result writes.
     decoy = _decoy(tmp_path / "decoy")
@@ -369,9 +371,11 @@ def test_scrub_and_writes_never_follow_a_link_the_run_planted(tmp_path, swap):
 
 
 def test_a_failed_scrub_item_keeps_the_verdict_and_the_rest_of_the_scrub(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, _ok(
         _PLANT + '\nmkdir -p "$HOME/.ssh/locked"; touch "$HOME/.ssh/locked/f"; '
         'chmod 000 "$HOME/.ssh/locked"\n'
+        'for i in $(seq 20); do mkdir -p "$HOME/.ssh/k_$i"; touch "$HOME/.ssh/k_$i/key"; done\n'
         'mkdir -p "$HOME/d"; touch "$HOME/d/f"; chmod 400 "$HOME/d"'))
     _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
     run = out / "sc/new/1"
@@ -381,13 +385,29 @@ def test_a_failed_scrub_item_keeps_the_verdict_and_the_rest_of_the_scrub(tmp_pat
         assert any(".ssh" in e for e in errors) and any("/d" in e for e in errors), errors
         assert json.loads((run / "verdict.json").read_text())["scrub_errors"] == errors
         assert (run / "scrub-errors.txt").read_text().splitlines() == errors
-        for rel in (".claude.json", ".claude/.credentials.json", ".codex"):
+        for rel in (".claude.json", ".claude/.credentials.json", ".codex", ".ssh/id_x"):
             assert not (run / "home" / rel).exists(), rel
+        assert not list((run / "home/.ssh").glob("k_*")), "siblings of a locked entry kept"
         assert not [p for p in (run / "home/.claude").rglob("*") if p.is_symlink()]
     finally:
         for rel in (".ssh/locked", "d"):
             if (run / "home" / rel).exists():
                 (run / "home" / rel).chmod(0o700)
+
+
+def test_a_failed_scrub_record_does_not_cost_the_verdict(tmp_path):
+    _require_sandbox()
+    claude = fake_claude(tmp_path, _ok(
+        _PLANT + '\nmkdir "$E2E_RUN/scrub-errors.txt"\n'
+        'mkdir -p "$HOME/.ssh/locked"; chmod 000 "$HOME/.ssh/locked"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    run = out / "sc/new/1"
+    try:
+        assert verdicts[0]["verdict"] == "PASS", verdicts[0]
+        assert json.loads((run / "verdict.json").read_text())["scrub_errors"]
+    finally:
+        if (run / "home/.ssh/locked").exists():
+            (run / "home/.ssh/locked").chmod(0o700)
 
 
 def test_scrub_subcommand_cleans_runs_a_killed_harness_left(tmp_path):
