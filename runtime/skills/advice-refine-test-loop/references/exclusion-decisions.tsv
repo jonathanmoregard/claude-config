@@ -1,0 +1,3 @@
+fp_reason	decision	date
+tool exists in live server list	accepted	2026-11-20
+precondition blocked by sandbox	rejected	2026-11-23
