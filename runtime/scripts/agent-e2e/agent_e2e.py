@@ -355,16 +355,36 @@ def _redaction_client():
     return mod
 
 
+def _rewrite(fd: int, data: bytes) -> None:
+    """Replace the content of the file open read-only at FD. A file the run
+    kept read-only (git objects are 0444) gets the owner write bit for the
+    write and its mode back after. The write goes to the same inode, reopened
+    through /proc/self/fd: no path is looked up, so nothing can be swapped in."""
+    mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    if not mode & stat.S_IWUSR:
+        os.fchmod(fd, mode | stat.S_IWUSR)
+    try:
+        w = os.open(f"/proc/self/fd/{fd}", os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(w, view):]
+        finally:
+            os.close(w)
+    finally:
+        if not mode & stat.S_IWUSR:
+            os.fchmod(fd, mode)
+
+
 def _withhold(fd: int, why: str) -> None:
-    os.ftruncate(fd, 0)
-    os.pwrite(fd, WITHHELD.format(why=why).encode(), 0)
+    _rewrite(fd, WITHHELD.format(why=why).encode())
 
 
 def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
     """Redact secrets in every regular file under PATH, in place. Returns the
-    errors. Each file is read and rewritten through one O_NOFOLLOW fd, so a
-    run cannot swap a path under it. A file is rewritten only when a secret
-    was found in it.
+    errors. Each file is opened once, read-only and O_NOFOLLOW, and any
+    rewrite goes to that same inode (see _rewrite), so a run cannot swap a
+    path under it. A file is rewritten only when a secret was found in it.
 
     REQUIRED fails closed: a file that cannot be scanned (no scanner, a scan
     that fails, a file past the scan limit or not writable) is withheld, its
@@ -417,8 +437,7 @@ def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
                     _withhold(fd, f"not scanned for secrets: {failed}")
                     errors.append(f"{where}: withheld, not scanned: {failed}")
                 elif result != text:
-                    os.ftruncate(fd, 0)
-                    os.pwrite(fd, result.encode(), 0)
+                    _rewrite(fd, result.encode())
             except OSError as exc:
                 errors.append(f"{where}: could not redact: {exc}")
             finally:
@@ -438,11 +457,11 @@ def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
             for name in filenames:
                 where = path / dirpath / name
                 try:
-                    fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                                  | os.O_CLOEXEC, dir_fd=dfd)
                 except FileNotFoundError:
                     continue
-                except OSError as exc:  # a link or FIFO the removal pass missed, a 0400 file
+                except OSError as exc:  # a mode-000 file
                     errors.append(f"{where}: not scanned: {exc}")
                     if required:
                         try:

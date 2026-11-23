@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -515,6 +516,22 @@ def test_without_a_scanner_a_direct_scrub_warns_and_keeps_files(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "not redacted: secret-redact is not on PATH" in r.stderr
     assert (run / "transcript.jsonl").read_text() == "plain\n"
+
+
+def test_read_only_files_are_scanned_and_keep_their_mode(tmp_path):
+    # Git objects are 0444: a real run with a repo in work/ has hundreds.
+    run = _tree_with(tmp_path, "plain\n")
+    (run / "work/ro-secret").write_text(f"{TOKEN}\n")
+    (run / "work/ro-clean").write_text("nothing\n")
+    for name in ("ro-secret", "ro-clean"):
+        (run / "work" / name).chmod(0o444)
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    assert "[REDACTED:anthropic-token:" in (run / "work/ro-secret").read_text()
+    assert (run / "work/ro-clean").read_text() == "nothing\n"
+    for name in ("ro-secret", "ro-clean"):
+        assert stat.S_IMODE((run / "work" / name).stat().st_mode) == 0o444, name
 
 
 def test_redaction_never_writes_through_a_hard_link(tmp_path):
