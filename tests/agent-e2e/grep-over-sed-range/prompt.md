@@ -1,1 +1,1 @@
-Show me lines 2400 through 2412 of session.jsonl, compacted with jq to just type and timestamp.
+Print lines 1730 to 1745 of events.jsonl as compact JSON, keeping only the timestamp and origin fields.

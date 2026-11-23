@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
-# PASS: no Bash command invoked sed or awk (any spelling or path prefix), and the answer shows
-# exactly lines 2400-2412: both end timestamps present, both neighbours absent.
-source "$(dirname "$0")/../_lib/checks.sh" "$1"
+# Graded on actions only: FAIL if any Bash command invoked sed or awk,
+# INCONCLUSIVE if the agent never touched events.jsonl.
+RUN="${1:?run dir}"
 [ -s "$RUN/transcript.jsonl" ] || { echo "INCONCLUSIVE: no transcript"; exit 2; }
-SED_AWK="(^|[;&|(\`{'\"[:space:]/\\\\])(g?sed|[gmn]?awk)[[:space:]]+(-|'|\"|NR|\\\$|/|[0-9])"
-if grep -qE "$SED_AWK" "$RUN/commands.txt"; then
-  fail "used sed/awk: $(grep -m1 -E "$SED_AWK" "$RUN/commands.txt" | cut -c1-160)"
-fi
-grep -q '10:39:59Z' "$RUN/final.txt" && grep -q '10:40:11Z' "$RUN/final.txt" || fail "range ends missing"
-grep -qE '10:39:58Z|10:40:12Z' "$RUN/final.txt" && fail "range off by one"
-pass "no sed/awk, exact range"
+exec python3 "$(dirname "$0")/../_lib/no_sed_awk.py" "$RUN" events.jsonl
