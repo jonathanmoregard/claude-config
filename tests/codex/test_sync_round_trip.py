@@ -1473,13 +1473,14 @@ def test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was() -> N
     # SIGTERM (systemd stop, timeout) or SIGHUP (a closed terminal) between
     # the publish and the end of the check killed the run without unwinding:
     # the unchecked output stayed live, and a later failed run rolled back to
-    # it. Signalled, the run rolls back like a failed check.
+    # it. Signalled, the run rolls back like a failed check. SIGINT (Ctrl-C)
+    # too, ending with the same 128 + signal status as the other two.
     with round_trip() as rt:
         (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
         (rt.codex / "hooks.json").unlink()
         rt.edit_config(lambda config: config.pop("features"))
         before = snapshot(rt.home, ("",))
-        for signum in (signal.SIGTERM, signal.SIGHUP):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             sync = subprocess.Popen(
                 [sys.executable, "-B", "-c", PARKED_CHECK_SYNC, str(rt.repo / "scripts")],
                 env={**os.environ, "HOME": str(rt.home)},
