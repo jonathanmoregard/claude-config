@@ -383,6 +383,56 @@ def test_binary_changed_after_the_review_is_drift(sb):
     assert is_deny(out) and "drifted" in reason(out)
 
 
+def _old_script_on_main(sb) -> str:
+    """A behaviour file already on origin/main, big enough that deleting it is
+    no small change; the feature branch is rebased onto it."""
+    git(sb.work, "switch", "-q", "main")
+    sb.commit("scripts/old.sh", "".join(f"echo {i}\n" for i in range(40)), msg="old")
+    git(sb.work, "push", "-q", "origin", "main")
+    git(sb.work, "switch", "-q", "feat/x")
+    git(sb.work, "rebase", "-q", "main")
+    return "scripts/old.sh"
+
+
+def test_deleted_file_need_not_be_read_by_a_passing_review(sb):
+    # Nothing is left at the tip for an advisor's Read to open; the deletion
+    # itself is in the diff the review covers.
+    old = _old_script_on_main(sb)
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    assert sb.gate() is None
+
+
+def test_deleted_file_still_needs_a_passing_review_on_the_branch(sb):
+    old = _old_script_on_main(sb)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    out = sb.gate()
+    assert is_deny(out) and "no advisor verdict is recorded" in reason(out)
+
+
+def test_git_failing_never_counts_as_deleted(sb, tmp_path):
+    # A deleted path is excused from a read; git erroring must not be.
+    tip = git(sb.work, "rev-parse", "HEAD").strip()
+    assert artl_gate.exists_at_tip(str(sb.work), tip, "src/app.py") is True
+    assert artl_gate.exists_at_tip(str(sb.work), tip, "gone.sh") is False
+    assert artl_gate.exists_at_tip(str(tmp_path / "no-repo"), tip, "gone.sh") is True
+    assert artl_gate.exists_at_tip(str(sb.work), "0" * 40, "gone.sh") is True
+
+
+def test_deleted_then_recreated_file_still_needs_a_read(sb):
+    old = _old_script_on_main(sb)
+    git(sb.work, "rm", "-q", old)
+    git(sb.work, "commit", "-qm", "drop old")
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.commit(old, "".join(f"rm -r /tmp/x{i}\n" for i in range(40)), msg="bring it back")
+    sb.review("PASS", reads=["scripts/run.sh"])
+    out = sb.gate()
+    assert is_deny(out) and old in reason(out)
+
+
 def test_text_file_marked_binary_by_attributes_still_needs_a_read(sb):
     sb.commit(".gitattributes", "*.sh -diff\n")
     sb.commit("scripts/run.sh", SCRIPT_BODY)
