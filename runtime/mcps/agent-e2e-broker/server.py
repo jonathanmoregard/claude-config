@@ -502,6 +502,198 @@ def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> 
             tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 
+# The deployed harness beside this server, not the campaign's master checkout:
+# `scrub` must exist whenever this code does, and that checkout is deleted.
+SCRUBBER = HERE.parents[1] / "scripts/agent-e2e/agent_e2e.py"
+# Secret detection everywhere in this config is the `secret-redact` CLI
+# (nixos-config's pkgs.secret-redact: gitleaks with pinned rules), the engine
+# the output-redaction hook and the aggregator use, through the hook's client.
+SECRET_REDACT = "secret-redact"
+REDACT_TIMEOUT = 120.0
+sys.path.insert(0, str(HERE.parents[1] / "hooks"))
+import secret_redaction  # noqa: E402
+
+
+def _secret_redact(policy: dict) -> str:
+    """The scanner on the policy path. Every campaign needs it: its runs and its
+    response are redacted with it, and without it neither can be."""
+    cli = shutil.which(SECRET_REDACT, path=":".join(policy["path"]))
+    if not cli:
+        raise RuntimeError(f"BROKEN safety boundary: {SECRET_REDACT} is not on the policy path")
+    return cli
+
+
+def _scrub_runs(policy: dict, runs: Path) -> str:
+    """Strip account material from every run dir under RUNS. The unit is
+    SIGKILLed on cancel and RuntimeMaxSec, which skips the harness's own
+    per-run scrub. Redaction is required: a file it cannot scan is withheld.
+    Returns an error report, or "" when clean; never raises.
+    The report names at most SCRUB_REPORT_LINES entries: it leads the tool
+    response, so an unbounded one would push the verdicts past the cut."""
+    if not os.path.lexists(runs):  # a link planted here is scrub's to refuse
+        return ""
+    try:
+        if stat.S_IMODE(os.lstat(runs).st_mode) == 0:  # locked by a scrub that died
+            _set_dir_mode(runs, 0o700)
+        p = subprocess.run([sys.executable, "-I", str(SCRUBBER), "scrub", "--require-redaction",
+                            str(runs)], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=SCRUB_TIMEOUT,
+                           env={"PATH": ":".join(policy["path"]), "LANG": "C.UTF-8"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Killed mid-walk, the scrub leaves files it never reached readable and
+        # unscanned. Lock RUNS until a later scrub gets through it.
+        try:
+            _set_dir_mode(runs, 0)
+            locked = "locked (mode 000) until a later scrub completes"
+        except OSError as lock_exc:
+            locked = f"and could not be locked: {lock_exc}"
+        return f"{TAG} scrub of {runs} failed: {exc!r}; {locked}"
+    if p.returncode == 0:
+        return ""
+    lines = p.stderr.strip().splitlines()
+    if len(lines) > SCRUB_REPORT_LINES:
+        lines = [*lines[:SCRUB_REPORT_LINES],
+                 f"... {len(lines) - SCRUB_REPORT_LINES} more; `scrub {runs}` lists them all"]
+    return f"{TAG} scrub of {runs} incomplete (exit {p.returncode}):\n" + "\n".join(lines)
+
+
+SCRUB_REPORT_LINES = 10
+SCRUB_TIMEOUT = 600
+LOGS = ("harness.out", "harness.err")   # in the campaign dir; the unit appends to them
+SCRUB_REPORT_CHARS = 4000    # the whole scrub section of one response
+SCRUBBED_MARK = "scrubbed"   # in the campaign dir, which no unit can write
+REPORTED_MARK = "scrub-reported"
+
+
+def _unit_state(policy: dict, unit: str) -> str:
+    """UNIT's ActiveState. Raises when systemd cannot be asked."""
+    systemctl = shutil.which("systemctl", path=":".join(policy["path"]))
+    if not systemctl:
+        raise RuntimeError("systemctl is not on the policy path")
+    p = subprocess.run([systemctl, "--user", "show", "-p", "ActiveState", "--value",
+                        f"{unit}.service"], stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, timeout=30, env=_manager_env(policy))
+    if p.returncode != 0:
+        raise RuntimeError(f"systemctl exit {p.returncode}: {p.stderr.strip()}")
+    return p.stdout.strip()
+
+
+def _set_dir_mode(path: Path, mode: int) -> None:
+    """chmod the directory PATH itself, never through a link at PATH. O_PATH
+    opens it whatever its mode; /proc/self/fd then names that very inode."""
+    fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.chmod(f"/proc/self/fd/{fd}", mode)
+    finally:
+        os.close(fd)
+
+
+def _redact_logs(policy: dict, campaign: Path) -> str:
+    """Redact the unit's harness.out and harness.err, which sit outside runs/
+    but inside the Read-allowed tree and carry each verdict's reason. Only once
+    the unit has stopped: it appends to them. A log that cannot be scanned is
+    withheld. Returns an error report, or ""; never raises."""
+    errors = []
+    for name in LOGS:
+        try:
+            fd = os.open(campaign / name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{campaign / name}: not scanned: {exc}")
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            text = os.pread(fd, size, 0).decode("utf-8", "replace") if size <= LOG_SCAN_BYTES else None
+            try:
+                if text is None:
+                    raise secret_redaction.ScanError(f"{size} bytes is past the scan limit")
+                clean = secret_redaction.redact_value(text, cli=_secret_redact(policy),
+                                                      timeout=REDACT_TIMEOUT)
+            except (secret_redaction.ScanError, RuntimeError) as exc:
+                clean = f"{TAG} withheld: not scanned for secrets: {exc}\n"
+                errors.append(f"{campaign / name}: withheld, not scanned: {exc}")
+            if clean != text:
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, clean.encode(), 0)
+        except OSError as exc:
+            errors.append(f"{campaign / name}: could not redact: {exc}")
+        finally:
+            os.close(fd)
+    return f"{TAG} logs of {campaign.name}:\n" + "\n".join(errors) if errors else ""
+
+
+LOG_SCAN_BYTES = 4 * 1024 * 1024
+
+
+def _mark(campaign: Path, name: str) -> str:
+    """Create CAMPAIGN/NAME. Returns an error report, or ""; never raises: a
+    missing mark only means the next sweep looks at the campaign again."""
+    try:
+        os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o600))
+    except OSError as exc:
+        return f"{TAG} could not mark {campaign.name} {name}; the next sweep retries: {exc}"
+    return ""
+
+
+def _scrub_stopped(policy: dict, campaign: Path) -> str:
+    """Scrub CAMPAIGN, whose unit systemd has said is stopped, and mark it when
+    clean. Left dirty, it is scrubbed again by every sweep, but only its first
+    report is given in full: after that it costs each response one line."""
+    report = "\n".join(r for r in (_scrub_runs(policy, campaign / "out" / "runs"),
+                                    _redact_logs(policy, campaign)) if r)
+    if not report:
+        return _mark(campaign, SCRUBBED_MARK)
+    if os.path.lexists(campaign / REPORTED_MARK):
+        return (f"{TAG} {campaign / 'out' / 'runs'} still incomplete, as reported "
+                f"before; `scrub` it after fixing what blocks it")
+    return "\n".join(p for p in (report, _mark(campaign, REPORTED_MARK)) if p)
+
+
+def _scrub_after_unit(policy: dict, campaign: Path) -> str:
+    """Post-unit scrub of CAMPAIGN. Asks systemd first: a unit that outlived the
+    broker's wait can still write, so a scrub that ran before the unit was
+    known stopped proves nothing. Such a campaign is scrubbed best-effort and
+    left unmarked for the sweep."""
+    try:
+        state = _unit_state(policy, UNIT_PREFIX + campaign.name)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        state, why = None, f"cannot ask systemd about {campaign.name}: {exc}"
+    else:
+        why = f"unit for {campaign.name} still {state or 'unknown'}"
+    if state in ("inactive", "failed"):
+        return _scrub_stopped(policy, campaign)
+    report = _scrub_runs(policy, campaign / "out" / "runs")
+    return "\n".join(p for p in (report, f"{TAG} {why}; left for the sweep") if p)
+
+
+def _scrub_settled(policy: dict, campaigns: Path, skip: Path) -> str:
+    """Scrub every campaign whose unit ran and has stopped, once. A broker that
+    exits mid-campaign takes its unit down (pdeathsig) before its own
+    post-unit scrub runs; the next campaign on any broker catches it here.
+    A campaign with no runs/ yet is still in setup, so it is left unmarked."""
+    reports = []
+    for entry in os.scandir(campaigns):
+        campaign = Path(entry.path)
+        if (campaign == skip or not entry.is_dir(follow_symlinks=False)
+                or os.path.lexists(campaign / SCRUBBED_MARK)
+                or not os.path.lexists(campaign / "out" / "runs")):
+            continue
+        try:
+            state = _unit_state(policy, UNIT_PREFIX + entry.name)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            reports.append(f"{TAG} sweep stopped: cannot ask systemd about "
+                           f"{entry.name}: {exc}")
+            break
+        if state not in ("inactive", "failed"):
+            continue
+        report = _scrub_stopped(policy, campaign)
+        if report:
+            reports.append(report)
+    return "\n".join(reports)
+
+
 def _launch(argv: list[str], env: dict, lock_fd: int) -> subprocess.Popen:
     return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
@@ -534,29 +726,17 @@ def _run_argv(proc: subprocess.Popen, timeout_s: int, rec: Optional[_InFlight]):
         return 124, out or "", (err or "") + f"\n{TAG} harness exceeded {timeout_s}s; stopped"
 
 
-_SECRET_PATTERNS = [
-    ("anthropic-api", re.compile(r"sk-ant-(?:api|oat|ort)\d{2}-[A-Za-z0-9_\-]{20,}")),
-    ("openai", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}")),
-    ("github-token", re.compile(r"\bgh[psoure]_[A-Za-z0-9]{36,}\b")),
-    ("github-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
-    ("slack-token", re.compile(r"\bxox[boaprs]-[A-Za-z0-9\-]{10,}\b")),
-    ("aws-access", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("tavily-key", re.compile(r"\btvly-[A-Za-z0-9_\-]{20,}\b")),
-    ("age-secret-key", re.compile(r"\bAGE-SECRET-KEY-1[0-9A-Z]{58}\b")),
-]
-_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----"
-    r"(?:.*?-----END (?:[A-Z0-9 ]*)PRIVATE KEY(?: BLOCK)?-----|.*\Z)",
-    re.DOTALL,
-)
+def _scrub_section(*reports: str) -> str:
+    """The scrub reports that lead a response, capped at SCRUB_REPORT_CHARS."""
+    section = "\n".join(r for r in reports if r)
+    if len(section) > SCRUB_REPORT_CHARS:
+        section = section[:SCRUB_REPORT_CHARS] + f"\n{TAG} scrub reports cut"
+    return section
 
 
-def _redact(body: str) -> str:
-    body = _PRIVATE_KEY_RE.sub(lambda m: f"[REDACTED:private-key:{len(m.group(0))}chars]", body)
-    for label, pat in _SECRET_PATTERNS:
-        body = pat.sub(lambda m, _l=label: f"[REDACTED:{_l}:{len(m.group(0))}chars]", body)
-    return body
+def _redact(body: str, cli: str) -> str:
+    """BODY with every secret redacted. Raises secret_redaction.ScanError."""
+    return secret_redaction.redact_value(body, cli=cli, timeout=REDACT_TIMEOUT)
 
 
 def _report(out: Path, scenario: str, n: int) -> str:
@@ -581,7 +761,20 @@ def _prune(campaigns: Path) -> None:
     cutoff = time.time() - RETAIN_SEC
     for entry in os.scandir(campaigns):
         if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            _unlock_tree(Path(entry.path))
             shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _unlock_tree(root: Path) -> None:
+    """Give every directory under ROOT its owner bits back, so rmtree can empty
+    it: a run can leave a mode-000 directory the scrub never could, and its
+    campaign would otherwise outlive every prune. Links are never followed."""
+    for dirpath, dirnames, _ in os.walk(root):
+        for name in dirnames:
+            try:
+                _set_dir_mode(Path(dirpath) / name, 0o700)
+            except OSError:
+                continue  # a link, or gone: rmtree, which follows nothing, decides
 
 
 def _open_lock(path: Path) -> int:
@@ -624,6 +817,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     exe = policy["claudeExecutable"]
     if not os.access(exe, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: claude is not executable: {exe}")
+    redactor = _secret_redact(policy)
     _private_dir(policy["stateDir"])
     # One deadline bounds every wait before the run: slot, then mirror lock.
     deadline = time.monotonic() + policy["maxQueueSec"]
@@ -671,30 +865,40 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 policy.pop("mirror_fd", None)
                 policy.pop("in_flight", None)
                 os.close(mirror)
+            # Outside the mirror lock: no other campaign's setup waits on it.
+            swept = _scrub_settled(policy, campaigns, campaign)
             proc = _launch(supervised, _manager_env(policy), lock)
         except BaseException:
             # Nothing ran yet: the whole campaign dir goes, not only the harness.
             if campaign is not None:
                 shutil.rmtree(campaign, ignore_errors=True)
             raise
+        scrubbed = ""
         try:
             rc, _, client = _run_argv(proc, req["call_timeout"] + 60, rec)
             stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
-            stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
         finally:
+            scrubbed = _scrub_after_unit(policy, campaign)
             shutil.rmtree(campaign / "harness", ignore_errors=True)
+        stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
     finally:
         os.close(lock)
+    # First, so a response cut at outputLimitChars still carries it.
+    scrub_report = _scrub_section(scrubbed, swept)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
-              f"harness = origin/master = {master}\n"
+              + (f"{scrub_report}\n" if scrub_report else "")
+              + f"harness = origin/master = {master}\n"
               f"old = {req['old_ref']} = {old}\nnew = {req['new_ref']} = {new}\n"
               f"output: {out}\n")
     body = "\n".join([header, stdout.rstrip(), "--- per run ---",
                       _report(out, req["scenario"], req["n"]),
                       *(["--- stderr ---", stderr.rstrip()[-4000:]] if stderr.strip() else []),
                       f"--- harness exit {rc} ---"])
-    body = _redact(body)
+    try:
+        body = _redact(body, redactor)
+    except secret_redaction.ScanError as exc:  # fail closed: no unscanned text leaves
+        return f"{TAG} response withheld: the secret scan failed ({exc}); runs: {out}"
     limit = policy["outputLimitChars"]
     return body if len(body) <= limit else body[:limit] + f"\n{TAG} output truncated; see {out}"
 
