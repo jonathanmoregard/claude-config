@@ -107,18 +107,20 @@ def tree_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
-def tree_state(root: Path) -> dict[str, tuple[str, bytes | str]]:
+def tree_state(root: Path) -> dict[str, tuple[str, bytes | str, int]]:
+    """Every entry under root: a link by target, a file by bytes and mode,
+    a directory by mode, so a rollback that restores another mode differs."""
     if not root.exists() and not root.is_symlink():
         return {}
-    state: dict[str, tuple[str, bytes | str]] = {}
+    state: dict[str, tuple[str, bytes | str, int]] = {}
     for path in [root, *sorted(root.rglob("*"))]:
         relative = "." if path == root else str(path.relative_to(root))
         if path.is_symlink():
-            state[relative] = ("symlink", os.readlink(path))
+            state[relative] = ("symlink", os.readlink(path), 0)
         elif path.is_dir():
-            state[relative] = ("directory", b"")
+            state[relative] = ("directory", b"", path.stat().st_mode & 0o7777)
         else:
-            state[relative] = ("file", path.read_bytes())
+            state[relative] = ("file", path.read_bytes(), path.stat().st_mode & 0o7777)
     return state
 
 
@@ -177,7 +179,7 @@ def assert_wrapper_trees_unchanged(
 
 def live_state(
     codex: Path, plugin: Path, agents: Path
-) -> dict[str, dict[str, tuple[str, bytes | str]]]:
+) -> dict[str, dict[str, tuple[str, bytes | str, int]]]:
     return {
         "codex": tree_state(codex),
         "plugin": tree_state(plugin),
