@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 HOME = Path.home()
@@ -21,6 +22,47 @@ LEGACY_PLUGIN_LINK = CODEX / "plugins" / PLUGIN_NAME
 IMPORT_DIR = REPO / "imports" / "claude-live"
 MANIFEST = IMPORT_DIR / "manifest.json"
 REPORT_DIR = CODEX / "claude-setup-mirror"
+
+# The directories the output lives in: each managed path's parent, which
+# also holds what a killed run leaves beside one (render_codex.managed_paths,
+# beside_managed_path).
+OUTPUT_TREES = (CODEX, AGENTS_HOME, PLUGIN_ROOT.parent)
+# Where the output is written and read; None: in place, under HOME. Set only
+# by staged_output.
+STAGE: Path | None = None
+
+
+def in_stage(path: Path, stage: Path) -> Path:
+    """Where stage holds path, a path under HOME: the same place relative to
+    stage, for a path in an output tree; any other path is itself."""
+    for tree in OUTPUT_TREES:
+        if path == tree or tree in path.parents:
+            return stage / path.relative_to(HOME)
+    return path
+
+
+def located(path: Path) -> Path:
+    """Where the output path names is on disk: in the stage while
+    staged_output holds one, else path itself.
+
+    The output keeps naming HOME (hook commands, role files and link
+    targets hold absolute paths), so every write helper here, and every
+    read the render and the check make of the output, goes through this.
+    """
+    if STAGE is None or path == STAGE or STAGE in path.parents:
+        return path
+    return in_stage(path, STAGE)
+
+
+@contextmanager
+def staged_output(stage: Path) -> Iterator[None]:
+    """Within the block, the output trees are written and read under stage."""
+    global STAGE
+    STAGE = stage
+    try:
+        yield
+    finally:
+        STAGE = None
 
 RESERVED_SKILL_NAMES = {
     "imagegen",
@@ -66,6 +108,7 @@ SECRET_KEY_PARTS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL")
 
 
 def mkdir(path: Path) -> None:
+    path = located(path)
     assert_not_claude_write(path)
     path.mkdir(parents=True, exist_ok=True)
 
@@ -106,6 +149,7 @@ def default_created_file_mode() -> int:
 
 
 def write_file(path: Path, text: str, mode: int | None = None) -> bool:
+    path = located(path)
     assert_not_claude_write(path)
     mkdir(path.parent)
     existing_mode: int | None = None
@@ -149,6 +193,7 @@ def write_file(path: Path, text: str, mode: int | None = None) -> bool:
 
 
 def remove_path(path: Path) -> None:
+    path = located(path)
     assert_not_claude_write(path)
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
@@ -182,6 +227,7 @@ def replace_entry(dst: Path, build: Callable[[Path], object]) -> bool:
     directory on either side cannot be renamed over, so what stands at dst
     moves aside first; dst is missing only between those two renames.
     """
+    dst = located(dst)
     assert_not_claude_write(dst)
     mkdir(dst.parent)
     holder = Path(tempfile.mkdtemp(prefix=f".{dst.name}.swap-", dir=dst.parent))
@@ -210,6 +256,7 @@ def copy_tree_clean(src: Path, dst: Path) -> None:
 
 
 def link_or_copy(src: Path, dst: Path) -> str:
+    dst = located(dst)
     assert_not_claude_write(dst)
     if dst.is_symlink() and Path(os.readlink(dst)) == src:
         return "already-linked"

@@ -35,6 +35,8 @@ from roundtrip_support import (  # noqa: E402
     snapshot,
 )
 
+import common  # noqa: E402  (roundtrip_support put codex/scripts on sys.path)
+
 
 GITHUB_CHILD_SETS: tuple[dict[str, list[str]], ...] = (
     {},
@@ -296,6 +298,16 @@ def test_mirror_owns_exactly_the_paths_the_production_publish_manages() -> None:
     owned = tuple(path.relative_to(home) for path in render_codex.managed_paths())
     kept = tuple(path.relative_to(home) for path in render_codex.never_pruned_paths())
     assert (owned, kept) == (PUBLISH_MANAGED_PATHS, PUBLISH_NEVER_PRUNED_PATHS)
+
+
+def test_the_stage_holds_every_managed_path_and_what_sits_beside_it() -> None:
+    # A direct sync writes and reads the output only under its stage. A
+    # managed path, or a leftover beside one (beside_managed_path), outside
+    # the staged trees would be read, or pruned, in the home itself.
+    home, stage = Path.home(), Path("/stage")
+    for root in render_codex.managed_paths():
+        for path in (root, root.parent / f".{root.name}.swap-x", root.parent / f"{root.name}.bak-x"):
+            assert common.in_stage(path, stage) == stage / path.relative_to(home), path
 
 
 # Where a backup machinery used to keep what the sync removed. The mirror
@@ -1930,6 +1942,7 @@ if __name__ == "__main__":
     test_check_rejects_config_key_the_render_does_not_produce()
     test_sync_repairs_a_damaged_wrapper_it_published()
     test_mirror_owns_exactly_the_paths_the_production_publish_manages()
+    test_the_stage_holds_every_managed_path_and_what_sits_beside_it()
     test_sync_replaces_a_hand_made_skill_at_a_planned_name_without_backup()
     test_sync_prunes_skills_the_plan_does_not_hold_but_not_codex_system_skills()
     test_failed_publish_restores_the_skill_it_replaced()

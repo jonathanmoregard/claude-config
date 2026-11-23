@@ -11,6 +11,9 @@ Two independent layers, both must pass:
    faithfully reproduces still cannot publish an unsafe Codex config. The one
    function they borrow is the hook fan-out's own plan loader: what it
    rejects, the runtime rejects.
+
+Every read of the output goes through common.located; every path the check
+names is the one under HOME.
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ from common import (
     REPO,
     REPORT_DIR,
     load_json,
+    located,
 )
 from import_claude import file_inventory
 from render_codex import (
@@ -243,7 +247,7 @@ def profile_paths() -> list[Path]:
     `.codex/<name>.config.toml` in a project is not read. A missing file is
     no layer. The glob is a superset of the names Codex accepts.
     """
-    return sorted(path for path in CODEX.glob("*.config.toml") if path.is_file())
+    return [path for path in output_glob(CODEX, "*.config.toml") if located(path).is_file()]
 
 
 def profile_invariant_errors(profile: dict[str, Any]) -> list[str]:
@@ -297,9 +301,9 @@ def agent_role_paths(config: dict[str, Any] | None) -> list[Path]:
         if isinstance(config_file, str):
             path = Path(config_file).expanduser()
             paths.add(path if path.is_absolute() else CODEX / path)
-    root = CODEX / "agents"
-    if root.is_dir():
-        paths.update(path for path in root.rglob("*.toml") if path.is_file())
+    paths.update(
+        path for path in output_glob(CODEX / "agents", "**/*.toml") if located(path).is_file()
+    )
     return sorted(paths)
 
 
@@ -416,7 +420,7 @@ def report_invariant_errors(report: object) -> list[str]:
 
 
 def validate_frontmatter(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
+    text = located(path).read_text(encoding="utf-8")
     if not text.startswith("---\n"):
         return [f"{path}: missing frontmatter"]
     end = text.find("\n---", 4)
@@ -520,9 +524,16 @@ def validate_hooks_document(document: object, path: str | Path) -> list[str]:
     return errors
 
 
+def output_glob(root: Path, pattern: str) -> list[Path]:
+    """The output paths under root that pattern matches, sorted, by the
+    names they have under HOME, wherever common.located puts them."""
+    on_disk = located(root)
+    return sorted(root / path.relative_to(on_disk) for path in on_disk.glob(pattern))
+
+
 def read_text(path: Path, errors: list[str]) -> str | None:
     try:
-        return path.read_text(encoding="utf-8")
+        return located(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         errors.append(f"{path}: missing")
     except (OSError, UnicodeDecodeError) as exc:
@@ -646,7 +657,7 @@ def hook_wrapper_invariant_errors(
             if plan is None:
                 continue
             try:
-                load_handlers(path)
+                load_handlers(path, locate=located)
             except ValueError as exc:
                 errors.append(f"{path}: {exc}")
             handlers = plan.get("handlers")
@@ -702,12 +713,11 @@ def output_invariant_errors() -> list[str]:
     # the sync renders; scan them all, nested and hidden ones included.
     rules_root = CODEX / "rules"
     rules_paths = {rules_root / "default.rules"}
-    if rules_root.is_dir():
-        # A directory whose name ends in .rules is not a rules file, and the
-        # same walk reaches the rules files inside it.
-        rules_paths.update(
-            path for path in rules_root.rglob("*.rules") if path.is_file()
-        )
+    # A directory whose name ends in .rules is not a rules file, and the
+    # same walk reaches the rules files inside it.
+    rules_paths.update(
+        path for path in output_glob(rules_root, "**/*.rules") if located(path).is_file()
+    )
     for rules_path in sorted(rules_paths):
         rules = read_text(rules_path, errors)
         if rules is not None:
@@ -729,7 +739,7 @@ def output_invariant_errors() -> list[str]:
 
     # Codex reads skills from both roots; commands render as skills too.
     for root in (CODEX / "skills", PLUGIN_ROOT / "skills"):
-        for skill in sorted(root.glob("*/SKILL.md")):
+        for skill in output_glob(root, "*/SKILL.md"):
             if skill.parent.name == ".system":
                 continue
             text = read_text(skill, errors)

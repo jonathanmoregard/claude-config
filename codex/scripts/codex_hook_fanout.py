@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from codex_hook_output_adapter import claude_input_payloads, codex_payload_from
 
@@ -48,9 +48,14 @@ class Outcome:
     timed_out: bool = False
 
 
-def load_handlers(path: Path) -> list[Handler]:
+def load_handlers(path: Path, locate: Callable[[Path], Path] = Path) -> list[Handler]:
+    """The plan's handlers, or ValueError naming what the fan-out rejects.
+
+    locate maps a path the plan names to where it is on disk: the check
+    passes common.located, which knows where the output is written.
+    """
     try:
-        plan = json.loads(path.read_text(encoding="utf-8"))
+        plan = json.loads(locate(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read hook plan {path}: {exc}") from exc
     if not isinstance(plan, dict) or not isinstance(plan.get("handlers"), list):
@@ -72,7 +77,8 @@ def load_handlers(path: Path) -> list[Handler]:
         wrapper = value.get("wrapper")
         if not isinstance(wrapper, str) or not Path(wrapper).is_absolute():
             raise ValueError(f"{prefix}.wrapper must be an absolute path")
-        if not Path(wrapper).is_file() or not os.access(wrapper, os.X_OK):
+        on_disk = locate(Path(wrapper))
+        if not on_disk.is_file() or not os.access(on_disk, os.X_OK):
             raise ValueError(f"{prefix}.wrapper must be an executable file")
         timeout = value.get("timeout")
         if (

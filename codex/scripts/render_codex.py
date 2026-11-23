@@ -37,6 +37,7 @@ from common import (
     ignore_generated,
     link_or_copy,
     load_json,
+    located,
     mkdir,
     remove_path,
     replace_entry,
@@ -254,11 +255,13 @@ def ensure_legacy_plugin_link() -> None:
     if LEGACY_PLUGIN_LINK == PLUGIN_ROOT:
         return
     mkdir(LEGACY_PLUGIN_LINK.parent)
-    if LEGACY_PLUGIN_LINK.exists() or LEGACY_PLUGIN_LINK.is_symlink():
-        if LEGACY_PLUGIN_LINK.is_symlink() and Path(os.readlink(LEGACY_PLUGIN_LINK)) == PLUGIN_ROOT:
+    # The link names PLUGIN_ROOT under HOME, wherever it is written.
+    link = located(LEGACY_PLUGIN_LINK)
+    if link.exists() or link.is_symlink():
+        if link.is_symlink() and Path(os.readlink(link)) == PLUGIN_ROOT:
             return
-        remove_path(LEGACY_PLUGIN_LINK)
-    LEGACY_PLUGIN_LINK.symlink_to(PLUGIN_ROOT, target_is_directory=True)
+        remove_path(link)
+    link.symlink_to(PLUGIN_ROOT, target_is_directory=True)
 
 
 CODEX_0146_DESCRIPTION_MAX_CHARS = 96
@@ -842,11 +845,13 @@ def wrong_type_path(path: Path, *, directory: bool = False) -> Path | None:
     root = managed_root(path)
     for ancestor in reversed(path.parents):
         if ancestor == root or root in ancestor.parents:
-            if ancestor.is_symlink() or (ancestor.exists() and not ancestor.is_dir()):
+            on_disk = located(ancestor)
+            if on_disk.is_symlink() or (on_disk.exists() and not on_disk.is_dir()):
                 return ancestor
-    real_dir = path.is_dir() and not path.is_symlink()
+    on_disk = located(path)
+    real_dir = on_disk.is_dir() and not on_disk.is_symlink()
     if directory:
-        return path if (path.exists() or path.is_symlink()) and not real_dir else None
+        return path if (on_disk.exists() or on_disk.is_symlink()) and not real_dir else None
     return path if real_dir else None
 
 
@@ -2024,7 +2029,8 @@ def merge_input_text(path: Path) -> str | None:
     """A merge input's text, or None when no regular file stands there:
     the production wrapper carries one into its staged home only if
     `[ -f ]`, and anything else at the path is the mirror's to replace."""
-    return path.read_text(encoding="utf-8") if path.is_file() else None
+    on_disk = located(path)
+    return on_disk.read_text(encoding="utf-8") if on_disk.is_file() else None
 
 
 def render_marketplace_text() -> str:
@@ -2312,10 +2318,11 @@ def unplanned_paths(plan: RenderPlan) -> list[Path]:
     def visit(path: Path) -> None:
         if path in leaves or path in kept:
             return
-        if path in open_ and path.is_dir() and not path.is_symlink():
-            for child in sorted(path.iterdir()):
-                visit(child)
-        elif path.exists() or path.is_symlink():
+        on_disk = located(path)
+        if path in open_ and on_disk.is_dir() and not on_disk.is_symlink():
+            for name in sorted(os.listdir(on_disk)):
+                visit(path / name)
+        elif on_disk.exists() or on_disk.is_symlink():
             found.append(path)
 
     for root in managed_paths():
@@ -2329,11 +2336,12 @@ def beside_managed_path(root: Path) -> list[Path]:
     as in the production publish, which prunes those too, and the holder a
     run killed inside replace_entry (.<name>.swap-*) or put_file
     (.<name>.tmp-*) left there, perhaps with the original moved aside."""
-    if not root.parent.is_dir():
+    parent = located(root.parent)
+    if not parent.is_dir():
         return []
     prefixes = (f"{root.name}.bak-", f".{root.name}.swap-", f".{root.name}.tmp-")
     return [
-        sibling for sibling in sorted(root.parent.iterdir()) if sibling.name.startswith(prefixes)
+        root.parent / name for name in sorted(os.listdir(parent)) if name.startswith(prefixes)
     ]
 
 
@@ -2779,7 +2787,7 @@ def publish_config(plan: RenderPlan) -> None:
     # production publish replaces it with the regular file it rsyncs.
     if (
         live
-        and not path.is_symlink()
+        and not located(path).is_symlink()
         and canonical(parse_live_config(live)) == canonical(tomllib.loads(rendered))
     ):
         return
@@ -2876,10 +2884,11 @@ SYMLINK_FOR_FILE = "a symlink where the render plan writes a regular file"
 
 def file_drift(path: Path, text: str) -> list[str]:
     # put_file replaces a link with a regular file whatever it leads to.
-    if path.is_symlink():
+    on_disk = located(path)
+    if on_disk.is_symlink():
         return [f"{path}: {SYMLINK_FOR_FILE}"]
     try:
-        actual = path.read_bytes()
+        actual = on_disk.read_bytes()
     except FileNotFoundError:
         return [f"{path}: missing"]
     except OSError as exc:
@@ -2892,10 +2901,11 @@ def file_drift(path: Path, text: str) -> list[str]:
 def config_drift(plan: RenderPlan) -> list[str]:
     # The same no-op test publish_config uses: semantic, order-insensitive.
     path = CODEX / "config.toml"
-    if path.is_symlink():
+    on_disk = located(path)
+    if on_disk.is_symlink():
         return [f"{path}: {SYMLINK_FOR_FILE}"]
     try:
-        live = path.read_text(encoding="utf-8")
+        live = on_disk.read_text(encoding="utf-8")
     except FileNotFoundError:
         return [f"{path}: missing"]
     except OSError as exc:
@@ -2928,15 +2938,16 @@ def config_differences(
 
 
 def link_drift(src: Path, dst: Path) -> list[str]:
-    if dst.is_symlink():
-        if Path(os.readlink(dst)) == src:
+    on_disk = located(dst)
+    if on_disk.is_symlink():
+        if Path(os.readlink(on_disk)) == src:
             return []
-    elif src.is_dir() and dst.is_dir():
+    elif src.is_dir() and on_disk.is_dir():
         # link_or_copy falls back to a copy where symlinks are unavailable.
-        if comparable_tree(dst) == comparable_tree(src, source=True):
+        if comparable_tree(on_disk) == comparable_tree(src, source=True):
             return []
-    elif src.is_file() and dst.is_file():
-        if dst.read_bytes() == src.read_bytes():
+    elif src.is_file() and on_disk.is_file():
+        if on_disk.read_bytes() == src.read_bytes():
             return []
     return [f"{dst}: missing or not a link to {src}"]
 
@@ -2947,7 +2958,7 @@ def mcp_asset_drift(assets: list[tuple[Path, Path]]) -> list[str]:
     errors: list[str] = []
     for src, dst in assets:
         expected = comparable_tree(src, source=True)
-        actual = comparable_tree(dst)
+        actual = comparable_tree(located(dst))
         for rel in sorted(expected.keys() | actual.keys()):
             path = dst / rel
             if rel not in actual:
@@ -2960,16 +2971,17 @@ def mcp_asset_drift(assets: list[tuple[Path, Path]]) -> list[str]:
 
 
 def render_plan_drift(plan: RenderPlan) -> list[str]:
-    """Every difference between what publish_render_plan writes and disk."""
+    """Every difference between what publish_render_plan writes and disk,
+    read where common.located puts the output."""
     errors: list[str] = []
+    link = located(LEGACY_PLUGIN_LINK)
     if LEGACY_PLUGIN_LINK != PLUGIN_ROOT and not (
-        LEGACY_PLUGIN_LINK.is_symlink()
-        and Path(os.readlink(LEGACY_PLUGIN_LINK)) == PLUGIN_ROOT
+        link.is_symlink() and Path(os.readlink(link)) == PLUGIN_ROOT
     ):
         errors.append(f"{LEGACY_PLUGIN_LINK}: missing or not a link to {PLUGIN_ROOT}")
     for path, text in plan.hook_wrapper_files.items():
         drift = file_drift(path, text)
-        if not drift and path.suffix == ".sh" and path.stat().st_mode & 0o7777 != 0o755:
+        if not drift and path.suffix == ".sh" and located(path).stat().st_mode & 0o7777 != 0o755:
             drift = [f"{path}: hook wrapper must be mode 0755"]
         errors.extend(drift)
     errors.extend(mcp_asset_drift(plan.mcp_assets))
