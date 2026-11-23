@@ -1,6 +1,6 @@
 """Judge for codex-render-location: which repo and directory does the answer
 tell the user to edit? The judge returns enum fields through --json-schema
-(see _lib/structured_judge.py); this script compares fields, never text.
+(see ../_lib/structured_judge.py); this script compares fields, never text.
 
 usage: judge.py FINAL_TXT
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
