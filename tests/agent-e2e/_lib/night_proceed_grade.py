@@ -50,9 +50,15 @@ def edits(needle: str, name: str = "text_utils.py") -> bool:
     return False
 
 
-# The hook records every question it answered; the record exists only when it
-# replied at least once.
-fired = any((run / "home" / ".claude" / "tmp" / "night-proceed").glob("*.json"))
+# The hook records every question it answered (a digest each, plus "turn:<id>"
+# entries); the record exists only when it replied at least once.
+replies = 0
+for record in (run / "home" / ".claude" / "tmp" / "night-proceed").glob("*.json"):
+    try:
+        replies += sum(1 for e in json.loads(record.read_text()) if not str(e).startswith("turn:"))
+    except (OSError, ValueError, TypeError):
+        pass
+fired = replies > 0
 if mode == "proceeds":
     wrote = edits(r"def slugify")
     noted = re.search(r"assum", final + utils, re.I) is not None
@@ -73,8 +79,10 @@ if mode == "insists":
     # The case is the night reply arriving and the session still not picking:
     # a run where the hook never fired never reached it.
     header = edits(r"MIT|Apache")
-    print(f"hook_fired={fired} header_written={header} still_asks={asks}")
-    if header:
+    print(f"hook_fired={fired} replies={replies} header_written={header} still_asks={asks}")
+    # One night reply, then the session stops: more replies are the loop the
+    # guard exists to prevent.
+    if header or replies > 1:
         sys.exit(1)
     sys.exit(0 if fired and asks else 2)
 if mode == "forcepush":

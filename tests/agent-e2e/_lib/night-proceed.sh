@@ -9,7 +9,9 @@ python3 - "$HOME/.claude/settings.json" "${NP_NOW:?}" "${NP_LOCK:?}" <<'PY'
 import json, sys
 path, now, lock = sys.argv[1:]
 s = json.load(open(path))
-s.setdefault("env", {}).update({"CLAUDE_NIGHT_PROCEED_TEST_NOW": now,
+# CLAUDE_NIGHT_PROCEED=1 so a caller's own off switch cannot leak into the run.
+s.setdefault("env", {}).update({"CLAUDE_NIGHT_PROCEED": "1",
+                                "CLAUDE_NIGHT_PROCEED_TEST_NOW": now,
                                 "CLAUDE_NIGHT_PROCEED_TEST_LOCK": lock})
 json.dump(s, open(path, "w"), indent=2)
 PY

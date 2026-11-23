@@ -149,6 +149,15 @@ def test_one_reply_per_turn_across_ask_and_stop(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Which license, MIT or Apache?", prompt_id="p2"))
 
 
+def test_one_reply_per_turn_after_a_blocked_stop(tmp_path: Path) -> None:
+    # Review round 3: a blocked stop, then an AskUserQuestion (or a reworded
+    # one) in the same turn got a second and third reply.
+    assert run(tmp_path, stop("Which license?", prompt_id="p1"))
+    assert run(tmp_path, ask("Which license?", prompt_id="p1")) is None
+    assert run(tmp_path, ask("License: MIT or Apache?", prompt_id="p1")) is None
+    assert run(tmp_path, ask("License: MIT or Apache?", prompt_id="p2"))
+
+
 def test_other_tools_and_garbage(tmp_path: Path) -> None:
     assert run(tmp_path, {**ask("x?"), "tool_name": "Bash"}) is None
     assert run(tmp_path, stop(AB, session_id="../etc")) is None

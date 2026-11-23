@@ -23,9 +23,9 @@ Loop guard, at most one reply per question:
   - `stop_hook_active` (a stop that follows any hook's block) stands down;
   - a hash of every question answered this session: the same question asked
     again is let through and the session stops as it does today;
-  - one reply per user turn on Stop (`prompt_id`): an AskUserQuestion denied
-    earlier in the turn already carried PROMPT, so the session ending on that
-    question as text is let through.
+  - one reply per user turn (`prompt_id`), across both events: once PROMPT
+    reached the session this turn, a later AskUserQuestion (reworded or not)
+    or a stop on the same question is let through.
 
 Fails open: any error, an unreadable lock state (no session bus), a missing
 config, a classifier that fails, times out or answers anything but QUESTION
@@ -215,7 +215,7 @@ def decide(payload: object) -> dict | None:
         return None
     seen = Seen(session)
     try:
-        if key in seen or (event == "Stop" and turn is not None and turn in seen):
+        if key in seen or (turn is not None and turn in seen):
             return None
         if text is not None and not ends_on_question(text):
             return None
