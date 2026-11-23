@@ -701,9 +701,14 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
                          "binding it would expose every sibling run; point "
                          "E2E_SHARED outside the runs")
     exe_bind = []
-    exe_dir = pathlib.Path(claude).resolve().parent
-    if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
-        exe_bind = ["--ro-bind", str(exe_dir), str(exe_dir)]
+    # Under /tmp the binary is hidden by the private /tmp, so it is bound back
+    # read-only. Whole path segments (`/tmpfoo` is not /tmp), and a binary
+    # straight in /tmp brings only itself back, not all of the real /tmp.
+    exe = pathlib.Path(claude).resolve()
+    if exe.parent == pathlib.Path("/tmp"):
+        exe_bind = ["--ro-bind", str(exe), str(exe)]
+    elif exe.parent.is_relative_to("/tmp"):
+        exe_bind = ["--ro-bind", str(exe.parent), str(exe.parent)]
     # Last, so a read-only ancestor bind or the tmpfs over RUNS cannot shadow
     # them; an inherited E2E_SHARED under RUNS is bound back in the same way.
     binds = ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]

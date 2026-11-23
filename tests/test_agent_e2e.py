@@ -1630,3 +1630,36 @@ def test_a_grader_that_dies_is_not_a_finding(tmp_path):
     _, _, verdicts = _run(tmp_path, sc, claude)
     assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts[0].get("why")
     assert "without a verdict" in verdicts[0]["why"]
+
+
+def _harness_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_e2e_under_test", HARNESS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _exe_binds(argv: list[str]) -> list[str]:
+    return [argv[i + 1] for i, a in enumerate(argv[:-2])
+            if a == "--ro-bind" and argv[i + 1] == argv[i + 2]]
+
+
+@pytest.mark.parametrize("exe, bound, not_bound", [
+    # A binary straight in /tmp brings back only itself, never the real /tmp.
+    ("/tmp/claude-bin", "/tmp/claude-bin", "/tmp"),
+    # Whole segments: /tmpfoo is not under /tmp, so it is not bound back.
+    ("/tmpfoo/bin/claude", None, "/tmpfoo/bin"),
+    ("/tmp/x/claude", "/tmp/x", None),
+])
+def test_the_claude_bind_never_brings_back_more_of_tmp_than_the_binary(
+        tmp_path, exe, bound, not_bound):
+    mod = _harness_module()
+    run = tmp_path / "runs" / "new" / "1"
+    argv = mod.sandboxed(["true"], claude=exe, run=run, runs=tmp_path / "runs",
+                         shared=run / "shared", work=run / "work")
+    binds = _exe_binds(argv)
+    if bound:
+        assert bound in binds
+    if not_bound:
+        assert not_bound not in binds
