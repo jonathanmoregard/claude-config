@@ -827,6 +827,93 @@ def test_rollback_leaves_no_snapshot_behind() -> None:
         assert snapshots() == before
 
 
+@contextmanager
+def watching_for_missing(paths: list[Path]) -> Iterator[list[str]]:
+    """Record each of paths found missing at any copy, link, replace or
+    removal made inside the block. A directory swapped in by two renames is
+    missing only between them, which this does not observe."""
+    missing: list[str] = []
+
+    def observing(name: str, real):
+        def call(*args: object, **kwargs: object) -> object:
+            missing.extend(
+                f"{path} before {name}"
+                for path in paths
+                if not path.exists() and not path.is_symlink()
+            )
+            return real(*args, **kwargs)
+
+        return call
+
+    with ExitStack() as observers:
+        for owner, name in (
+            (shutil, "copy2"),
+            (shutil, "copytree"),
+            (shutil, "rmtree"),
+            (os, "replace"),
+            (os, "unlink"),
+            (Path, "symlink_to"),
+        ):
+            observers.enter_context(
+                patch.object(owner, name, observing(name, getattr(owner, name)))
+            )
+        yield missing
+
+
+def test_a_no_op_publish_leaves_mcp_assets_in_place() -> None:
+    # Each publish removed ~/.codex/mcps/git-broker and copied it back, so a
+    # Codex session starting meanwhile found the required broker missing,
+    # even when nothing had changed.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _, manifest_path, codex, plugin = write_fixture(root)
+        broker = codex / "mcps" / "git-broker"
+        with isolated_renderer(root, manifest_path, codex, plugin, budget_support()):
+            render_codex.main()
+            before = (broker.stat().st_ino, (broker / "server.py").stat().st_ino)
+            with watching_for_missing([broker / "server.py"]) as missing:
+                render_codex.main()
+        assert missing == [], missing
+        assert (broker.stat().st_ino, (broker / "server.py").stat().st_ino) == before
+
+
+def test_a_changed_mcp_asset_replaces_the_old_one_whole_never_missing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _, manifest_path, codex, plugin = write_fixture(root)
+        broker = codex / "mcps" / "git-broker"
+        with isolated_renderer(root, manifest_path, codex, plugin, budget_support()):
+            render_codex.main()
+            (broker / "stale.txt").write_text("from an earlier sync\n", encoding="utf-8")
+            (root / ".claude" / "mcps" / "git-broker" / "server.py").write_text(
+                "# structured broker, changed\n", encoding="utf-8"
+            )
+            with watching_for_missing([broker / "server.py"]) as missing:
+                render_codex.main()
+        assert missing == [], missing
+        assert (broker / "server.py").read_text(encoding="utf-8") == (
+            "# structured broker, changed\n"
+        )
+        assert not (broker / "stale.txt").exists()
+        assert not [entry.name for entry in broker.parent.iterdir() if entry.name.startswith(".")]
+
+
+def test_a_retargeted_reference_link_is_never_missing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        old, new = root / "old.md", root / "new.md"
+        old.write_text("old\n", encoding="utf-8")
+        new.write_text("new\n", encoding="utf-8")
+        link = root / "refs" / "agent.md"
+        link.parent.mkdir()
+        link.symlink_to(old)
+        with watching_for_missing([link]) as missing:
+            common.link_or_copy(new, link)
+        assert missing == [], missing
+        assert os.readlink(link) == str(new)
+        assert [entry.name for entry in link.parent.iterdir()] == ["agent.md"]
+
+
 def test_unclassified_hook_preserves_both_wrapper_trees() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1295,6 +1382,9 @@ if __name__ == "__main__":
     test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot()
     test_rollback_never_leaves_a_restored_path_missing()
     test_rollback_leaves_no_snapshot_behind()
+    test_a_no_op_publish_leaves_mcp_assets_in_place()
+    test_a_changed_mcp_asset_replaces_the_old_one_whole_never_missing()
+    test_a_retargeted_reference_link_is_never_missing()
     test_unclassified_hook_preserves_both_wrapper_trees()
     test_invalid_or_missing_budget_mapping_preserves_both_wrapper_trees()
     test_second_wrapper_preparation_failure_publishes_neither_copy()

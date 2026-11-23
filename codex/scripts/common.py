@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any
+from typing import Any, Callable
 
 
 HOME = Path.home()
@@ -155,29 +155,79 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
-def copy_tree_clean(src: Path, dst: Path) -> None:
+def entry_state(path: Path) -> Any:
+    """What path holds, without following links: None when missing; a file
+    by bytes and mode, a directory by mode and children, a link by target."""
+    if path.is_symlink():
+        return ("symlink", os.readlink(path))
+    if path.is_dir():
+        return (
+            "directory",
+            path.stat().st_mode & 0o7777,
+            {child.name: entry_state(child) for child in sorted(path.iterdir())},
+        )
+    if path.exists():
+        return ("file", path.read_bytes(), path.stat().st_mode & 0o7777)
+    return None
+
+
+def replace_entry(dst: Path, build: Callable[[Path], object]) -> bool:
+    """Put the entry build makes at dst, never removing dst first, and
+    leave dst untouched when it already holds exactly that. Returns whether
+    dst changed.
+
+    build makes the entry at the path it is given, beside dst, which is then
+    renamed over dst: atomic for a file or a link over a file or a link. A
+    directory on either side cannot be renamed over, so what stands at dst
+    moves aside first; dst is missing only between those two renames.
+    """
     assert_not_claude_write(dst)
-    if dst.exists() or dst.is_symlink():
-        remove_path(dst)
-    shutil.copytree(src, dst, ignore=ignore_generated)
+    mkdir(dst.parent)
+    holder = Path(tempfile.mkdtemp(prefix=f".{dst.name}.swap-", dir=dst.parent))
+    try:
+        staged = holder / "entry"
+        build(staged)
+        if entry_state(staged) == entry_state(dst):
+            return False
+
+        def real_dir(entry: Path) -> bool:
+            return entry.is_dir() and not entry.is_symlink()
+
+        if (dst.exists() or dst.is_symlink()) and (real_dir(dst) or real_dir(staged)):
+            os.rename(dst, holder / "aside")
+            os.rename(staged, dst)
+        else:
+            os.replace(staged, dst)
+        return True
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+
+
+def copy_tree_clean(src: Path, dst: Path) -> None:
+    """dst becomes a copy of src, whatever else it held, swapped in whole."""
+    replace_entry(dst, lambda staged: shutil.copytree(src, staged, ignore=ignore_generated))
 
 
 def link_or_copy(src: Path, dst: Path) -> str:
     assert_not_claude_write(dst)
-    if dst.exists() or dst.is_symlink():
-        if dst.is_symlink() and Path(os.readlink(dst)) == src:
-            return "already-linked"
-        remove_path(dst)
-    mkdir(dst.parent)
-    try:
-        dst.symlink_to(src, target_is_directory=src.is_dir())
-        return "symlink"
-    except OSError:
-        if src.is_dir():
-            shutil.copytree(src, dst, ignore=ignore_generated)
-            return "copytree"
-        shutil.copy2(src, dst)
-        return "copy"
+    if dst.is_symlink() and Path(os.readlink(dst)) == src:
+        return "already-linked"
+    how = "symlink"
+
+    def build(staged: Path) -> None:
+        nonlocal how
+        try:
+            staged.symlink_to(src, target_is_directory=src.is_dir())
+        except OSError:
+            if src.is_dir():
+                shutil.copytree(src, staged, ignore=ignore_generated)
+                how = "copytree"
+            else:
+                shutil.copy2(src, staged)
+                how = "copy"
+
+    replace_entry(dst, build)
+    return how
 
 
 def ignore_generated(dir_name: str, entries: list[str]) -> set[str]:

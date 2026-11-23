@@ -39,6 +39,7 @@ from common import (
     load_json,
     mkdir,
     remove_path,
+    replace_entry,
     toml_array,
     toml_scalar,
     toml_string,
@@ -868,7 +869,8 @@ def put_dir(path: Path) -> None:
 
 
 def put_tree(src: Path, dst: Path) -> None:
-    """put_file for a copied tree: room made, then dst replaced whole."""
+    """put_file for a copied tree: room made, then dst swapped in whole, or
+    left untouched when it already is that copy."""
     make_room(dst, directory=True)
     copy_tree_clean(src, dst)
 
@@ -2561,17 +2563,10 @@ def outermost_paths(paths: list[Path]) -> list[Path]:
 
 
 def restore_snapshot_entry(path: Path, kind: str, saved: Path | str) -> None:
-    """Put one snapshot entry back at path without removing path first.
+    """Put one snapshot entry back at path without removing path first
+    (replace_entry): a Codex session starting meanwhile finds it in place."""
 
-    The entry is built beside path, then renamed over it: atomic for a file
-    or a link over a file or a link. A directory on either side cannot be
-    renamed over, so what stands there moves aside first; path is missing
-    only between those two renames.
-    """
-    mkdir(path.parent)
-    holder = Path(tempfile.mkdtemp(prefix=f".{path.name}.rollback-", dir=path.parent))
-    try:
-        staged = holder / "entry"
+    def build(staged: Path) -> None:
         if kind == "symlink":
             staged.symlink_to(str(saved), target_is_directory=True)
         elif kind == "directory":
@@ -2579,16 +2574,7 @@ def restore_snapshot_entry(path: Path, kind: str, saved: Path | str) -> None:
         else:
             shutil.copy2(Path(saved), staged)
 
-        def real_dir(entry: Path) -> bool:
-            return entry.is_dir() and not entry.is_symlink()
-
-        if (path.exists() or path.is_symlink()) and (real_dir(path) or real_dir(staged)):
-            os.rename(path, holder / "aside")
-            os.rename(staged, path)
-        else:
-            os.replace(staged, path)
-    finally:
-        shutil.rmtree(holder, ignore_errors=True)
+    replace_entry(path, build)
 
 
 # What stops a run (systemd, a closed terminal, Ctrl-C); see rollback_paths_on_error.
