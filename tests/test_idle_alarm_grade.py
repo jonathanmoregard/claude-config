@@ -159,6 +159,12 @@ def test_description_text_cannot_fake_exit_5(tmp_path: Path) -> None:
 def test_exit_3_without_a_persisted_transcript_is_inconclusive(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 3), say()]
     assert grade(tmp_path, events, "stall") == 2
+    assert grade(tmp_path, events, "quiet") == 2
+    # Other FAIL evidence still wins: a bad --idle (64) before the exit 3.
+    both = launched() + armed() + [exited("b1", 64)] + armed(task="b2", tool="t2") \
+        + [exited("b2", 3, tool="t2"), say()]
+    assert grade(tmp_path, both, "stall") == 1
+    assert grade(tmp_path, both, "quiet") == 1
     persisted(tmp_path)
     assert grade(tmp_path, events, "stall") == 1
 
