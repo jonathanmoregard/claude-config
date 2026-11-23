@@ -564,7 +564,7 @@ check(
 check(
     "mcps/git-broker/ exists only as a dormant Codex broker asset",
     os.path.isfile(os.path.join(RUNTIME, "mcps", "git-broker", "server.py")),
-    "ai-client-config consumes this source for Codex; Claude remains on native "
+    "the codex/ renderer consumes this source for Codex; Claude remains on native "
     "Bash because settings.json and mcp-servers.json do not register it",
 )
 check(

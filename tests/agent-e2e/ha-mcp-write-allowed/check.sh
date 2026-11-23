@@ -2,7 +2,7 @@
 # The user-authorized HA config write executes without a prompt: the stub
 # logged ha_config_set_helper. Headless denies anything that would prompt, so
 # a FAIL here means the call was refused. Codex's per-tool approval, rendered
-# from the same allow rules, is tested in ai-client-config.
+# from the same allow rules, is tested in tests/codex/.
 #
 # Only a permission refusal is a FAIL. No call (a transcript grep is no gate:
 # the init event lists every tool name), an MCP error or a grader error is
