@@ -61,7 +61,7 @@
       "/home/jonathan/.claude/mcps/agent-e2e-broker/server.py"
     ],
     "env": {},
-    "timeout": 3900000
+    "timeout": 5760000
   },
   "github": {
     "type": "stdio",

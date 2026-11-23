@@ -15,7 +15,10 @@ an old/new campaign of one scenario, nothing else.
 - The scenario comes from the new ref's tests/agent-e2e tree, by name.
 - Model, sample count, parallelism, per-run budget, per-run timeout and the
   whole call's worst-case wall time are bounded by config.json.
-- One run at a time; no caller-chosen paths, commands or environment.
+- At most maxCampaigns campaigns at once, each holding a slot lock until its
+  unit stops; a caller finding every slot busy waits up to maxQueueSec. Git
+  work on the shared mirror is serialised by a separate, short-held lock.
+- No caller-chosen paths, commands or environment.
 
 Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
 """
@@ -62,8 +65,11 @@ _POLICY_KEYS = frozenset({
     "version", "remoteUrl", "stateDir", "harness", "scenarioRoot", "claudeExecutable",
     "path", "models", "maxSamples", "maxJobs", "maxBudgetUsd",
     "maxTimeoutSec", "maxCallSec", "outputLimitChars", "readOnlyPaths",
+    "maxCampaigns", "maxQueueSec",
 })
-_POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars")
+_POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
+                  "maxCampaigns", "maxQueueSec")
+SLOT_POLL_SEC = 2.0
 _ARGS = frozenset({"scenario", "old_ref", "new_ref", "model", "n", "jobs",
                    "budget_usd", "timeout_sec"})
 _SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -123,7 +129,10 @@ def _load_policy(config: dict) -> dict:
     if any(r == policy["stateDir"] or r in policy["stateDir"].parents for r in roots(home)):
         raise RuntimeError("policy stateDir must lie outside ~/Repos and ~/worktrees")
     policy["mirror"] = policy["stateDir"] / "mirror.git"
+    # The mirror lock serialises git work on the shared mirror and pruning; it is
+    # held only while a campaign is set up. Each running campaign holds one slot.
     policy["lock"] = policy["stateDir"] / "lock"
+    policy["slots"] = [policy["stateDir"] / f"slot-{i}" for i in range(raw["maxCampaigns"])]
     policy["campaigns"] = policy["stateDir"] / "campaigns"
     policy["readOnlyPaths"] = [canonical(p, home) for p in extra
                                if not isinstance(p, str) or os.path.lexists(p)]
@@ -506,6 +515,30 @@ def _prune(campaigns: Path) -> None:
             shutil.rmtree(entry.path, ignore_errors=True)
 
 
+def _open_lock(path: Path) -> int:
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
+
+def _acquire_slot(policy: dict, rec: Optional[_InFlight]) -> int:
+    """Wait (up to maxQueueSec) for a free campaign slot; return its locked fd.
+    The fd goes to the supervisor, so the slot frees only once the unit stops."""
+    deadline = time.monotonic() + policy["maxQueueSec"]
+    while True:
+        for path in policy["slots"]:
+            fd = _open_lock(path)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                os.close(fd)
+        if rec is not None and rec.cancelled:
+            raise RuntimeError("cancelled while queued for a campaign slot")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"all {len(policy['slots'])} agent-e2e campaign slots stayed busy "
+                               f"for {policy['maxQueueSec']}s; try again later")
+        time.sleep(SLOT_POLL_SEC)
+
+
 def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     policy = _load_policy(_load_config())
     req = _validate_request(args, policy)
@@ -513,33 +546,39 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     if not os.access(exe, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: claude is not executable: {exe}")
     _private_dir(policy["stateDir"])
-    lock = os.open(policy["lock"], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    lock = _acquire_slot(policy, rec)
     try:
+        campaign = None
+        mirror = _open_lock(policy["lock"])
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError("another agent-e2e campaign is running; one at a time") from None
-        _update_mirror(policy)
-        master = _resolve(policy, "origin/master")
-        old = _resolve(policy, req["old_ref"])
-        new = _resolve(policy, req["new_ref"])
-        scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
-        for name in _RUN_FILES:
-            if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
-                raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
-        campaigns = _private_dir(policy["campaigns"])
-        _prune(campaigns)
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
-                                         dir=campaigns))
-        out = campaign / "out"
-        out.mkdir(mode=0o700)
-        for name in ("harness.out", "harness.err"):
-            os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                             | os.O_CLOEXEC, 0o600))
-        _extract_scenarios(policy, new, campaign / "scenarios")
-        try:
+            fcntl.flock(mirror, fcntl.LOCK_EX)
+            _update_mirror(policy)
+            master = _resolve(policy, "origin/master")
+            old = _resolve(policy, req["old_ref"])
+            new = _resolve(policy, req["new_ref"])
+            scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
+            for name in _RUN_FILES:
+                if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
+                    raise RuntimeError(f"{req['new_ref']} has no {scen_rel}/{name}")
+            campaigns = _private_dir(policy["campaigns"])
+            _prune(campaigns)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
+                                             dir=campaigns))
+            out = campaign / "out"
+            out.mkdir(mode=0o700)
+            for name in ("harness.out", "harness.err"):
+                os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+            _extract_scenarios(policy, new, campaign / "scenarios")
             harness = _checkout_harness(policy, master, campaign / "harness")
+        except BaseException:
+            if campaign is not None:
+                shutil.rmtree(campaign / "harness", ignore_errors=True)
+            raise
+        finally:
+            os.close(mirror)
+        try:
             argv = [sys.executable, "-I", str(harness), "run",
                     str(campaign / "scenarios" / scen_rel),
                     "--arm", f"old={old}", "--arm", f"new={new}",
@@ -574,8 +613,9 @@ TOOLS = [{
         "Runs one agent-config e2e scenario (tests/agent-e2e/<scenario> from new_ref) "
         "through scripts/agent-e2e/agent_e2e.py with a real headless Claude agent, arm "
         "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
-        "(origin/<branch> or a pushed 40-hex commit). One campaign at a time; it blocks "
-        "until done (up to an hour). Returns the harness summary table, every run's "
+        "(origin/<branch> or a pushed 40-hex commit). Up to maxCampaigns campaigns run at "
+        "once; when every slot is busy the call waits in line for one (up to maxQueueSec), "
+        "then blocks until done (up to an hour). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "
         "FAIL and INCONCLUSIVE is reported; nothing is retried."),
     "inputSchema": {

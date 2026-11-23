@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -171,6 +172,7 @@ class Fixture(unittest.TestCase):
             "models": ["haiku", "sonnet"], "maxSamples": 2, "maxJobs": 2,
             "maxBudgetUsd": 3.0, "maxTimeoutSec": 900, "maxCallSec": 3600,
             "outputLimitChars": 20000, "readOnlyPaths": [],
+            "maxCampaigns": 2, "maxQueueSec": 3,
         }
         self.server._load_config = lambda: {"agentE2eBroker": dict(self.raw)}
         self.policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
@@ -212,6 +214,14 @@ class ValidationTests(Fixture):
         policy = self.server._load_policy({"agentE2eBroker": self.raw})
         with self.assertRaisesRegex(RuntimeError, "worst-case"):
             self.server._validate_request(self.req(n=2, jobs=1, timeout_sec=900), policy)
+
+    def test_client_timeout_covers_queue_wait_plus_longest_call(self) -> None:
+        raw = json.loads((HERE / "config.json").read_text())["agentE2eBroker"]
+        servers = json.loads((HERE.parents[2] / "runtime/mcp-servers.json").read_text())
+        timeout_ms = servers["agent_e2e_broker"]["timeout"]
+        # call_timeout = worst + 120, plus the harness's 60s grace and setup.
+        need = raw["maxQueueSec"] + raw["maxCallSec"] + 120 + 60 + 120
+        self.assertGreaterEqual(timeout_ms, need * 1000)
 
     def test_shipped_config_names_paths_of_this_repo(self) -> None:
         self.server.PROTOCOL = "https"
@@ -288,13 +298,59 @@ class RunTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "has no"):
             self.server._tool_run(self.req(scenario="absent"))
 
-    def test_one_campaign_at_a_time(self) -> None:
-        import fcntl
-        self.policy["lock"].parent.mkdir(mode=0o700)
-        with open(self.policy["lock"], "w") as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
-            with self.assertRaisesRegex(RuntimeError, "one at a time"):
+    def _hold(self, paths):
+        import contextlib, fcntl
+        stack = contextlib.ExitStack()
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        for p in paths:
+            fh = stack.enter_context(open(p, "w"))
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        return stack
+
+    def test_runs_while_another_campaign_holds_a_slot(self) -> None:
+        with self._hold(self.policy["slots"][:1]):
+            text = self.server._tool_run(self.req())
+        self.assertIn("harness exit 0", text)
+
+    def test_waits_for_a_slot_then_runs(self) -> None:
+        import threading
+        stack = self._hold(self.policy["slots"])
+        threading.Timer(1.0, stack.close).start()
+        t0 = time.monotonic()
+        text = self.server._tool_run(self.req())
+        self.assertGreaterEqual(time.monotonic() - t0, 1.0)
+        self.assertIn("harness exit 0", text)
+
+    def test_all_slots_busy_past_the_queue_limit_refuses(self) -> None:
+        with self._hold(self.policy["slots"]):
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, r"all 2 .* slots stayed busy for 3s"):
                 self.server._tool_run(self.req())
+            self.assertGreaterEqual(time.monotonic() - t0, 3)
+        self.assertEqual(list(self.out.glob("*")) if self.out.exists() else [], [])
+
+    def test_cancel_while_queued_stops_waiting(self) -> None:
+        rec = self.server._InFlight()
+        rec.cancelled = True
+        with self._hold(self.policy["slots"]):
+            with self.assertRaisesRegex(RuntimeError, "cancelled while queued"):
+                self.server._tool_run(self.req(), rec)
+
+    def test_mirror_lock_waits_rather_than_refuses(self) -> None:
+        import threading
+        stack = self._hold([self.policy["lock"]])
+        threading.Timer(1.0, stack.close).start()
+        text = self.server._tool_run(self.req())
+        self.assertIn("harness exit 0", text)
+
+    def test_slot_is_never_opened_through_a_symlink(self) -> None:
+        owner_file = Path(self.tmp.name) / "owner-file"
+        owner_file.write_text("OWNER-DATA\n")
+        self.policy["lock"].parent.mkdir(mode=0o700)
+        self.policy["slots"][0].symlink_to(owner_file)
+        with self.assertRaises(OSError):
+            self.server._tool_run(self.req())
+        self.assertEqual(owner_file.read_text(), "OWNER-DATA\n")
 
     def test_lock_is_never_opened_through_a_symlink(self) -> None:
         owner_file = Path(self.tmp.name) / "owner-file"
@@ -662,14 +718,15 @@ class ReviewFindingTests(Fixture):
         while time.monotonic() < deadline:
             harness = subprocess.run(["pgrep", "-f", f"{self.out}/.*runs"],
                                      capture_output=True, text=True).stdout.split()
-            with open(self.policy["lock"], "w") as fh:
-                try:
-                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    locked = False
-                except BlockingIOError:
-                    locked = True
-            # The lock may be free only once no harness is left running.
-            self.assertFalse(harness and not locked, "harness runs without the lock")
+            locked = False
+            for slot in self.policy["slots"]:
+                with open(slot, "w") as fh:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        locked = True
+            # A slot may be free only once no harness is left running.
+            self.assertFalse(harness and not locked, "harness runs without its slot")
             if not harness and not locked:
                 freed = True
                 break
