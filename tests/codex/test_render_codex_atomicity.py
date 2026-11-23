@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from io import StringIO
 import json
 import os
@@ -687,6 +687,70 @@ def test_rollback_that_cannot_restore_keeps_its_snapshot_and_names_it() -> None:
             shutil.rmtree(kept, ignore_errors=True)
 
 
+def test_rollback_never_leaves_a_restored_path_missing() -> None:
+    # A rollback removed every target before restoring any: a Codex session
+    # starting meanwhile found no config.toml or hooks.json. Each one is
+    # replaced in place instead. Checked at every copy, replace and removal
+    # the restore makes; a directory swaps in by two renames, which these do
+    # not observe, so it is missing at most between them.
+    with tempfile.TemporaryDirectory() as td:
+        codex = Path(td) / ".codex"
+        (codex / "skills" / "a").mkdir(parents=True)
+        (codex / "skills" / "a" / "SKILL.md").write_text("old skill\n", encoding="utf-8")
+        (codex / "config.toml").write_text("old config\n", encoding="utf-8")
+        (codex / "hooks.json").write_text("{}\n", encoding="utf-8")
+        (codex / "AGENTS.md").write_text("old instructions\n", encoding="utf-8")
+        (codex / "link").symlink_to(codex / "skills")
+        existing = ["config.toml", "hooks.json", "AGENTS.md", "link", "skills"]
+        targets = [codex / name for name in [*existing, "new"]]
+        before = tree_state(codex)
+        rolling_back = False
+        observed: list[str] = []
+        missing: list[str] = []
+
+        def observing(name: str, real):
+            def call(*args: object, **kwargs: object) -> object:
+                if rolling_back:
+                    observed.append(name)
+                    missing.extend(
+                        f"{path} before {name}"
+                        for path in existing
+                        if not (codex / path).exists() and not (codex / path).is_symlink()
+                    )
+                return real(*args, **kwargs)
+
+            return call
+
+        failure = OSError("injected publication failure")
+        with ExitStack() as observers:
+            for owner, name in (
+                (render_codex.shutil, "copy2"),
+                (render_codex.shutil, "copytree"),
+                (render_codex.os, "replace"),
+                (render_codex, "remove_path"),
+            ):
+                observers.enter_context(
+                    patch.object(owner, name, observing(name, getattr(owner, name)))
+                )
+            try:
+                with render_codex.rollback_paths_on_error(targets):
+                    (codex / "config.toml").write_text("new config\n", encoding="utf-8")
+                    (codex / "AGENTS.md").unlink()
+                    (codex / "AGENTS.md").mkdir()
+                    (codex / "link").unlink()
+                    (codex / "link").write_text("not a link\n", encoding="utf-8")
+                    (codex / "skills" / "a" / "SKILL.md").write_text("new\n", encoding="utf-8")
+                    (codex / "new").write_text("published\n", encoding="utf-8")
+                    (codex / "hooks.json").write_text('{"new": true}\n', encoding="utf-8")
+                    rolling_back = True
+                    raise failure
+            except OSError as exc:
+                assert exc is failure, exc
+        assert observed, "the restore made no observed call"
+        assert missing == [], missing
+        assert tree_state(codex) == before
+
+
 def test_rollback_leaves_no_snapshot_behind() -> None:
     # The snapshot is the rollback's own scratch: removed after a publish that
     # stands and after a rollback that restored everything.
@@ -1174,6 +1238,7 @@ if __name__ == "__main__":
     test_late_publication_failure_rolls_back_all_live_paths()
     test_interrupted_publication_rolls_back_like_a_failed_one()
     test_rollback_that_cannot_restore_keeps_its_snapshot_and_names_it()
+    test_rollback_never_leaves_a_restored_path_missing()
     test_rollback_leaves_no_snapshot_behind()
     test_unclassified_hook_preserves_both_wrapper_trees()
     test_invalid_or_missing_budget_mapping_preserves_both_wrapper_trees()

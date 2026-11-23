@@ -2559,6 +2559,37 @@ def outermost_paths(paths: list[Path]) -> list[Path]:
     return result
 
 
+def restore_snapshot_entry(path: Path, kind: str, saved: Path | str) -> None:
+    """Put one snapshot entry back at path without removing path first.
+
+    The entry is built beside path, then renamed over it: atomic for a file
+    or a link over a file or a link. A directory on either side cannot be
+    renamed over, so what stands there moves aside first; path is missing
+    only between those two renames.
+    """
+    mkdir(path.parent)
+    holder = Path(tempfile.mkdtemp(prefix=f".{path.name}.rollback-", dir=path.parent))
+    try:
+        staged = holder / "entry"
+        if kind == "symlink":
+            staged.symlink_to(str(saved), target_is_directory=True)
+        elif kind == "directory":
+            shutil.copytree(Path(saved), staged, symlinks=True)
+        else:
+            shutil.copy2(Path(saved), staged)
+
+        def real_dir(entry: Path) -> bool:
+            return entry.is_dir() and not entry.is_symlink()
+
+        if (path.exists() or path.is_symlink()) and (real_dir(path) or real_dir(staged)):
+            os.rename(path, holder / "aside")
+            os.rename(staged, path)
+        else:
+            os.replace(staged, path)
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+
+
 @contextmanager
 def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
     """Snapshot paths, and put them back if the block raises anything, an
@@ -2617,17 +2648,13 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
         yield
     except BaseException as failure:
         try:
-            for path in sorted(targets, key=lambda item: len(item.parts), reverse=True):
-                if path.exists() or path.is_symlink():
-                    remove_path(path)
+            # Restored in place, so a Codex session starting now never finds
+            # config.toml or hooks.json missing; then what the run added goes.
             for path, (kind, saved) in snapshots.items():
-                mkdir(path.parent)
-                if kind == "symlink":
-                    path.symlink_to(str(saved), target_is_directory=True)
-                elif kind == "directory":
-                    shutil.copytree(Path(saved), path, symlinks=True)
-                else:
-                    shutil.copy2(Path(saved), path)
+                restore_snapshot_entry(path, kind, saved)
+            for path in targets:
+                if path not in snapshots and (path.exists() or path.is_symlink()):
+                    remove_path(path)
         except Exception as error:
             raise RuntimeError(
                 f"rollback failed: {type(error).__name__}: {error}; the pre-publish "
