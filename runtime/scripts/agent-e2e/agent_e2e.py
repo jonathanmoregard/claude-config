@@ -688,14 +688,25 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     Campaigns of the broker are kept apart by its own unit. Without bwrap
     there is no sibling isolation at all; the verdict's `isolated_tmp` says
     which a run had.
+
+    A bind after that tmpfs whose source is RUNS or above it would undo it.
+    The binary's directory therefore goes before it, so a scratch dir holding
+    both `claude` and --out keeps the binary in view and the siblings hidden.
+    E2E_SHARED cannot move: it must stay visible and writable, so one at or
+    above RUNS refuses the run rather than exposing every sibling.
     """
-    binds = []
+    shared_at = shared.resolve()
+    if shared_at == runs.resolve() or shared_at in runs.resolve().parents:
+        raise ValueError(f"E2E_SHARED {shared} is {runs} or an ancestor of it: "
+                         "binding it would expose every sibling run; point "
+                         "E2E_SHARED outside the runs")
+    exe_bind = []
     exe_dir = pathlib.Path(claude).resolve().parent
     if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
-        binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
+        exe_bind = ["--ro-bind", str(exe_dir), str(exe_dir)]
     # Last, so a read-only ancestor bind or the tmpfs over RUNS cannot shadow
     # them; an inherited E2E_SHARED under RUNS is bound back in the same way.
-    binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
+    binds = ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
     # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
     # included) and ~/.ssh is hidden; only the run, the shared log dir and
     # the credentials file (token refresh) stay writable.
@@ -730,8 +741,8 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # with the token in hand; measured with a 3s timeout against `sleep 300`.
     return [shutil.which("bwrap"), "--dev-bind", "/", "/",
             "--unshare-pid", "--proc", "/proc", "--die-with-parent",
-            *home_guard, *path_guard(), "--tmpfs", "/tmp", "--tmpfs", str(runs),
-            *binds, "--chdir", str(work), "--", *argv]
+            *home_guard, *path_guard(), "--tmpfs", "/tmp", *exe_bind,
+            "--tmpfs", str(runs), *binds, "--chdir", str(work), "--", *argv]
 
 
 def events_of(text: str) -> list[dict]:

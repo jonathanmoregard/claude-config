@@ -381,15 +381,20 @@ def test_a_run_cannot_reach_a_sibling_run(tmp_path):
     try:
         sc = _scenario(tmp_path, "exit 0\n")
         out = base / "out"
-        sibling = out / sc.name / "old/1/home/.claude.json"
+        sib_run = out / sc.name / "old/1"
+        sibling = sib_run / "home/.claude.json"
         sibling.parent.mkdir(parents=True)
         sibling.write_text("sibling-account\n")
         (out / "beside").write_text("beside-runs\n")
         shared = base / "shared"
         shared.mkdir()
         report = shared / "report"
+        # The writes go both into the sibling's HOME and beside it, so hiding
+        # only the siblings' HOMEs would not pass for hiding their runs.
         claude = fake_claude(base, _ok(f"""
 {{ cat {sibling} || echo "sibling unreadable"
+   echo pwned > {sibling}
+   mkdir -p {sib_run} && echo planted > {sib_run / "planted"}
    cat "$E2E_RUN/marker" {out / "beside"}
    echo w > "$E2E_RUN/own" && echo "own run writable"; }} > {report} 2>&1
 """))
@@ -406,6 +411,81 @@ def test_a_run_cannot_reach_a_sibling_run(tmp_path):
         assert "ready" in text and "own run writable" in text, text
         assert "beside-runs" in text, text
         assert (out / sc.name / "new/1/own").read_text() == "w\n"
+        assert sibling.read_text() == "sibling-account\n", "a run wrote a sibling's HOME"
+        assert not (sib_run / "planted").exists(), "a run wrote into a sibling's run dir"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.mark.parametrize("shared_at", ["runs", "out", "above-out", "link-to-out"])
+def test_a_shared_dir_over_the_runs_refuses_the_run(tmp_path, shared_at):
+    """E2E_SHARED is bound writable after the tmpfs over `<--out>/<scenario>`,
+    so one at or above it would bind every sibling run back in. There is no
+    order of binds that keeps both promises -- the shared dir in view and the
+    siblings hidden -- so the run must not start, and its verdict says why."""
+    _require_sandbox()
+    base = pathlib.Path(tempfile.mkdtemp(prefix="e2e-shared-over-", dir="/var/tmp"))
+    try:
+        sc = _scenario(tmp_path, "exit 0\n")
+        out = base / "out"
+        runs = out / sc.name
+        shared = {"runs": runs, "out": out, "above-out": base,
+                  "link-to-out": base / "link"}[shared_at]
+        sibling = runs / "old/1/home/.claude.json"
+        sibling.parent.mkdir(parents=True)
+        (base / "link").symlink_to(out)  # bwrap follows it to the real dir
+        sibling.write_text("sibling-account\n")
+        started = tmp_path / "agent-started"
+        claude = fake_claude(base, _ok(f"""
+touch {started}
+cat {sibling} > "$E2E_SHARED/leak" 2>&1; echo pwned > {sibling}
+"""))
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / "CLAUDE.md").write_text("x\n")
+        r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                    "--out", str(out), "--claude", str(claude),
+                    env={**os.environ, "E2E_SHARED": str(shared)})
+        assert r.returncode == 0, r.stderr
+        verdict = json.loads((runs / "new/1/verdict.json").read_text())
+        assert verdict["verdict"] == "INCONCLUSIVE", verdict
+        assert "E2E_SHARED" in verdict["why"], verdict
+        assert not started.exists(), "the agent ran with the siblings in view"
+        assert sibling.read_text() == "sibling-account\n"
+        assert not (shared / "leak").exists()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_a_claude_beside_the_runs_in_tmp_does_not_expose_them(tmp_path):
+    """A `claude` under /tmp is bound back in by its directory, which is
+    hidden by the private /tmp otherwise. When that directory holds --out too
+    -- the plain layout of a scratch dir with the binary and the output side by
+    side -- the bind must not bring the sibling runs back with it."""
+    _require_sandbox()
+    base = pathlib.Path(tempfile.mkdtemp(prefix="e2e-exe-over-", dir="/tmp"))
+    try:
+        sc = _scenario(tmp_path, "exit 0\n")
+        out = base / "out"
+        sibling = out / sc.name / "old/1/home/.claude.json"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text("sibling-account\n")
+        claude = fake_claude(base, _ok(f"""
+{{ cat {sibling} || echo "sibling unreadable"
+   cat "$E2E_RUN/marker"
+   echo w > "$E2E_RUN/own" && echo "own run writable"; }} > "$E2E_SHARED/report" 2>&1
+"""))
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / "CLAUDE.md").write_text("x\n")
+        r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                    "--out", str(out), "--claude", str(claude))
+        assert r.returncode == 0, r.stderr
+        run = out / sc.name / "new/1"
+        assert json.loads((run / "verdict.json").read_text())["verdict"] == "PASS", r.stdout
+        text = (run / "shared/report").read_text()
+        assert "sibling-account" not in text and "sibling unreadable" in text, text
+        assert "ready" in text and "own run writable" in text, text
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
