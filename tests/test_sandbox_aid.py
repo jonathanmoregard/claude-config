@@ -42,6 +42,15 @@ def test_git_auth_failure_points_at_the_broker(tmp_path: Path) -> None:
     assert [(r["kind"], r["hint"]) for r in records] == [("hint", "git-auth")]
 
 
+def test_flake_eval_blocked_by_the_gitmodules_placeholder_names_the_fix(tmp_path: Path) -> None:
+    err = ("error: parsing .gitmodules file: failed open - "
+           "'/home/u/worktrees/r/.gitmodules' is locked: Permission denied")
+    proc, records = run_hook(tmp_path, failed(err, command="nix build .#x"))
+    assert proc.returncode == 2
+    assert "empty .gitmodules" in proc.stderr
+    assert [r["hint"] for r in records] == ["gitmodules"]
+
+
 def test_hint_also_reads_a_completed_call(tmp_path: Path) -> None:
     event = {"hook_event_name": "PostToolUse", "tool_name": "Bash",
              "tool_input": {"command": "systemctl --user status x | head"},

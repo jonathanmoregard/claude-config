@@ -47,10 +47,18 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         "or ~/worktrees into that root's `.trash/`.",
     ),
     (
+        "gitmodules",
+        re.compile(r"\.gitmodules' is locked: Permission denied"),
+        "The sandbox mounts a placeholder over a missing .gitmodules, which "
+        "nix's git fetcher cannot open. Commit an empty .gitmodules at the "
+        "repo root.",
+    ),
+    (
         "read-only",
         re.compile(r"Read-only file system", re.I),
         "The shell is sandboxed: it can write under ~/Repos, ~/worktrees, "
-        "/tmp and the nix, uv and cargo caches only.",
+        "/tmp, ~/.local/state/claude-tasks and its own cache "
+        "~/.cache/claude-sandbox only.",
     ),
 ]
 

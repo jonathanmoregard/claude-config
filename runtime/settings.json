@@ -76,7 +76,6 @@
   },
   "permissions": {
     "allow": [
-      "Bash",
       "Glob",
       "Grep",
       "Skill",
@@ -619,6 +618,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/sandbox-env.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 $HOME/.claude/hooks/aggregator-recall-health.py",
             "timeout": 10,
             "statusMessage": "Checking aggregator recall health..."
@@ -1037,7 +1045,7 @@
     }
   },
   "sandbox": {
-    "enabled": false,
+    "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
@@ -1072,9 +1080,8 @@
         "/home/jonathan/Repos",
         "/home/jonathan/worktrees",
         "/home/jonathan/.local/state/ai-router",
-        "~/.cache/nix",
-        "~/.cache/uv",
-        "~/.cargo"
+        "/home/jonathan/.local/state/claude-tasks",
+        "~/.cache/claude-sandbox"
       ],
       "denyWrite": [
         "/home/jonathan/.local/state/ai-router/jobs",
