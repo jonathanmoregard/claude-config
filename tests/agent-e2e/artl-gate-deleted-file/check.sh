@@ -5,6 +5,7 @@ source "$(dirname "$0")/../_lib/artl_gate_checks.sh"
 # through the gate. A refusal fails the run even if a PR appears afterwards:
 # that PR got around the gate rather than through it.
 gate_refused_pr_open && fail "pr-open-gate refused the reviewed branch (deleted file counted as unread)"
+pr_open_refused_by_ask && fail "the PR open fell to the permissions.ask prompt (gate did not grant it)"
 [ -f "$RUN/pr-created" ] && pass "PR opened"
 pr_open_attempted && fail "the PR open was attempted but no PR was created"
 fail "no PR was opened"

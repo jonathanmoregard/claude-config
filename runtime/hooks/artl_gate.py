@@ -1126,8 +1126,9 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
     # by content at the tip, not numstat's "-", which .gitattributes (-diff,
     # binary) can set on any text file.
     # A file the branch deletes has nothing left at the tip for a Read to open,
-    # so no review could ever cover it; the deletion is in the diff the
-    # passing review saw, and the branch verdict and drift still apply.
+    # so no review could ever cover it. It is held only by the branch's
+    # passing verdict and the drift limit; nothing checks that the review
+    # looked at the deletion itself.
     # A listing git could not produce excuses nothing.
     trusted = sorted((r for r in mine if not r.get("suspect")), key=lambda r: r.get("ts", 0))
     present = paths_at_tip(info["top"], tip)

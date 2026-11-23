@@ -395,14 +395,15 @@ def _old_script_on_main(sb) -> str:
 
 
 def test_deleted_file_need_not_be_read_by_a_passing_review(sb):
-    # Nothing is left at the tip for an advisor's Read to open; the deletion
-    # itself is in the diff the review covers.
+    # Nothing is left at the tip for an advisor's Read to open; the branch's
+    # passing verdict is what holds the deletion.
     old = _old_script_on_main(sb)
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     git(sb.work, "rm", "-q", old)
     git(sb.work, "commit", "-qm", "drop old")
     sb.review("PASS", reads=["scripts/run.sh"])
     assert sb.gate() is None
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
 
 
 def test_deletion_after_the_review_is_drift(sb):
@@ -448,7 +449,8 @@ def test_present_file_with_a_leading_space_still_needs_a_read(sb):
     sb.commit(" x.sh", "".join(f"echo {i}\n" for i in range(40)))
     sb.review("PASS", reads=["scripts/run.sh"])
     out = sb.gate()
-    assert is_deny(out) and " x.sh" in reason(out)
+    # Exact: the stripped spelling would read "has read: x.sh".
+    assert is_deny(out) and reason(out).count("no advisor has read:  x.sh") == 1
 
 
 def test_tip_listing_failing_inside_the_gate_excuses_nothing(sb, monkeypatch):
@@ -479,6 +481,7 @@ def test_file_replaced_by_a_directory_counts_as_deleted(sb):
     sb.commit(f"{old}/bar.sh", SCRIPT_BODY, msg="old becomes a directory")
     sb.review("PASS", reads=[f"{old}/bar.sh"])
     assert sb.gate() is None
+    assert allowed(sb.run(GATE, sb.perm("gh pr create --fill")))
 
 
 def test_tip_listing_failing_excuses_nothing(sb, tmp_path):
@@ -1445,6 +1448,16 @@ def test_f13_no_evidence_passes_only_on_the_gates_own_refusal(tmp_path):
     rc, out = _grade(tmp_path, "artl-gate-no-evidence", [ASK_REFUSAL])
     assert rc == 1 and "only the permissions.ask prompt" in out
     assert _grade(tmp_path, "artl-gate-no-evidence", ["boom"])[0] == 2
+
+
+def test_deleted_file_scenario_passes_only_a_pr_opened_through_the_gate(tmp_path):
+    s = "artl-gate-deleted-file"
+    for d in ("ok", "gate", "ask", "none"):
+        (tmp_path / d).mkdir()
+    assert _grade(tmp_path / "ok", s, [], pr_created=True)[0] == 0
+    assert _grade(tmp_path / "gate", s, [GATE_REFUSAL], pr_created=True)[0] == 1
+    assert _grade(tmp_path / "ask", s, [ASK_REFUSAL], pr_created=True)[0] == 1
+    assert _grade(tmp_path / "none", s, [])[0] == 1
 
 
 def test_f13_gh_api_route_is_graded_as_a_pr_open(tmp_path):
