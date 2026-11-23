@@ -47,6 +47,8 @@ def env(monkeypatch, tmp_path):
         "accessToken": TOKEN, "refreshToken": REFRESH, "expiresAt": FUTURE_MS}}),
         encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("E2E_JUDGE_CREDS", str(creds))
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.chdir(tmp_path)
@@ -160,35 +162,69 @@ def test_unusable_credentials_are_inconclusive_before_the_judge_runs(env, monkey
     assert (path.read_bytes() if path.exists() else None) == before
 
 
-def test_raw_output_is_kept_in_log_dir_with_the_token_redacted(env, monkeypatch) -> None:
-    logs = env / "run"
-    logs.mkdir()
+def test_failure_message_quotes_the_output_with_the_token_redacted(env, monkeypatch) -> None:
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(
         env, 'echo "err $CLAUDE_CODE_OAUTH_TOKEN" >&2\n', code=1))
-    with pytest.raises(Inconclusive):
-        judge("p", SCHEMA, log_dir=str(logs))
-    raw = (logs / "judge.out").read_text()
-    assert "err [REDACTED]" in raw
-    assert TOKEN not in raw
-    assert oct((logs / "judge.out").stat().st_mode & 0o777) == "0o600"
+    with pytest.raises(Inconclusive) as exc:
+        judge("p", SCHEMA)
+    assert "err [REDACTED]" in str(exc.value)
+    assert TOKEN not in str(exc.value)
 
 
-def test_nothing_is_left_behind_without_a_log_dir(env, monkeypatch) -> None:
-    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env))
+@pytest.mark.parametrize("code", [0, 1])
+def test_nothing_is_left_behind(env, monkeypatch, code) -> None:
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, code=code))
     before = set(os.listdir(env))
-    judge("p", SCHEMA)
-    assert set(os.listdir(env)) == before
+    try:
+        judge("p", SCHEMA)
+    except Inconclusive:
+        pass
+    assert set(os.listdir(env)) - {"claude"} == before - {"claude"}
 
 
-def test_a_planted_log_link_is_not_followed(env, monkeypatch) -> None:
-    logs = env / "run"
-    logs.mkdir()
-    target = env / "victim"
-    target.write_text("keep", encoding="utf-8")
-    (logs / "judge.out").symlink_to(target)
+def test_any_failure_type_is_inconclusive(env, monkeypatch) -> None:
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", str(env / "no-such-cli"))   # OSError
+    with pytest.raises(Inconclusive):
+        judge("p", SCHEMA)
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, "sleep 5\n"))   # TimeoutExpired
+    with pytest.raises(Inconclusive):
+        judge("p", SCHEMA, timeout=1)
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env))
-    assert judge("p", SCHEMA, log_dir=str(logs)) == {"ok": True}
-    assert target.read_text() == "keep"
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: 1 / 0)       # anything else
+    with pytest.raises(Inconclusive) as exc:
+        judge("p", SCHEMA)
+    assert "ZeroDivisionError" in str(exc.value)
+
+
+@pytest.mark.parametrize("raw", [
+    '{"claudeAiOauth":{"accessToken":"a\\u0000b","expiresAt":%d}}' % FUTURE_MS,  # NUL in token
+    "[" * 100000,                                                                # deep nesting
+])
+def test_hostile_credentials_are_inconclusive(env, monkeypatch, raw) -> None:
+    creds_of(env).write_text(raw, encoding="utf-8")
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env))
+    with pytest.raises(Inconclusive):
+        judge("p", SCHEMA)
+
+
+def test_inherited_claude_settings_are_not_passed_through(env, monkeypatch) -> None:
+    seen = env / "seen"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(env / "agent-config"))
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(
+        env, f'echo "${{CLAUDE_CONFIG_DIR-unset}}" > {seen}\n'))
+    judge("p", SCHEMA)
+    assert seen.read_text() == "unset\n"
+
+
+def test_without_a_credentials_file_ci_auth_is_used_and_redacted(env, monkeypatch) -> None:
+    creds_of(env).unlink()
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ci-token")
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, (
+        'echo "${ANTHROPIC_AUTH_TOKEN-unset}|${CLAUDE_CODE_OAUTH_TOKEN-unset}" >&2\n'), code=1))
+    with pytest.raises(Inconclusive) as exc:
+        judge("p", SCHEMA)
+    assert "[REDACTED]|unset" in str(exc.value)
+    assert "ci-token" not in str(exc.value)
 
 
 if __name__ == "__main__":

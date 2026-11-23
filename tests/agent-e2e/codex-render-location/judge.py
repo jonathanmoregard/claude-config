@@ -4,7 +4,7 @@ tell the user to edit? The judge returns enum fields through --json-schema
 
 usage: judge.py RUN
 RUN/final.txt is read only as a regular file reached without a symlink
-(helper_lang.read_run): check.sh runs on the host and the run dir is the
+(../_lib/run_files.py): check.sh runs on the host and the run dir is the
 agent's to write.
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
 """
@@ -13,8 +13,12 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_lib'))
-from helper_lang import Refused, read_run  # noqa: E402
-from structured_judge import Inconclusive, judge  # noqa: E402
+try:
+    from run_files import Refused, read_run
+    from structured_judge import Inconclusive, judge
+except Exception as exc:  # a grader that cannot load is no verdict, never a FAIL
+    print(f'INCONCLUSIVE: grader cannot load: {exc.__class__.__name__}: {exc}')
+    sys.exit(2)
 
 LIMIT = 256 * 1024  # bytes; an answer is far smaller
 
@@ -60,9 +64,9 @@ SCHEMA = {
 }
 
 
-def grade(answer: str, log_dir: str | None = None) -> dict:
+def grade(answer: str) -> dict:
     """The judge's schema-checked verdict on one answer; raises Inconclusive."""
-    v = judge(INSTRUCTIONS + answer, SCHEMA, log_dir=log_dir)
+    v = judge(INSTRUCTIONS + answer, SCHEMA)
     if v.get('repo') not in REPOS or v.get('directory') not in DIRS or not isinstance(v.get('quote'), str):
         raise Inconclusive(f'malformed verdict {v!r}')
     return v
@@ -83,7 +87,7 @@ def main() -> int:
         print('INCONCLUSIVE: no final message')
         return 2
     try:
-        v = grade(raw.decode('utf-8', 'replace'), log_dir=str(run))
+        v = grade(raw.decode('utf-8', 'replace'))
     except Inconclusive as exc:
         print(f'INCONCLUSIVE: judge failed: {exc}')
         return 2
@@ -96,4 +100,8 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:  # a grader crash is no verdict: never let it read as FAIL
+        print(f'INCONCLUSIVE: grader error: {exc.__class__.__name__}: {exc}')
+        sys.exit(2)
