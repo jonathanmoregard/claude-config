@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable
 
@@ -616,6 +617,36 @@ def test_mirror_prunes_every_unplanned_path_inside_the_managed_paths_only() -> N
         before = snapshot(rt.home, ("",))
         rt.sync_ok()
         assert snapshot(rt.home, ("",)) == before
+
+
+def test_sync_prunes_what_a_killed_run_left_beside_a_managed_path() -> None:
+    # A run killed (SIGKILL) inside replace_entry or put_file leaves its
+    # holder, perhaps with the original moved aside, beside the path it
+    # was replacing. Inside a managed directory the walk prunes it; beside a
+    # top-level managed path (~/.codex/.hooks.json.swap-*) nothing did.
+    with round_trip() as rt:
+        swap = Path(tempfile.mkdtemp(prefix=".hooks.json.swap-", dir=rt.codex))
+        (swap / "aside").write_text("{}\n", encoding="utf-8")
+        plugin_swap = Path(tempfile.mkdtemp(prefix=f".{rt.plugin.name}.swap-", dir=rt.plugin.parent))
+        (plugin_swap / "entry").mkdir()
+        fd, name = tempfile.mkstemp(prefix=".AGENTS.md.tmp-", dir=rt.codex)
+        os.close(fd)
+        left = {swap, plugin_swap, Path(name)}
+
+        # A failed check puts them back with the rest of the home.
+        profile = rt.codex / "p.config.toml"
+        profile.write_text('approval_policy = "on-request"\n', encoding="utf-8")
+        before = snapshot(rt.home, ("",))
+        assert rt.sync().returncode == 1
+        assert snapshot(rt.home, ("",)) == before
+        profile.unlink()
+
+        result = assert_check_fails(rt)
+        errors = {line for line in result.stdout.splitlines() if line.startswith("- ")}
+        assert errors == {f"- {path}: not in the render plan" for path in left}, describe(result)
+        rt.sync_ok()
+        for path in left:
+            assert not path.exists(), path
 
 
 def hook_generation_files(rt) -> dict[Path, bytes]:
@@ -1908,6 +1939,7 @@ if __name__ == "__main__":
     test_check_rejects_artifacts_the_render_would_remove_or_repair()
     test_sync_prunes_a_nested_role_file_under_the_imported_role_root()
     test_mirror_prunes_every_unplanned_path_inside_the_managed_paths_only()
+    test_sync_prunes_what_a_killed_run_left_beside_a_managed_path()
     test_sync_repairs_a_modified_content_addressed_hook_file()
     test_sync_repairs_generator_owned_hook_paths_of_the_wrong_type()
     test_paths_cleared_for_the_wrong_type_are_replaced_and_rolled_back()

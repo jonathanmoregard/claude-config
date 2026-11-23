@@ -2300,8 +2300,7 @@ def unplanned_paths(plan: RenderPlan) -> list[Path]:
     first: what publish_render_plan prunes and render_plan_drift reports.
 
     The walk never follows a link and never enters a leaf or a never-pruned
-    path. A *.bak-* beside a managed path counts as inside it, as in the
-    production publish, which prunes those too.
+    path. What beside_managed_path names counts as inside it.
     """
     leaves, directories = planned_entries(plan)
     kept = set(never_pruned_paths())
@@ -2321,13 +2320,21 @@ def unplanned_paths(plan: RenderPlan) -> list[Path]:
 
     for root in managed_paths():
         visit(root)
-        if root.parent.is_dir():
-            found.extend(
-                sibling
-                for sibling in sorted(root.parent.iterdir())
-                if sibling.name.startswith(f"{root.name}.bak-")
-            )
+        found.extend(beside_managed_path(root))
     return found
+
+
+def beside_managed_path(root: Path) -> list[Path]:
+    """What sits beside a managed path but counts as inside it: a *.bak-*,
+    as in the production publish, which prunes those too, and the holder a
+    run killed inside replace_entry (.<name>.swap-*) or put_file
+    (.<name>.tmp-*) left there, perhaps with the original moved aside."""
+    if not root.parent.is_dir():
+        return []
+    prefixes = (f"{root.name}.bak-", f".{root.name}.swap-", f".{root.name}.tmp-")
+    return [
+        sibling for sibling in sorted(root.parent.iterdir()) if sibling.name.startswith(prefixes)
+    ]
 
 
 def publish_references(links: list[tuple[Path, Path]]) -> None:
@@ -2717,7 +2724,7 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
 
 def render_plan_paths(plan: RenderPlan) -> list[Path]:
     """What a publish may change, for the rollback set: every managed path
-    but config.toml (see publish_config) and every *.bak-* beside one.
+    but config.toml (see publish_config) and what beside_managed_path names.
 
     A managed path holding a never-pruned one is taken entry by entry around
     it, so the rollback cannot touch what the publish leaves alone; the
@@ -2738,12 +2745,7 @@ def render_plan_paths(plan: RenderPlan) -> list[Path]:
     for root in managed_paths():
         if root != CODEX / "config.toml":
             paths.extend(around(root))
-        if root.parent.is_dir():
-            paths.extend(
-                sibling
-                for sibling in sorted(root.parent.iterdir())
-                if sibling.name.startswith(f"{root.name}.bak-")
-            )
+        paths.extend(beside_managed_path(root))
     paths.extend(plan.hook_wrapper_files)
     paths.extend(
         blocking
