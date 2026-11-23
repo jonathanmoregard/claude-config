@@ -73,26 +73,55 @@ def time_limit(task: str = "b1") -> list[dict]:
                               "background time limit")]
 
 
-def grade(tmp: Path, events: list[dict], mode: str, *, alarm: bool = False) -> int:
+# What the notify-send stub logs ("$*") for the stall toast the old wait-for
+# sent, and for an unrelated toast another hook may send during a run.
+STALL_TOAST = (f"-a Claude Code -u critical Background agent stalled agent {AGENT} "
+               "stalled: no activity for 1m0s (idle limit 60s)\n")
+# Another hook's toast that even says "stalled": only the stall toast's title counts.
+OTHER_TOAST = ("--urgency=critical --app-name=claude-tripwire Config changed "
+               "settings.json while a sync stalled\n")
+
+
+def grade(tmp: Path, events: list[dict], mode: str, *, toast: str = "") -> int:
     (tmp / "transcript.jsonl").write_text("\n".join(json.dumps(e) for e in events))
-    if alarm:
-        (tmp / "notify.log").write_text(f"agent {AGENT} stalled: no activity\n")
+    if toast:
+        (tmp / "notify.log").write_text(toast)
     return grader.grade(tmp, mode)[0]
 
 
 def test_stall_pass(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
-    assert grade(tmp_path, events, "stall", alarm=True) == 0
+    assert grade(tmp_path, events, "stall") == 0
+
+
+def test_stall_with_a_desktop_notification_fails(tmp_path: Path) -> None:
+    events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
+    assert grade(tmp_path, events, "stall", toast=STALL_TOAST) == 1
+
+
+def test_stall_toast_fails_quiet_too(tmp_path: Path) -> None:
+    events = launched() + armed() + agent_done() + killed("b1")
+    assert grade(tmp_path, events, "quiet") == 0
+    assert grade(tmp_path, events, "quiet", toast=STALL_TOAST) == 1
+
+
+def test_stall_toast_fails_even_without_a_dispatch(tmp_path: Path) -> None:
+    assert grade(tmp_path, [say("hi")], "stall", toast=STALL_TOAST) == 1
+
+
+def test_another_hooks_toast_is_not_the_stall_toast(tmp_path: Path) -> None:
+    events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
+    assert grade(tmp_path, events, "stall", toast=OTHER_TOAST) == 0
 
 
 def test_stall_needs_a_parent_turn_after_the_exit(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 5)]
-    assert grade(tmp_path, events, "stall", alarm=True) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_reply_text_about_exit_5_is_not_the_alarm(tmp_path: Path) -> None:
     events = launched() + armed() + [say("it will exit 5 if quiet; the alarm fired before")]
-    assert grade(tmp_path, events, "stall", alarm=True) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_arming_variants_count(tmp_path: Path) -> None:
@@ -153,7 +182,7 @@ def persisted(tmp: Path) -> None:
 def test_description_text_cannot_fake_exit_5(tmp_path: Path) -> None:
     persisted(tmp_path)
     events = launched() + armed() + [exited("b1", 3, desc="Wait (exit code 5 = stalled)"), say()]
-    assert grade(tmp_path, events, "stall", alarm=True) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_exit_3_without_a_persisted_transcript_is_inconclusive(tmp_path: Path) -> None:
@@ -203,8 +232,28 @@ def test_kill_without_a_parent_stop_call_is_not_the_parents(tmp_path: Path) -> N
 def test_time_limit_does_not_mask_a_broken_rearm(tmp_path: Path) -> None:
     events = launched() + armed() + time_limit() + armed(task="b2", tool="t2") \
         + [exited("b2", 64, tool="t2"), say()]
-    assert grade(tmp_path, events, "stall", alarm=False) == 1
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_missing_transcript_is_inconclusive(tmp_path: Path) -> None:
     assert grader.grade(tmp_path, "stall")[0] == 2
+
+
+def test_stall_toast_fails_even_without_a_transcript(tmp_path: Path) -> None:
+    (tmp_path / "notify.log").write_text(STALL_TOAST)
+    assert grader.grade(tmp_path, "stall")[0] == 1
+
+
+def test_rearmed_waiter_exit_5_without_a_parent_turn_fails(tmp_path: Path) -> None:
+    events = launched() + armed() + time_limit() + armed(task="b2", tool="t2") \
+        + [exited("b2", 5, tool="t2")]
+    assert grade(tmp_path, events, "stall") == 1
+
+
+def test_exit_5_then_exit_3_without_a_persisted_transcript_fails(tmp_path: Path) -> None:
+    # The alarm fired (exit 5) with no parent turn; a later re-arm saw no
+    # transcript (exit 3). The fired alarm outranks "nothing persisted".
+    events = launched() + armed() + armed(task="b2", tool="t2") \
+        + [exited("b1", 5), exited("b2", 3, tool="t2")]
+    assert grade(tmp_path, events, "stall") == 1
+    assert grade(tmp_path, events, "quiet") == 1
