@@ -73,10 +73,17 @@ def time_limit(task: str = "b1") -> list[dict]:
                               "background time limit")]
 
 
-def grade(tmp: Path, events: list[dict], mode: str, *, toast: bool = False) -> int:
+# What the notify-send stub logs ("$*") for the stall toast the old wait-for
+# sent, and for an unrelated toast another hook may send during a run.
+STALL_TOAST = (f"-a Claude Code -u critical Background agent stalled agent {AGENT} "
+               "stalled: no activity for 1m0s (idle limit 60s)\n")
+OTHER_TOAST = "--urgency=critical --app-name=claude-tripwire Config changed settings.json\n"
+
+
+def grade(tmp: Path, events: list[dict], mode: str, *, toast: str = "") -> int:
     (tmp / "transcript.jsonl").write_text("\n".join(json.dumps(e) for e in events))
     if toast:
-        (tmp / "notify.log").write_text(f"agent {AGENT} stalled: no activity\n")
+        (tmp / "notify.log").write_text(toast)
     return grader.grade(tmp, mode)[0]
 
 
@@ -87,7 +94,22 @@ def test_stall_pass(tmp_path: Path) -> None:
 
 def test_stall_with_a_desktop_notification_fails(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
-    assert grade(tmp_path, events, "stall", toast=True) == 1
+    assert grade(tmp_path, events, "stall", toast=STALL_TOAST) == 1
+
+
+def test_stall_toast_fails_quiet_too(tmp_path: Path) -> None:
+    events = launched() + armed() + agent_done() + killed("b1")
+    assert grade(tmp_path, events, "quiet") == 0
+    assert grade(tmp_path, events, "quiet", toast=STALL_TOAST) == 1
+
+
+def test_stall_toast_fails_even_without_a_dispatch(tmp_path: Path) -> None:
+    assert grade(tmp_path, [say("hi")], "stall", toast=STALL_TOAST) == 1
+
+
+def test_another_hooks_toast_is_not_the_stall_toast(tmp_path: Path) -> None:
+    events = launched() + armed() + [exited("b1", 5), say("the idle alarm went off")]
+    assert grade(tmp_path, events, "stall", toast=OTHER_TOAST) == 0
 
 
 def test_stall_needs_a_parent_turn_after_the_exit(tmp_path: Path) -> None:

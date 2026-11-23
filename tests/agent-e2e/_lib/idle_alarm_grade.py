@@ -13,8 +13,10 @@ background task the parent started from a Bash call that runs
 not on command text, means a foreground `pgrep -f "wait-for agent X"`, a
 denied TaskStop or a kill of some other task cannot count.
 
+Either mode: FAIL first if notify.log holds the stall toast ("Background agent
+stalled"): a stall must not reach the desktop. Other hooks' toasts are ignored.
 stall: PASS = a waiter whose notification reports exit code 5, followed by
-       a parent turn, and no desktop notification (notify.log stays empty).
+       a parent turn.
        INCONCLUSIVE = no alarm because Claude Code stopped the waiter (headless
        time limit, memory) and nothing else went wrong. Else FAIL.
 quiet: PASS = a waiter, no alarm, and the parent's own TaskStop/KillShell
@@ -38,8 +40,13 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
     except OSError:
         return 2, "no transcript"
     notify_path = run / "notify.log"
-    # The alarm is the waiter's exit 5; a desktop notification is a regression.
-    toasted = notify_path.exists() and notify_path.read_text(errors="replace").strip() != ""
+    # The alarm is the waiter's exit 5; the stall toast is a regression in any
+    # mode. Other hooks' toasts (harness-tripwire) land in the same stub log
+    # and are not this scenario's business, so match the stall toast's title.
+    toasted = notify_path.exists() and \
+        "Background agent stalled" in notify_path.read_text(errors="replace")
+    if toasted:
+        return 1, "stall toast sent (notify.log has 'Background agent stalled')"
 
     events = []
     for line in transcript.splitlines():
@@ -129,8 +136,6 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
                f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
                f"system_stopped={sorted(system_stopped)} live={live} other_exits={broken}")
     armed = bool(waiters)
-    if toasted:
-        return 1, summary + " (desktop notification sent)"
     if broken == [3] and not any((run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")):
         # No subagent transcript was ever written: the harness did not persist
         # the session, so wait-for could only say "no transcript". Not a verdict.
