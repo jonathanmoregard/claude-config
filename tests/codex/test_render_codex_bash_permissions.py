@@ -21,7 +21,9 @@ def claude_runtime() -> tuple[dict[str, object], dict[str, object]]:
         "ask": [],
         "deny": [
             "Bash(sudo *)",
+            # arftl-allow: destructive-rm (fixture deny rule)
             "Bash(rm -rf *)",
+            # arftl-allow: history-rewrite (fixture deny rule)
             "Bash(git reset --hard*)",
             "Bash(gh pr merge *)",
             "Bash(*quarantine*)",

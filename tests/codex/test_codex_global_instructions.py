@@ -46,6 +46,7 @@ def test_render_plan_tracks_agents_md_as_an_atomic_target() -> None:
             skill_wrappers=(),
         )
         with patch.object(render_codex, "CODEX", codex):
+            # arftl-allow: suppression-marker (fixture plan is a partial stand-in)
             assert target in render_codex.render_plan_paths(plan)  # type: ignore[arg-type]
 
 

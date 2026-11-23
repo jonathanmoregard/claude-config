@@ -1076,6 +1076,7 @@ def test_missing_source_fails_before_wrapper_publication() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         manifest, manifest_path, codex, plugin = write_fixture(root)
+        # arftl-allow: suppression-marker (fixture manifest is an untyped dict)
         Path(manifest["skills"][0]["skill_md"]).unlink()  # type: ignore[index]
         before_codex = tree_bytes(codex / "skills")
         before_plugin = tree_bytes(plugin / "skills")
@@ -1086,6 +1087,7 @@ def test_missing_source_fails_before_wrapper_publication() -> None:
             try:
                 render_codex.main()
             except FileNotFoundError:
+                # arftl-allow: swallowed-exception (the expected rejection; the else branch fails the test)
                 pass
             else:
                 raise AssertionError("missing source skill was not rejected")

@@ -664,12 +664,15 @@ Git boundary:
 BASH_DENY_PREFIXES = {
     "Bash(sudo)": ("sudo",),
     "Bash(sudo *)": ("sudo",),
+    # arftl-allow: destructive-rm (deny-rule table: data, not a command)
     "Bash(rm -rf *)": ("rm", "-rf"),
+    # arftl-allow: destructive-rm (deny-rule table, as above)
     "Bash(rm -fr *)": ("rm", "-fr"),
     "Bash(mkfs *)": ("mkfs",),
     "Bash(dd *)": ("dd",),
     "Bash(git push --force*)": ("git", "push", "--force"),
     "Bash(git push -f*)": ("git", "push", "-f"),
+    # arftl-allow: history-rewrite (deny-rule table, as above)
     "Bash(git reset --hard*)": ("git", "reset", "--hard"),
     "Bash(gh pr merge)": ("gh", "pr", "merge"),
     "Bash(gh pr merge *)": ("gh", "pr", "merge"),

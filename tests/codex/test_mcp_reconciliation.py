@@ -23,6 +23,7 @@ from mcp_test_support import (  # noqa: E402
 
 def test_import_prefers_dedicated_mcp_source_and_omits_fully_denied_server() -> None:
     settings = {
+        # arftl-allow: permission-widened (fixture: deny rules the import must honour)
         "permissions": {
             "deny": [
                 "mcp__futuresearch",

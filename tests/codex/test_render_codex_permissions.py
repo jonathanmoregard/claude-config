@@ -281,6 +281,7 @@ def test_relative_allow_and_additional_paths_do_not_become_global_roots() -> Non
 
 
 def test_additional_directories_require_accept_edits_mode() -> None:
+    # arftl-allow: permission-widened (each mode must still be refused extra roots)
     for mode in ("default", "plan", "dontAsk", "bypassPermissions"):
         roots = render_codex.codex_writable_roots(
             {"defaultMode": mode, "additionalDirectories": ["//mode-only"]}

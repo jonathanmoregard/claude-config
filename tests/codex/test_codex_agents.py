@@ -24,6 +24,7 @@ def test_import_collects_global_and_enabled_plugin_agents() -> None:
         (plugin / "agents").mkdir(parents=True)
         (claude / "agents" / "advisor.md").write_text(
             "---\nname: advisor\ndescription: Review only\n"
+            # arftl-allow: permission-widened (fixture: agent front matter to convert)
             "permissionMode: bypassPermissions\n"
             'tools: ["Read", "Grep", "Glob", "Skill"]\n---\n\nReview carefully.\n',
             encoding="utf-8",
@@ -52,6 +53,7 @@ def test_render_creates_native_codex_agent_roles() -> None:
         source = root / "advisor.md"
         source.write_text(
             "---\nname: advisor\ndescription: Review only\n"
+            # arftl-allow: permission-widened (fixture, as above)
             "permissionMode: bypassPermissions\n"
             'tools: ["Read", "Grep", "Glob", "Skill"]\n---\n\n'
             "Review CLAUDE.md carefully.\n",
@@ -62,6 +64,7 @@ def test_render_creates_native_codex_agent_roles() -> None:
                 "name": "advisor",
                 "description": "Review only",
                 "path": str(source),
+                # arftl-allow: permission-widened (fixture, as above)
                 "permission_mode": "bypassPermissions",
                 "tools": ["Read", "Grep", "Glob", "Skill"],
             }

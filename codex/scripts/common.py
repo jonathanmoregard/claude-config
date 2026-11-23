@@ -117,6 +117,7 @@ def write_file(path: Path, text: str, mode: int | None = None) -> bool:
                     path.chmod(mode)
                 return False
         except UnicodeDecodeError:
+            # arftl-allow: swallowed-exception (a non-UTF-8 file cannot equal the text; fall through and rewrite it)
             pass
     desired_mode = (
         mode

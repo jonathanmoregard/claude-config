@@ -341,6 +341,7 @@ def main() -> int:
             dedicated_mcp,
         ),
         "hooks": merge_hooks(settings.get("hooks") or {}, plugin_hooks),
+        # arftl-allow: permission-widened (copies Claude's permissions verbatim; the renderer maps them)
         "permissions": settings.get("permissions") or {},
         "settings": {
             key: value
