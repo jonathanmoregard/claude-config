@@ -117,10 +117,12 @@ printf 'fp_reason\tdecision\tdate\ntest-only path\taccepted\t2026-11-23\n' > "$D
 out=$("$TALLY" --root "$ROOT" --decided "$DEC"); rc=$?
 expect "tally with an accepted decision exits 0" 0 "$rc"
 expect "an accepted reason is not proposed" "" "$(grep -E "^exclude\?${T}" <<<"$out")"
-printf 'fp_reason\tdecision\tdate\ntest-only\trejected\t2026-11-23\n' > "$DEC"
+printf 'test-only\trejected\tx\ntest-only path extra\trejected\tx\nTest-only path\trejected\tx\ntest-only path\tunaccepted\tx\n' > "$DEC"
 out=$("$TALLY" --root "$ROOT" --decided "$DEC")
 expect "an undecided reason is still proposed" \
   "exclude?${T}test-only path${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"
+expect "an unreadable decisions file is reported" "ledger-tally: $ROOT: unreadable, no decisions applied" \
+  "$("$TALLY" --root "$ROOT" --decided "$ROOT" 2>&1 >/dev/null | grep unreadable)"
 out=$("$TALLY" --root "$ROOT" --decided "$ROOT/missing.tsv")
 expect "a missing decisions file decides nothing" \
   "exclude?${T}test-only path${T}3${T}2" "$(grep -E "^exclude\?${T}" <<<"$out")"

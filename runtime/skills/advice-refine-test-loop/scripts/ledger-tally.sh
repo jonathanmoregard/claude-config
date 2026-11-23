@@ -23,7 +23,10 @@ while (( $# )); do
     *) break ;;
   esac
 done
-[[ -f $decided ]] || decided=/dev/null
+if [[ ! -e $decided ]]; then decided=/dev/null   # no decisions file: none decided
+elif [[ -d $decided || ! -r $decided ]]; then
+  echo "ledger-tally: $decided: unreadable, no decisions applied" >&2; decided=/dev/null
+fi
 
 shopt -s nullglob
 ledgers=("$root"/*/review-ledger.tsv)
