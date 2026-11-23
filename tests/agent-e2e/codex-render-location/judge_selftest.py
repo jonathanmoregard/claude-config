@@ -1,52 +1,60 @@
 """Regression check for judge.py against hand-written answers with a known
-verdict. Runs the real judge model, so it is not part of pytest; run it after
-changing judge.py or ../_lib/structured_judge.py:
+verdict: each case pins the repo and directory fields the judge must return.
+Runs the real judge model, so it is not part of pytest; run it after changing
+judge.py or ../_lib/structured_judge.py:
 
     python3 -I tests/agent-e2e/codex-render-location/judge_selftest.py
 
-Exits 0 when every case gets its expected exit code (0 PASS, 1 FAIL).
+Exits 0 when every case gets its expected fields; 2 when the judge fails.
 """
 import os
-import subprocess
 import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_lib'))
+from judge import grade, passes  # noqa: E402
+from structured_judge import Inconclusive  # noqa: E402
+
+# (expected repo, expected directory, answer)
 CASES = [
-    (0, 'Make the change under codex/ in claude-config.'),
-    (0, 'Edit the renderer in ~/Repos/claude-config, under codex/ (codex/scripts/render_codex.py). '
-        'Do not touch ai-client-config; it is retired.'),
-    (1, 'Edit ~/Repos/claude-config, directory runtime/codex/.'),
-    (1, 'This lives in claude-config. The renderer output lands in codex/, but the change itself '
-        'goes in runtime/hooks/.'),
-    (1, 'Edit the ai-client-config repository, in clients/codex/.'),
-    (1, 'Edit ~/.claude/codex/scripts/render_codex.py, the codex/ directory of your Claude config.'),
-    (1, 'Edit the renderer under ~/.claude/codex/.'),
+    ('claude-config', 'codex', 'Make the change under codex/ in claude-config.'),
+    ('claude-config', 'codex',
+     'Edit the renderer in ~/Repos/claude-config, under codex/ (codex/scripts/render_codex.py). '
+     'Do not touch ai-client-config; it is retired.'),
+    ('claude-config', 'runtime', 'Edit ~/Repos/claude-config, directory runtime/codex/.'),
+    ('claude-config', 'runtime',
+     'This lives in claude-config. The renderer output lands in codex/, but the change itself '
+     'goes in runtime/hooks/.'),
+    ('ai-client-config', 'other', 'Edit the ai-client-config repository, in clients/codex/.'),
+    ('live-claude-dir', 'codex',
+     'Edit ~/.claude/codex/scripts/render_codex.py, the codex/ directory of your Claude config.'),
+    ('live-claude-dir', 'codex', 'Edit the renderer under ~/.claude/codex/.'),
 ]
 
 
-def run(case: tuple[int, str]) -> tuple[int, str, int, str]:
-    want, answer = case
-    with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as fh:
-        fh.write(answer + '\n')
+def run(case):
+    repo, directory, answer = case
     try:
-        proc = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'judge.py'), fh.name],
-                              capture_output=True, text=True, timeout=600)
-    finally:
-        os.unlink(fh.name)
-    return want, answer, proc.returncode, proc.stdout.strip()
+        return case, grade(answer + '\n')
+    except Inconclusive as exc:
+        return case, exc
 
 
 def main() -> int:
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(run, CASES))
-    bad = 0
-    for want, answer, got, out in results:
-        ok = got == want
+    bad = failed = 0
+    for (repo, directory, answer), v in results:
+        if isinstance(v, Inconclusive):
+            failed += 1
+            print(f'ERR judge failed: {v} :: {answer[:70]}')
+            continue
+        ok = (v['repo'], v['directory']) == (repo, directory)
+        ok = ok and passes(v) == ((repo, directory) == ('claude-config', 'codex'))
         bad += not ok
-        print(f"{'ok ' if ok else 'BAD'} want={want} got={got} :: {answer[:70]} :: {out[:120]}")
-    return 1 if bad else 0
+        print(f"{'ok ' if ok else 'BAD'} want={repo}/{directory} got={v['repo']}/{v['directory']} :: {answer[:70]}")
+    return 2 if failed else (1 if bad else 0)
 
 
 sys.exit(main())

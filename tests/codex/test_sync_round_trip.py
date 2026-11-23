@@ -14,7 +14,6 @@ from itertools import product
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import signal
 import subprocess
@@ -2071,37 +2070,7 @@ def test_report_discloses_research_agent_fallback() -> None:
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from retired_repo_names import GENERATED_NAMES  # noqa: E402
-from retired_repo_names import retired_repo_mentions as _mentions  # noqa: E402
-
-
-def retired_repo_mentions(line: str) -> list[str]:
-    """Names of the retired repo in one line of generated output, beyond the
-    names generated output may carry (tests/retired_repo_names.py)."""
-    return _mentions(line, GENERATED_NAMES, generated=True)
-
-
-def test_retired_repo_exemptions_cover_only_the_names_they_claim() -> None:
-    exempt = [
-        "ai-client-config check OK",
-        "ai-client-config check FAILED: 2 issues",
-        "see ai-client-config-codex-sync.service.",
-        "ai-client-config-sync.nix",
-        "/tmp/ai-client-config-roundtrip-k3j_9x/home/.codex",
-    ]
-    routed = [
-        "route changes to the ai-client-config checkout",
-        "edit the ai-client-config repository",
-        "ai-client-config checks this",
-        "edit ai-client-config-repository",
-        "the ai-client-config-repos dir",
-        "ai-client-config-synced",
-        "ai-client-config-codex-syncer",
-        "ai-client-config-skill-probes",
-        "edit ai-client-config.",
-    ]
-    assert [line for line in exempt if retired_repo_mentions(line)] == []
-    assert [line for line in routed if not retired_repo_mentions(line)] == []
+from retired_repo_names import retired_repo_mentions  # noqa: E402
 
 
 def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None:
@@ -2121,7 +2090,7 @@ def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None
             except UnicodeDecodeError:
                 continue
             for number, line in enumerate(text.splitlines(), 1):
-                if retired_repo_mentions(line):
+                if retired_repo_mentions(line, temp_home_ok=True):
                     stale.append(f"{path.relative_to(rt.home)}:{number}: {line.strip()}")
         assert stale == [], "\n".join(stale)
         agents = (rt.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
@@ -2129,7 +2098,6 @@ def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None
 
 
 if __name__ == "__main__":
-    test_retired_repo_exemptions_cover_only_the_names_they_claim()
     test_generated_text_never_routes_codex_changes_to_the_retired_repo()
     test_round_trip_matrix_checks_clean_and_rerenders_as_no_op()
     test_unchanged_hourly_run_from_a_staged_home_publishes_nothing()

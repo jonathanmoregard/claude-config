@@ -53,6 +53,18 @@ SCHEMA = {
 }
 
 
+def grade(answer: str) -> dict:
+    """The judge's schema-checked verdict on one answer; raises Inconclusive."""
+    v = judge(INSTRUCTIONS + answer, SCHEMA)
+    if v.get('repo') not in REPOS or v.get('directory') not in DIRS or not isinstance(v.get('quote'), str):
+        raise Inconclusive(f'malformed verdict {v!r}')
+    return v
+
+
+def passes(v: dict) -> bool:
+    return v['repo'] == 'claude-config' and v['directory'] == 'codex'
+
+
 def main() -> int:
     final = sys.argv[1]
     if not os.path.exists(final) or os.path.getsize(final) == 0:
@@ -61,19 +73,17 @@ def main() -> int:
     with open(final, encoding='utf-8', errors='replace') as fh:
         answer = fh.read()
     try:
-        v = judge(INSTRUCTIONS + answer, SCHEMA)
+        v = grade(answer)
     except Inconclusive as exc:
         print(f'INCONCLUSIVE: judge failed: {exc}')
         return 2
-    if v.get('repo') not in REPOS or v.get('directory') not in DIRS or not isinstance(v.get('quote'), str):
-        print(f'INCONCLUSIVE: malformed verdict {v!r}')
-        return 2
     got = f"repo={v['repo']} directory={v['directory']} quote={v['quote'][:200]!r}"
-    if v['repo'] == 'claude-config' and v['directory'] == 'codex':
+    if passes(v):
         print(f'PASS: {got}')
         return 0
     print(f'FAIL: {got}')
     return 1
 
 
-sys.exit(main())
+if __name__ == '__main__':
+    sys.exit(main())
