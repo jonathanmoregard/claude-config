@@ -225,7 +225,9 @@ def replace_entry(dst: Path, build: Callable[[Path], object]) -> bool:
     build makes the entry at the path it is given, beside dst, which is then
     renamed over dst: atomic for a file or a link over a file or a link. A
     directory on either side cannot be renamed over, so what stands at dst
-    moves aside first; dst is missing only between those two renames.
+    moves aside first; dst is missing only between those two renames. An
+    error or interrupt (Ctrl-C) between them moves it back before the
+    holder is removed; only a kill there leaves it aside, in the holder.
     """
     dst = located(dst)
     assert_not_claude_write(dst)
@@ -241,8 +243,16 @@ def replace_entry(dst: Path, build: Callable[[Path], object]) -> bool:
             return entry.is_dir() and not entry.is_symlink()
 
         if (dst.exists() or dst.is_symlink()) and (real_dir(dst) or real_dir(staged)):
-            os.rename(dst, holder / "aside")
-            os.rename(staged, dst)
+            aside = holder / "aside"
+            try:
+                os.rename(dst, aside)
+                os.rename(staged, dst)
+            except BaseException:
+                if (aside.exists() or aside.is_symlink()) and not (
+                    dst.exists() or dst.is_symlink()
+                ):
+                    os.rename(aside, dst)
+                raise
         else:
             os.replace(staged, dst)
         return True

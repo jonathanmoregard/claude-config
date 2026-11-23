@@ -615,6 +615,37 @@ def test_a_retargeted_reference_link_is_never_missing() -> None:
         assert [entry.name for entry in link.parent.iterdir()] == ["agent.md"]
 
 
+def test_an_interrupt_between_the_two_renames_leaves_what_stood_at_dst() -> None:
+    # Replacing a directory takes two renames: what stands at dst moves into
+    # the holder, then the new entry moves in. A Ctrl-C between them unwound
+    # through `finally: rmtree(holder)`, deleting the moved-aside original
+    # and leaving dst missing.
+    with tempfile.TemporaryDirectory() as td:
+        dst = Path(td) / "AGENTS.md"
+        dst.mkdir()
+        (dst / "hand-made").write_text("original\n", encoding="utf-8")
+        before = tree_state(Path(td))
+        real = os.rename
+        renames = 0
+
+        def interrupted_after_the_first(src: object, target: object) -> None:
+            nonlocal renames
+            renames += 1
+            real(src, target)
+            if renames == 1:
+                raise KeyboardInterrupt
+
+        try:
+            with patch.object(os, "rename", interrupted_after_the_first):
+                common.replace_entry(dst, lambda entry: entry.write_text("new\n", encoding="utf-8"))
+        except KeyboardInterrupt:
+            # arftl-allow: swallowed-exception (the injected interrupt; the state check below is the test)
+            pass
+        else:
+            raise AssertionError("the injected interrupt was not raised")
+        assert tree_state(Path(td)) == before
+
+
 def test_unclassified_hook_preserves_both_wrapper_trees() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -937,6 +968,7 @@ if __name__ == "__main__":
     test_a_no_op_publish_leaves_mcp_assets_in_place()
     test_a_changed_mcp_asset_replaces_the_old_one_whole_never_missing()
     test_a_retargeted_reference_link_is_never_missing()
+    test_an_interrupt_between_the_two_renames_leaves_what_stood_at_dst()
     test_unclassified_hook_preserves_both_wrapper_trees()
     test_invalid_or_missing_budget_mapping_preserves_both_wrapper_trees()
     test_second_wrapper_preparation_failure_publishes_neither_copy()
