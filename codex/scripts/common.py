@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 from typing import Any, Callable, Iterator
 
@@ -260,9 +261,20 @@ def replace_entry(dst: Path, build: Callable[[Path], object]) -> bool:
         shutil.rmtree(holder, ignore_errors=True)
 
 
+def copy_tree(src: Path, dst: Path) -> None:
+    """Copy src to dst as copytree does, generated names skipped, then make
+    the copy owner-writable, as the production publish makes its snapshot of
+    ~/.claude (chmod -R u+w): a read-only directory kept read-only could be
+    neither renamed into place nor written into by a later publish."""
+    shutil.copytree(src, dst, ignore=ignore_generated)
+    for dir_name, _, file_names in os.walk(dst):
+        for path in (Path(dir_name), *(Path(dir_name) / name for name in file_names)):
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+
+
 def copy_tree_clean(src: Path, dst: Path) -> None:
     """dst becomes a copy of src, whatever else it held, swapped in whole."""
-    replace_entry(dst, lambda staged: shutil.copytree(src, staged, ignore=ignore_generated))
+    replace_entry(dst, lambda staged: copy_tree(src, staged))
 
 
 def link_or_copy(src: Path, dst: Path) -> str:
@@ -278,7 +290,7 @@ def link_or_copy(src: Path, dst: Path) -> str:
             staged.symlink_to(src, target_is_directory=src.is_dir())
         except OSError:
             if src.is_dir():
-                shutil.copytree(src, staged, ignore=ignore_generated)
+                copy_tree(src, staged)
                 how = "copytree"
             else:
                 shutil.copy2(src, staged)

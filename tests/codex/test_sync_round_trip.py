@@ -1911,6 +1911,36 @@ def test_sync_follows_symlinked_mcp_sources_like_the_copy_does() -> None:
         rt.sync_ok()
 
 
+def test_sync_copies_a_read_only_mcp_source() -> None:
+    # copytree kept a read-only source directory's mode, so the copy could
+    # be neither renamed into place nor written into: every sync failed. The
+    # production snapshot of ~/.claude is made owner-writable (chmod -R u+w)
+    # before its render; the renderer's copy is too.
+    with round_trip(synced=False) as rt:
+        source = rt.home / ".claude" / "mcps" / "git-broker"
+        nested = source / "lib"
+        nested.mkdir()
+        (nested / "helpers.py").write_text("# helpers\n", encoding="utf-8")
+        read_only = (nested / "helpers.py", nested, source)
+        try:
+            for path in read_only:
+                path.chmod(0o555 if path.is_dir() else 0o444)
+            rt.sync_ok()
+            for path in (source, nested):
+                path.chmod(0o755)
+            (source / "server.py").write_text("# structured Git broker v2\n", encoding="utf-8")
+            for path in (nested, source):
+                path.chmod(0o555)
+            rt.sync_ok()
+        finally:
+            for path in reversed(read_only):
+                path.chmod(0o755 if path.is_dir() else 0o644)
+        copied = rt.codex / "mcps" / "git-broker"
+        assert (copied / "server.py").read_text(encoding="utf-8") == "# structured Git broker v2\n"
+        assert (copied / "lib" / "helpers.py").read_text(encoding="utf-8") == "# helpers\n"
+        rt.sync_ok()
+
+
 def test_check_accepts_config_comments_and_reordering() -> None:
     # The comparison is semantic, the same no-op test publish_config uses.
     with round_trip() as rt:
@@ -2019,6 +2049,7 @@ if __name__ == "__main__":
     test_agents_sharing_a_file_name_get_distinct_references()
     test_a_generated_name_cannot_aim_a_write_outside_the_mirror()
     test_sync_follows_symlinked_mcp_sources_like_the_copy_does()
+    test_sync_copies_a_read_only_mcp_source()
     test_check_accepts_config_comments_and_reordering()
     test_check_reports_toml_parse_errors_as_invalid_toml()
     test_check_reports_other_failures_with_their_real_type()
