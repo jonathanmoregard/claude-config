@@ -1580,6 +1580,59 @@ def test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore() -> Non
             assert list(scratch.iterdir()) == [], context
 
 
+# Runs sync_codex.main() with a publish that fails once config.toml is
+# written, and a rollback whose first copy fails.
+FAILED_ROLLBACK_SYNC = """
+import shutil, sys
+sys.path.insert(0, sys.argv[1])
+import render_codex, sync_codex
+state = {"rolling_back": False, "copies_failed": 0}
+real_publish_config = render_codex.publish_config
+def publish_config(plan):
+    real_publish_config(plan)
+    state["rolling_back"] = True
+    raise OSError("injected publication failure")
+render_codex.publish_config = publish_config
+real_copy2 = shutil.copy2
+def copy2(*args, **kwargs):
+    if state["rolling_back"] and not state["copies_failed"]:
+        state["copies_failed"] += 1
+        raise OSError("injected restore failure")
+    return real_copy2(*args, **kwargs)
+shutil.copy2 = copy2
+raise SystemExit(sync_codex.main())
+"""
+
+
+def test_a_direct_syncs_failed_rollback_names_one_snapshot_of_all_it_changed() -> None:
+    # The publish's own rollback nested inside the sync's: when the inner
+    # one failed, the outer restored the home, yet the run ended sending
+    # the user to the inner snapshot, which lacks config.toml, and left it
+    # in TMPDIR for good. One rollback: what it names is all there is.
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        rt.edit_config(lambda config: config.pop("features"))
+        scratch = rt.home.parent / "tmp"
+        scratch.mkdir()
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", FAILED_ROLLBACK_SYNC, str(rt.repo / "scripts")],
+            env={**os.environ, "HOME": str(rt.home), "TMPDIR": str(scratch)},
+            cwd=rt.home,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        context = describe(result)
+        assert result.returncode != 0, context
+        failed = [line for line in result.stderr.splitlines() if "rollback failed" in line]
+        assert failed, context
+        kept = Path(failed[-1].split("snapshot is kept at ", 1)[1].split()[0])
+        assert list(scratch.iterdir()) == [kept], (sorted(scratch.iterdir()), context)
+        entries = json.loads((kept / "snapshot.json").read_text(encoding="utf-8"))
+        assert str(rt.config) in {entry["path"] for entry in entries}, entries
+
+
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
     # Codex reads skills from both roots, and commands render as skills too.
     with round_trip() as rt:
@@ -1815,6 +1868,7 @@ if __name__ == "__main__":
     test_render_without_a_manifest_names_the_checked_sync()
     test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
     test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore()
+    test_a_direct_syncs_failed_rollback_names_one_snapshot_of_all_it_changed()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()

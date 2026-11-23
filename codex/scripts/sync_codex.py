@@ -49,8 +49,9 @@ def main() -> int:
     # Codex write to it between the publish and the check is lost.
     paths = [*render_codex.render_plan_paths(plan), render_codex.CODEX / "config.toml"]
     try:
+        # The only rollback: the publish's own would nest in this one.
         with render_codex.rollback_paths_on_error(paths):
-            render_codex.publish(plan)
+            render_codex.publish(plan, rollback=False)
             if check.main() != 0:
                 raise CheckFailed
     except CheckFailed:

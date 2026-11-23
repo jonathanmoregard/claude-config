@@ -549,10 +549,10 @@ def test_publication_never_serializes_so_it_cannot_fail_on_it() -> None:
                 raise TypeError("injected serialization failure during publication")
             return real_dump_json(value)
 
-        def publish(plan: render_codex.RenderPlan) -> list[tuple[Path, Path]]:
+        def publish(plan: render_codex.RenderPlan, **kwargs: bool) -> None:
             nonlocal publishing
             publishing = True
-            return real_publish(plan)
+            return real_publish(plan, **kwargs)
 
         with (
             isolated_renderer(root, manifest_path, codex, plugin, budget_support()),

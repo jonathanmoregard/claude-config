@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import ast
 import datetime as dt
@@ -2784,8 +2784,11 @@ def publish_config(plan: RenderPlan) -> None:
     put_file(path, rendered)
 
 
-def publish_render_plan(plan: RenderPlan) -> None:
-    with rollback_paths_on_error(render_plan_paths(plan)):
+def publish_render_plan(plan: RenderPlan, *, rollback: bool = True) -> None:
+    """rollback=False is for a caller whose own rollback covers
+    render_plan_paths (sync_codex): one nested in it would keep a snapshot
+    of its own, and name it, when it failed and the caller's restored."""
+    with rollback_paths_on_error(render_plan_paths(plan)) if rollback else nullcontext():
         ensure_legacy_plugin_link()
         for path, text in stable_hook_script_files(plan).items():
             put_file(path, text, mode=0o755)
@@ -2988,8 +2991,8 @@ def load_render_plan() -> RenderPlan:
     return prepare_render_plan(manifest, load_support())
 
 
-def publish(plan: RenderPlan) -> None:
-    publish_render_plan(plan)
+def publish(plan: RenderPlan, *, rollback: bool = True) -> None:
+    publish_render_plan(plan, rollback=rollback)
     print(
         "rendered Codex: "
         f"skills={len(plan.skills)} "
