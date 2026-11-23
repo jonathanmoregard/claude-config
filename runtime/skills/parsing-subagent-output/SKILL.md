@@ -42,8 +42,10 @@ only asked for in the prompt. This holds for quick fixes and one-off scripts.
 ```bash
 schema='{"type":"object","additionalProperties":false,"required":["category"],
   "properties":{"category":{"type":"string","enum":["bug","feature"]}}}'
-out=$(claude -p --output-format json --json-schema "$schema" "Classify this ticket: $(cat "$f")")
-CATEGORY=$(jq -er '.structured_output.category' <<<"$out") || { echo "no category" >&2; exit 1; }
+out=$(claude -p --output-format json --json-schema "$schema" "Classify this ticket: $(cat "$f")") \
+  || { echo "claude failed" >&2; exit 1; }
+CATEGORY=$(jq -er 'select(.is_error == false) | .structured_output.category
+  | select(. == "bug" or . == "feature")' <<<"$out") || { echo "no category" >&2; exit 1; }
 ```
 
 ## Common mistakes

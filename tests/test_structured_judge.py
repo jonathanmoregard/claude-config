@@ -31,7 +31,7 @@ def fake(tmp: Path, stdout: str, code: int) -> str:
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     creds = tmp_path / "creds.json"
-    creds.write_text("{}", encoding="utf-8")
+    creds.write_text('{"claudeAiOauth": "e2e-fake"}', encoding="utf-8")
     monkeypatch.setenv("E2E_JUDGE_CREDS", str(creds))
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     tempfile.tempdir = None
@@ -45,6 +45,7 @@ def test_success_returns_the_structured_output(env, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("stdout,code", [
+    ('{"is_error":false,' + VERDICT + "}", 1),  # failed exit, clean-looking body
     ('{"is_error":true,' + VERDICT + "}", 1),   # failed exit
     ('{"is_error":true,' + VERDICT + "}", 0),   # error result, exit 0
     ('{' + VERDICT + "}", 0),                   # no is_error field
@@ -63,12 +64,14 @@ def test_credentials_are_copied_private_never_linked(env, monkeypatch) -> None:
     script.write_text(
         "#!/bin/sh\ncat >/dev/null\n"
         f'f="$HOME/.claude/.credentials.json"; [ -L "$f" ] && echo link > {seen} '
-        f'|| stat -c %a "$f" > {seen}\n'
+        f'|| {{ stat -c %a "$f"; cat "$f"; }} > {seen}\n'
         "printf '%s\\n' '{\"is_error\":false," + VERDICT + "}'\n", encoding="utf-8")
     script.chmod(0o755)
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", str(script))
     judge("p", SCHEMA)
-    assert seen.read_text().strip() == "600"
+    mode, content = seen.read_text().split("\n", 1)
+    assert mode == "600"
+    assert content == (env / "creds.json").read_text()
 
 
 if __name__ == "__main__":
