@@ -10,8 +10,10 @@ quiet: the parent armed `wait-for agent <id>`, no stall notification fired,
        files, reads the agent as finished (exit 0). finished_line is
        diagnostic only: the wait's output stays in the sandbox's private /tmp.
 live:  quiet, AND the worker's job really ran as a (fake) unit AND its
-       transcript stayed quiet for at least the 60 s idle limit; otherwise the
-       run never reached the situation and is INCONCLUSIVE, not a vacuous pass.
+       transcript stayed quiet for at least 76 s (the 60 s idle limit plus the
+       15 s poll step and 1 s clock resolution, so the wait really polled the
+       unit past idle); otherwise the run never reached the situation and is
+       INCONCLUSIVE, not a vacuous pass.
 INCONCLUSIVE (exit 2) when no background Agent dispatch happened at all.
 """
 import datetime
@@ -57,7 +59,10 @@ if mode in ("quiet", "live"):
         ran = calls.exists() and "systemd-run" in calls.read_text(errors="replace")
         started = list((run / "fake-systemd").glob("*.started")) if ran else []
         # The situation under test: the worker stayed quiet past the idle limit
-        # (60 s) while its unit ran. A worker that polled faster never reached it.
+        # (60 s) while its unit ran. The wait polls every idle/4 = 15 s step and
+        # `date +%s` has 1 s resolution, so the gap must be >= 60 + 15 + 1 = 76 s
+        # for the wait to have been past idle at a poll. A worker that polled
+        # faster never reached it.
         stamps = []
         for line in transcripts[0].read_text(errors="replace").splitlines():
             try:
@@ -68,7 +73,7 @@ if mode in ("quiet", "live"):
                 stamps.append(datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")))
         gap = max(((b - a).total_seconds() for a, b in zip(stamps, stamps[1:])), default=0)
         print(f"unit_ran={ran} max_quiet_gap={gap:.0f}s")
-        if not ran or not started or gap < 60:
+        if not ran or not started or gap < 76:
             sys.exit(2)
     # The wait's own output stays in the sandbox's private /tmp, so its exit is
     # pinned by replaying the staged wait-for over the run's persisted files:

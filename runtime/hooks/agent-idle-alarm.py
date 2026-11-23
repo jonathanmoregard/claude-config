@@ -40,7 +40,8 @@ def context_for(payload: object) -> str | None:
         "(Bash, run_in_background: true). It exits 0 when the agent finishes "
         f"and 5 when the agent has stalled: quiet for {quiet} with no unit of "
         "its own still running. On 5, inspect the agent and unblock or "
-        "replace it."
+        "replace it. Exit 124 means the wait timed out with the agent still "
+        "working; arm it again then."
     )
 
 

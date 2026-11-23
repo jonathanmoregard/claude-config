@@ -38,8 +38,7 @@
 #                                          launched still running
 #   common: --timeout <seconds> (default 3600; job default 14400 so a
 #                                          90-minute job does not time out;
-#                                          agent default the larger of 14400
-#                                          and --idle + 3600)
+#                                          agent default 86400, 24 h)
 #
 # `agent` finds the subagent under ~/.claude/projects/*/*/subagents/: it has
 # finished once agent-<id>.meta.json says `"finished": true` AND every
@@ -114,9 +113,10 @@ if [ "$mode" = agent ]; then
   # stray WAIT_FOR_AGENT_IDLE must not break the other modes.
   case $idle in ''|*[!0-9]*) usage ;; esac
   idle=$(( 10#$idle ))  # "08" is eight seconds, not a bad octal number
-  [ -n "$timeout_set" ] || timeout=$(( idle + 3600 > 14400 ? idle + 3600 : 14400 ))
+  [ -n "$timeout_set" ] || timeout=86400
 fi
 case $timeout in ''|*[!0-9]*) usage ;; esac
+timeout=$(( 10#$timeout ))  # "08" is eight seconds, not a bad octal number
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
 # nap <step>: sleep up to <step> seconds, never past the deadline.
@@ -717,15 +717,16 @@ agent_tool_uses() {
 }
 
 # Units the agent launched: `systemd-run … --unit=<name>` / `--unit <name>` /
-# `-u <name>` (a backslash-newline continuation is joined first), `wait-for job
-# <slug>`, `wait-for unit <name>`, and the jobs broker's `claude-job-<slug>`. A name held in a shell
-# variable cannot be read from the transcript and is not found.
+# `-u <name>` / `-u<name>` (a backslash-newline continuation is joined first),
+# `wait-for job <slug>`, `wait-for unit <name>` (a name may be quoted), and the
+# jobs broker's `claude-job-<slug>`. A name held in a shell variable cannot be
+# read from the transcript and is not found.
 agent_units() {
   agent_tool_uses "$1" | jq -r '
     if .name == "Bash" then
       (.input.command // "" | tostring | gsub("\\\\\n"; " ")) as $c
-      | ([$c | scan("systemd-run[^\n;|&]*?(?:--unit[= ]+|[ \t]-u[ \t]+)[\"\\x27]?([A-Za-z0-9@._:-]+)")]
-         + [$c | scan("wait-for[ \t]+job[ \t]+([A-Za-z0-9._-]+)")]
+      | ([$c | scan("systemd-run[^\n;|&]*?(?:--unit[= ]+|[ \t]-u[ \t]*)[\"\\x27]?([A-Za-z0-9@._:-]+)")]
+         + [$c | scan("wait-for[ \t]+job[ \t]+[\"\\x27]?([A-Za-z0-9._-]+)")]
          + [$c | scan("wait-for[ \t]+unit[ \t]+[\"\\x27]?([A-Za-z0-9@._:-]+)")]) | .[][]
     elif .name == "mcp__jobs_broker__start" then
       (.input.slug // empty | tostring | select(test("^[A-Za-z0-9_-]+$")) | "claude-job-" + .)
@@ -733,15 +734,20 @@ agent_units() {
 }
 
 # What keeps the agent from being done, one "<task-id><TAB><command>" per
-# line: background commands it launched that have not reported back, and a
-# "-<TAB>…" line when a task notification arrived after its last turn ended.
+# line: background tasks it launched that have not reported back, and a
+# "-<TAB>…" line when a message arrived after its last turn ended.
 #
-# A launch is a Bash result that starts "Command running in background with
+# A Bash launch is a result that starts "Command running in background with
 # ID: <id>" or "Command was moved to the background with ID: <id>" (a command
 # the harness backgrounded on its own), or carries that text anywhere when the
 # call asked for `run_in_background`. The text inside a file or log the agent
-# read is not a launch. Its end is a task notification naming
-# `<task-id><id></task-id>`, or the agent stopping that task itself.
+# read is not a launch. A background Agent launch is an Agent call whose result
+# says "Async agent launched successfully" and names `agentId: <id>`. A task
+# ends with a task notification naming `<task-id><id></task-id>`, with the
+# agent stopping it (TaskStop and friends: the id must equal the stop call's
+# task_id/shell_id/bash_id), or with a TaskOutput/BashOutput result the agent
+# read itself that names the id and carries a terminal `<status>` (completed,
+# failed, killed; not running).
 #
 # A notification is read only where the harness delivers one: a user prompt
 # (not a tool result), a queued_command attachment, a queue-operation. The
@@ -751,9 +757,10 @@ agent_units() {
 # Measured on the 2026-11-22 stall: the worker launched a wait loop in the
 # background, ended its turn ("I'll wait for that notification") and its
 # meta.json read `finished: true` while that loop was still pending, so
-# `finished` alone means "turn ended", not "done". A notification arriving
-# starts a new turn, and the harness clears `finished` only once that turn
-# runs, so a notification after the last end_turn means "resuming".
+# `finished` alone means "turn ended", not "done". Any message arriving after
+# the last end_turn (a task notification, or a plain user prompt) starts a new
+# turn, and the harness clears `finished` only once that turn runs, so it means
+# "resuming".
 agent_pending_tasks() {
   jq -nrR '
     def text: if type == "string" then .
@@ -763,35 +770,52 @@ agent_pending_tasks() {
               elif .type == "attachment" then .attachment.prompt? // "" | tostring
               elif .type == "queue-operation" then .content? // "" | tostring
               else "" end;
+    def prompt: .type == "user"
+                and (.message.content | type == "string"
+                     or (type == "array" and any(.[]; type == "object" and .type == "text")));
+    def idof: [.task_id?, .shell_id?, .bash_id?] | map(select(type == "string"));
     [inputs | fromjson? | select(type == "object")] as $e
     | [$e[] | select(.type == "assistant") | .message.content[]?
        | select(type == "object" and .type == "tool_use")] as $uses
     | ($uses | map(select(.id | type == "string")
                    | {key: .id, value: {cmd: (.input.command // .name // "" | tostring),
+                                        name: .name,
+                                        desc: ((.input.description // (.input.prompt // "" | tostring | .[0:80])) | tostring),
                                         bash: (.name == "Bash"),
-                                        bg: (.input.run_in_background == true)}})
+                                        bg: (.input.run_in_background == true),
+                                        ids: (.input | idof)}})
        | from_entries) as $call
     | ($e | map(note) | join("\n")) as $done
-    | ($uses | map(select(.name | test("^(TaskStop|KillShell|KillBash)$"))
-       | .input | tostring) | join("\n")) as $stops
+    | ($uses | map(select(.name | test("^(TaskStop|KillShell|KillBash)$")) | .input | idof) | add // []) as $stops
+    | [$e[] | select(.type == "user") | .message.content
+       | if type == "array" then .[] else empty end
+       | select(type == "object" and .type == "tool_result")
+       | $call[.tool_use_id // ""] as $c
+       | select($c != null)
+       | {c: $c, text: (.content | if type == "array" then map(.text? // "") | join("") else tostring end)}] as $results
+    | ([$results[] | select(.c.name | test("^(TaskOutput|BashOutput)$"))
+        | . as $r | (.text | gsub("<output>.*</output>"; ""; "s")) as $t
+        | select($t | test("<status>(completed|failed|killed)</status>"))
+        | ([$t | scan("<task_id>([A-Za-z0-9_-]+)</task_id>") | .[0]] + $r.c.ids)[]]
+       + $stops) as $ended
     | ([$e | to_entries[] | select(.value.type == "assistant"
                                    and .value.message.stop_reason? == "end_turn") | .key]
        | max // -1) as $end
-    | ([$e | to_entries[] | select(.key > $end) | .value | note
-        | select(contains("<task-notification>"))] | length > 0) as $resuming
-    | ([$e[] | select(.type == "user") | .message.content
-        | if type == "array" then .[] else empty end
-        | select(type == "object" and .type == "tool_result")
-        | $call[.tool_use_id // ""] as $c
-        | select($c.bash == true)
-        | (.content | if type == "array" then map(.text? // "") | join("") else tostring end)
-        | (if $c.bg then capture("Command (?:running in|was moved to the) background with ID: (?<id>[A-Za-z0-9_-]+)")?
-           else capture("^\\s*Command (?:running in|was moved to the) background with ID: (?<id>[A-Za-z0-9_-]+)")? end)
-        | .id as $id
+    | ($end >= 0 and ([$e | to_entries[] | select(.key > $end) | .value
+        | select(prompt or (note | contains("<task-notification>")))] | length > 0)) as $resuming
+    | ([$results[]
+        | (if .c.bash == true then
+             (if .c.bg then .text | capture("Command (?:running in|was moved to the) background with ID: (?<id>[A-Za-z0-9_-]+)")?
+              else .text | capture("^\\s*Command (?:running in|was moved to the) background with ID: (?<id>[A-Za-z0-9_-]+)")? end)
+           elif .c.name == "Agent" and (.text | contains("Async agent launched successfully")) then
+             (.text | capture("agentId: (?<id>[A-Za-z0-9]+)")?)
+           else empty end) as $l
+        | $l.id as $id
         | select(($done | contains("<task-id>" + $id + "</task-id>")) | not)
-        | select(($stops | contains($id)) | not)
-        | "\($id)\t\($c.cmd | gsub("\\s+"; " ") | .[0:160])"]
-       + (if $resuming then ["-\ta task notification arrived after the last turn ended (resuming)"]
+        | select(($ended | index($id)) | not)
+        | (if .c.bash == true then .c.cmd else "Agent " + .c.desc end) as $cmd
+        | "\($id)\t\($cmd | gsub("\\s+"; " ") | .[0:160])"]
+       + (if $resuming then ["-\ta message arrived after the last turn ended (resuming)"]
           else [] end))[]
   ' "$1" 2>/dev/null
 }
@@ -877,14 +901,14 @@ wait_agent() {
     # full idle period to wake on its completion before it counts as stalled.
     [ "$last_live" -gt "$mt" ] && mt=$last_live
     quiet=$(( now - mt ))
-    # Once a unit has been seen running it is polled every step, so its end is
-    # known to within one step and the idle period counts from there.
-    if [ "$quiet" -ge "$idle" ] || [ "$last_live" -gt 0 ]; then
-      agent_live_unit "$transcript" >/dev/null; rc=$?
-      if [ "$rc" = 0 ]; then
-        last_live=$now
-        nap "$step"; continue  # waiting on a running unit: real work
-      fi
+    # The units the agent launched are checked every step, whether or not it
+    # has been quiet yet (no launched unit: nothing to read, rc 1), so a unit's
+    # end is known to within one step and the idle period counts from the last
+    # moment one was seen running.
+    agent_live_unit "$transcript" >/dev/null; rc=$?
+    if [ "$rc" = 0 ]; then
+      last_live=$now
+      nap "$step"; continue  # waiting on a running unit: real work
     fi
     if [ "$quiet" -ge "$idle" ]; then
       units_note="no launched unit running"

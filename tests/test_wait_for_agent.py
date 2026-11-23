@@ -130,14 +130,31 @@ def test_running_unit_holds_off_the_alarm_until_it_ends(tmp_path: Path) -> None:
     assert notified(env) == ""
 
 
+TIMED_SYSTEMCTL = """#!/usr/bin/env bash
+# Running until the wall-clock time in $STUB_DIR/end, then active/exited.
+end=$(cat "$STUB_DIR/end")
+now=$(date +%s.%N)
+if awk -v n="$now" -v e="$end" 'BEGIN{exit !(n<e)}'; then
+  printf 'ActiveState=active\\nSubState=running\\n'
+else
+  printf 'ActiveState=active\\nSubState=exited\\n'
+fi
+"""
+
+
 def test_stall_after_a_unit_ends_counts_from_its_end(tmp_path: Path) -> None:
     env = make_env(tmp_path)
+    stub = Path(env["STUB_DIR"])
+    (stub / "bin" / "systemctl").write_text(TIMED_SYSTEMCTL)
     write_agent(tmp_path, "ddd5", [bash("systemd-run --user --unit=build-y -- make")], finished=False)
-    (Path(env["STUB_DIR"]) / "units" / "build-y").write_text("1")
-    started = time.time()
-    rc, out = run(env, "ddd5", "--idle", "2", "--timeout", "20")
+    end = time.time() + 1
+    (stub / "end").write_text(f"{end}")
+    rc, out = run(env, "ddd5", "--idle", "3", "--timeout", "20")
+    stalled_at = time.time()
     assert rc == 5, out
-    assert time.time() - started >= 2  # a full idle period after the unit ended
+    # `date +%s` has one-second resolution: a full idle period is >= idle - 1 s,
+    # measured from the moment the unit ended, not from the start of the test.
+    assert stalled_at - end >= 2, f"stall only {stalled_at - end:.2f}s after the unit ended"
 
 
 def test_units_from_every_launcher_are_checked(tmp_path: Path) -> None:

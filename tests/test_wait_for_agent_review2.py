@@ -37,7 +37,7 @@ def test_r1_notification_after_last_end_turn_is_not_finished(tmp_path: Path) -> 
     t = write_agent(tmp_path, "rr1", [], finished=True)
     bg_launch(t, "toolu_1", "bq1", "./a.sh", done=True, age=0, resumed=False)  # notification row is last
     rc, out = run(env, "rr1", "--idle", "2", "--timeout", "4")
-    assert rc != 0, (rc, out)
+    assert rc == 5, (rc, out)
 
 
 def _r2(tmp_path: Path, row: dict) -> tuple[int, str]:
@@ -60,13 +60,12 @@ def test_r2b_attachment_notification_is_seen(tmp_path: Path) -> None:
     assert rc == 0, (rc, out)
 
 
-def test_r3_leading_zero_idle_is_rejected_or_accepted(tmp_path: Path) -> None:
+def test_r3_leading_zero_idle_is_eight_seconds(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    write_agent(tmp_path, "rr3", [], finished=True)
-    p = subprocess.run([str(WAIT_FOR), "agent", "rr3", "--idle", "08"], env=env,
-                       capture_output=True, text=True, timeout=20)
-    print("exit", p.returncode, "stdout", p.stdout, "stderr", p.stderr)
-    assert p.returncode in (0, 64) and "value too great" not in p.stderr, (p.returncode, p.stdout, p.stderr)
+    write_agent(tmp_path, "rr3", [bash("ls")], finished=False)
+    rc, out = run(env, "rr3", "--idle", "08")
+    assert rc == 5, (rc, out)
+    assert "idle limit 8s" in out, out
 
 
 def test_r4_task_id_with_underscore_matches_its_completion(tmp_path: Path) -> None:
@@ -129,14 +128,20 @@ def _r7(tmp_path: Path, text: str) -> tuple[int, str]:
     return run(env, "rr7", "--idle", "2", "--timeout", "6")
 
 
+PENDING_X = "last: pending background `./x.sh`"
+PENDING_A = "last: pending background `./a.sh`"
+
+
 def test_r7a_auto_backgrounded_moved_text(tmp_path: Path) -> None:
     rc, out = _r7(tmp_path, "Command was moved to the background with ID: zz9. Output is being written to: /tmp/x/zz9.output")
-    assert rc != 0, (rc, out)
+    assert rc == 5, (rc, out)
+    assert PENDING_X in out, out
 
 
 def test_r7b_exact_launch_text_without_run_in_background(tmp_path: Path) -> None:
     rc, out = _r7(tmp_path, "Command running in background with ID: zz9. Output is being written to: /tmp/x/zz9.output")
-    assert rc != 0, (rc, out)
+    assert rc == 5, (rc, out)
+    assert PENDING_X in out, out
 
 
 def _r8(tmp_path: Path, rows: list[dict]) -> tuple[int, str]:
@@ -150,7 +155,8 @@ def _r8(tmp_path: Path, rows: list[dict]) -> tuple[int, str]:
 def test_r8a_marker_in_assistant_text_does_not_clear_task(tmp_path: Path) -> None:
     rc, out = _r8(tmp_path, [{"type": "assistant", "message": {"content": [
         {"type": "text", "text": "the log has <task-id>bq1</task-id>"}]}}])
-    assert rc != 0, (rc, out)
+    assert rc == 5, (rc, out)
+    assert PENDING_A in out, out
 
 
 def test_r8b_marker_in_tool_result_does_not_clear_task(tmp_path: Path) -> None:
@@ -161,7 +167,8 @@ def test_r8b_marker_in_tool_result_does_not_clear_task(tmp_path: Path) -> None:
          "content": "<task-id>bq1</task-id>"}]}},
     ]
     rc, out = _r8(tmp_path, rows)
-    assert rc != 0, (rc, out)
+    assert rc == 5, (rc, out)
+    assert PENDING_A in out, out
 
 
 def test_r9_deleted_transcript_does_not_hang_until_timeout(tmp_path: Path) -> None:
@@ -172,4 +179,5 @@ def test_r9_deleted_transcript_does_not_hang_until_timeout(tmp_path: Path) -> No
     time.sleep(0.7)
     t.unlink()
     out, err = p.communicate(timeout=30)
-    assert p.returncode != 124, (p.returncode, out, err)
+    assert p.returncode == 3, (p.returncode, out, err)
+    assert "no transcript" in out, out
