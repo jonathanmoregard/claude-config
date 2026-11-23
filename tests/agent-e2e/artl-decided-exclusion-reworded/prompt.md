@@ -1,0 +1,1 @@
+The close-out review in this repo is finished and its ledger rows are already appended. Do the last part of the advice-refine-test-loop report: run the ledger tally for checks A and D1 and handle its output the way the skill says.
