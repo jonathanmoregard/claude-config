@@ -34,6 +34,8 @@ def test_sandboxed_command_gets_own_caches_and_ignore(tmp_path):
     })
     assert got["XDG_CACHE_HOME"] == f"{tmp_path}/.cache/claude-sandbox"
     assert got["CARGO_HOME"] == f"{tmp_path}/.cache/claude-sandbox/cargo"
+    assert got["npm_config_cache"] == f"{tmp_path}/.cache/claude-sandbox/npm"
+    assert got["npm_config_store_dir"] == f"{tmp_path}/.cache/claude-sandbox/pnpm-store"
     assert got["GIT_CONFIG_COUNT"] == "3"
     assert got["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert got["GIT_CONFIG_KEY_2"] == "core.excludesFile"
@@ -46,7 +48,8 @@ def test_unsandboxed_command_is_untouched(tmp_path):
     env_file = tmp_path / "env.sh"
     run_hook(env_file)
     got = sourced(env_file, tmp_path, {})
-    for key in ("XDG_CACHE_HOME", "CARGO_HOME", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"):
+    for key in ("XDG_CACHE_HOME", "CARGO_HOME", "npm_config_cache", "npm_config_store_dir",
+                "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"):
         assert key not in got
 
 

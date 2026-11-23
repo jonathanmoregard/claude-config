@@ -16,6 +16,8 @@ BLOCK = MARKER + r"""
 if [ "${SANDBOX_RUNTIME:-}" = 1 ]; then
   export XDG_CACHE_HOME="$HOME/.cache/claude-sandbox"
   export CARGO_HOME="$HOME/.cache/claude-sandbox/cargo"
+  export npm_config_cache="$HOME/.cache/claude-sandbox/npm"
+  export npm_config_store_dir="$HOME/.cache/claude-sandbox/pnpm-store"
   if [ -f "$HOME/.config/git/ignore-claude-sandbox" ]; then
     _csb_n=${GIT_CONFIG_COUNT:-0}
     export "GIT_CONFIG_KEY_${_csb_n}=core.excludesFile"
