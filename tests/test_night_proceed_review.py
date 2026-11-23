@@ -24,7 +24,44 @@ def test_n4_headless_sdk_session_is_not_blocked(tmp_path: Path) -> None:
                extra={"CLAUDE_CODE_ENTRYPOINT": "cli", "PATH": fake_gdbus(tmp_path, "(true,)")})
 
 
+def parallel_asks(tmp_path: Path, sid: str, qs: list[str],
+                  prompt_id: str | None) -> list[str]:
+    """Two AskUserQuestion hooks for one session at once; their stdouts."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_NIGHT_PROCEED") and k != "CLAUDE_CODE_ENTRYPOINT"}
+    env.update(HOME=str(tmp_path), CLAUDE_NIGHT_PROCEED_TEST_NOW="02:00",
+               CLAUDE_NIGHT_PROCEED_TEST_LOCK="locked")
+    procs = []
+    for q in qs:
+        payload = {"hook_event_name": "PreToolUse", "session_id": sid,
+                   "tool_name": "AskUserQuestion",
+                   "tool_input": {"questions": [{"question": q}]}}
+        if prompt_id is not None:
+            payload["prompt_id"] = prompt_id
+        procs.append(subprocess.Popen([PYTHON, "-S", "-E", str(HOOK)], env=env, text=True,
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE))
+        procs[-1].stdin.write(json.dumps(payload)); procs[-1].stdin.close()
+    outs = [p.stdout.read() for p in procs]
+    for p in procs:
+        p.wait()
+    return outs
+
+
+def test_n6_parallel_asks_in_one_turn_get_one_reply(tmp_path: Path) -> None:
+    """Real payloads carry prompt_id: one night reply per user turn, so of two
+    parallel asks exactly one is denied and the other reaches the user."""
+    problems: list[str] = []
+    for rnd in range(20):
+        outs = parallel_asks(tmp_path, f"turn{rnd}", [f"one {rnd}?", f"two {rnd}?"], f"p{rnd}")
+        denied = sum(1 for o in outs if o.strip())
+        if denied != 1:
+            problems.append(f"round {rnd}: {denied} denies")
+    assert not problems, problems
+
+
 def test_n6_concurrent_asks_same_session_share_tmp(tmp_path: Path) -> None:
+    """Without prompt_id the per-question digests still survive concurrent writes."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("CLAUDE_NIGHT_PROCEED") and k != "CLAUDE_CODE_ENTRYPOINT"}
     env.update(HOME=str(tmp_path), CLAUDE_NIGHT_PROCEED_TEST_NOW="02:00",

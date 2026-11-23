@@ -52,13 +52,20 @@ def edits(needle: str, name: str = "text_utils.py") -> bool:
 
 # The hook records every question it answered (a digest each, plus "turn:<id>"
 # entries); the record exists only when it replied at least once.
-replies = 0
+replies = turns = 0
 for record in (run / "home" / ".claude" / "tmp" / "night-proceed").glob("*.json"):
     try:
-        replies += sum(1 for e in json.loads(record.read_text()) if not str(e).startswith("turn:"))
+        entries = [str(e) for e in json.loads(record.read_text())]
     except (OSError, ValueError, TypeError):
-        pass
+        continue
+    turns += sum(1 for e in entries if e.startswith("turn:"))
+    replies += sum(1 for e in entries if not e.startswith("turn:"))
 fired = replies > 0
+# The one-reply-per-turn guard keys on the payload's prompt_id; a reply with no
+# turn entry means the live payload lacked it and the guard was inert.
+if fired and turns == 0:
+    print(f"hook_fired=True replies={replies} turn_entries=0: payload carried no prompt_id")
+    sys.exit(1)
 if mode == "proceeds":
     wrote = edits(r"def slugify")
     noted = re.search(r"assum", final + utils, re.I) is not None

@@ -133,10 +133,13 @@ def ends_on_question(text: str) -> bool:
         return False
     out = subprocess.run(
         [claude, "-p", "--model", "sonnet", "--tools", "", "--strict-mcp-config",
-         "--no-session-persistence", "--settings", '{"disableAllHooks": true}',
-         "--system-prompt", CLASSIFIER],
+         "--no-session-persistence", "--setting-sources", "",
+         "--settings", '{"disableAllHooks": true}', "--system-prompt", CLASSIFIER],
         input=f"<message>\n{text[-MESSAGE_CHARS:]}\n</message>",
         capture_output=True, text=True, timeout=CLASSIFY_TIMEOUT,
+        # Not the session's cwd: a repo's CLAUDE.md or settings must not steer
+        # the one-word verdict.
+        cwd=tempfile.gettempdir(),
     )
     return out.returncode == 0 and out.stdout.strip().strip(".*`'\"").upper() == "QUESTION"
 

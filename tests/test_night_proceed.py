@@ -1,10 +1,14 @@
 """night-proceed: answer a night-time question once, only while the screen is locked."""
 from __future__ import annotations
 
+import importlib.util
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -17,6 +21,7 @@ FAKE_CLAUDE = """#!/bin/sh
 n=$(ls "$FAKE_DIR"/call.* 2>/dev/null | wc -l)
 printf '%s\\n' "$@" > "$FAKE_DIR/call.$n"
 cat > "$FAKE_DIR/stdin.$n"
+pwd > "$FAKE_DIR/cwd.$n"
 printf '%s\\n' "${FAKE_REPLY-QUESTION}"
 exit "${FAKE_RC:-0}"
 """
@@ -182,3 +187,63 @@ def test_desktop_lock_query_without_seam(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Lock 3?"), lock=None,
                extra={"PATH": fake_gdbus(tmp_path, "Error: no bus", rc=1)}) is None
     assert run(tmp_path, stop("Lock 4?"), lock=None, extra={"PATH": f"{fake_bin(tmp_path)}"}) is None
+
+
+def test_classifier_ignores_the_session_settings_and_cwd(tmp_path: Path) -> None:
+    run(tmp_path, stop(AB))
+    (args,) = calls(tmp_path)
+    assert args[args.index("--setting-sources") + 1] == ""
+    cwd = (tmp_path / "claude-calls" / "cwd.0").read_text().strip()
+    assert Path(cwd).resolve() == Path(tempfile.gettempdir()).resolve(), cwd
+
+
+def load_hook(tmp: Path, monkeypatch) -> object:
+    """The hook as a module, HOME at tmp, so main() can run in-process."""
+    monkeypatch.setenv("HOME", str(tmp))
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    monkeypatch.setenv("CLAUDE_NIGHT_PROCEED_TEST_NOW", "02:00")
+    monkeypatch.setenv("CLAUDE_NIGHT_PROCEED_TEST_LOCK", "locked")
+    monkeypatch.delenv("CLAUDE_NIGHT_PROCEED", raising=False)
+    spec = importlib.util.spec_from_file_location("night_proceed_hook", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main_out(mod: object, payload: object, monkeypatch, capsys) -> str:
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert mod.main() == 0
+    return capsys.readouterr().out
+
+
+def test_hanging_classifier_fails_open(tmp_path: Path, monkeypatch, capsys) -> None:
+    bindir = tmp_path / "hangbin"
+    bindir.mkdir()
+    (bindir / "claude").write_text("#!/bin/sh\nexec sleep 30\n")
+    (bindir / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    mod = load_hook(tmp_path, monkeypatch)
+    mod.CLASSIFY_TIMEOUT = 0.5
+    assert main_out(mod, stop(AB), monkeypatch, capsys) == ""
+
+
+def test_missing_or_broken_config_fails_open(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("PATH", f"{fake_bin(tmp_path)}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DIR", str(tmp_path / "claude-calls"))
+    mod = load_hook(tmp_path, monkeypatch)
+    mod.CONFIG = tmp_path / "absent.json"
+    assert main_out(mod, stop("Missing?"), monkeypatch, capsys) == ""
+    mod.CONFIG = tmp_path / "broken.json"
+    mod.CONFIG.write_text('{"night_proceed": {"start": 22}}')
+    assert main_out(mod, stop("Broken?"), monkeypatch, capsys) == ""
+
+
+def test_stop_timeout_outlasts_classifier_and_gdbus() -> None:
+    """settings.json kills the hook at its timeout; the classifier (plus the 3 s
+    gdbus query) must finish well inside it, or the nested claude is orphaned."""
+    settings = json.loads((RUNTIME / "settings.json").read_text())
+    text = (RUNTIME / "hooks" / "night-proceed.py").read_text()
+    classify = int(re.search(r"^CLASSIFY_TIMEOUT = (\d+)", text, re.M).group(1))
+    timeouts = [h.get("timeout", 60) for entry in settings["hooks"]["Stop"]
+                for h in entry.get("hooks", []) if "night-proceed.py" in h.get("command", "")]
+    assert timeouts and all(t >= classify + 3 + 5 for t in timeouts), (timeouts, classify)
