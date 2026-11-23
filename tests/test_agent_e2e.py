@@ -429,6 +429,126 @@ def test_a_non_utf8_name_in_scrub_errors_does_not_cost_the_verdict(tmp_path):
             bad.chmod(0o700)
 
 
+# The fake `secret-redact` (tests/stubs/secret-redact-fake): the real one is a
+# nixos-config package no CI runner has. It finds `sk-ant-` tokens only.
+FAKE_REDACT = ROOT / "tests/stubs/secret-redact-fake"
+TOKEN = "sk-ant-oat01-" + "Q" * 40
+
+
+def _redact_env(*first: pathlib.Path) -> dict:
+    return {**os.environ, "PATH": ":".join([*map(str, first), os.environ["PATH"]])}
+
+
+def _no_redact_env(tmp_path) -> dict:
+    """PATH without any secret-redact, real or fake: only what the tests run."""
+    bindir = tmp_path / "bin-no-redact"
+    bindir.mkdir()
+    for tool in ("bash", "git", "bwrap", "python3"):
+        if found := shutil.which(tool):
+            (bindir / tool).symlink_to(found)
+    return {**os.environ, "PATH": str(bindir)}
+
+
+def _kept_with_token(run: pathlib.Path) -> list[str]:
+    return [str(p.relative_to(run)) for p in run.rglob("*")
+            if p.is_file() and not p.is_symlink() and TOKEN.encode() in p.read_bytes()]
+
+
+def test_a_printed_token_is_redacted_in_every_kept_file(tmp_path):
+    _require_sandbox()
+    # The agent prints its credential (as by `cat` on the staged link) and
+    # copies it into work/ and its HOME's state; the grader echoes it into
+    # the verdict. Every kept file is Read-allowed under the broker.
+    claude = fake_claude(tmp_path, (
+        f'echo "{TOKEN}" > "$E2E_WORK/notes.txt"\n'
+        f'mkdir -p "$HOME/.local/state/n"; echo "{TOKEN}" > "$HOME/.local/state/n/row"\n'
+        f"cat <<'EOF'\n{stream('the token is ' + TOKEN, ['cat ~/.claude/.credentials.json'])}\nEOF\n"))
+    sc = _scenario(tmp_path, f'echo "saw {TOKEN}"; exit 0')
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude), env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    run = out / "sc/new/1"
+    assert _kept_with_token(out) == [], _kept_with_token(out)
+    assert "[REDACTED:anthropic-token:" in (run / "transcript.jsonl").read_text()
+    assert "[REDACTED:anthropic-token:" in (run / "work/notes.txt").read_text()
+    verdict = json.loads((run / "verdict.json").read_text())
+    assert verdict["verdict"] == "PASS" and "[REDACTED:" in verdict["why"], verdict
+    assert TOKEN not in r.stdout, "the verdict line on stdout kept the token"
+    assert "scrub_errors" not in verdict
+
+
+def _tree_with(tmp_path, text: str) -> pathlib.Path:
+    run = tmp_path / "out/sc/new/1"
+    (run / "work").mkdir(parents=True)
+    (run / "transcript.jsonl").write_text(text)
+    (run / "work/clean.txt").write_text("nothing here\n")
+    return run
+
+
+def test_required_redaction_withholds_what_it_cannot_scan(tmp_path):
+    run = _tree_with(tmp_path, f"FAIL-THE-SCAN {TOKEN}\n")
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 1 and "withheld, not scanned" in r.stderr, r.stderr
+    assert (run / "transcript.jsonl").read_text().startswith("[withheld by the agent-e2e scrub")
+    assert _kept_with_token(tmp_path / "out") == []
+    # Only the file the scanner failed on: its batch is rescanned file by file.
+    assert (run / "work/clean.txt").read_text() == "nothing here\n"
+    assert r.stderr.count("withheld, not scanned") == 1, r.stderr
+
+
+def test_required_redaction_without_a_scanner_withholds_everything(tmp_path):
+    run = _tree_with(tmp_path, f"{TOKEN}\n")
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_no_redact_env(tmp_path))
+    assert r.returncode == 1 and "secret-redact is not on PATH" in r.stderr, r.stderr
+    for name in ("transcript.jsonl", "work/clean.txt"):
+        assert (run / name).read_text().startswith("[withheld by the agent-e2e scrub"), name
+
+
+def test_without_a_scanner_a_direct_scrub_warns_and_keeps_files(tmp_path):
+    # A CI runner: no secret-redact can be installed, and nothing there gives
+    # a reviewer Read on the runs, so the files stay and the run says so.
+    run = _tree_with(tmp_path, "plain\n")
+    r = harness("scrub", str(tmp_path / "out"), env=_no_redact_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "not redacted: secret-redact is not on PATH" in r.stderr
+    assert (run / "transcript.jsonl").read_text() == "plain\n"
+
+
+def test_redaction_never_writes_through_a_hard_link(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text(f"{TOKEN}\n")
+    run = _tree_with(tmp_path, "plain\n")
+    os.link(outside, run / "work/linked.txt")
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    assert outside.read_text() == f"{TOKEN}\n"
+    assert not (run / "work/linked.txt").exists()
+
+
+def test_a_file_past_the_scan_limit_is_withheld(tmp_path):
+    run = _tree_with(tmp_path, "x" * (4 * 1024 * 1024 + 1))
+    r = harness("scrub", str(tmp_path / "out"), env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 1 and "past the" in r.stderr, r.stderr
+    assert (run / "transcript.jsonl").read_text().startswith("[withheld by the agent-e2e scrub")
+    assert (run / "work/clean.txt").read_text() == "nothing here\n"
+
+
+@pytest.mark.skipif(shutil.which("secret-redact") is None
+                    or shutil.which("secret-redact").startswith(str(FAKE_REDACT)),
+                    reason="the real secret-redact (nixos-config) is not on PATH")
+def test_the_real_scanner_redacts_an_oauth_token(tmp_path):
+    real = "sk-ant-oat01-" + "A" * 80
+    run = _tree_with(tmp_path, f'{{"type":"user","content":"{real}"}}\n')
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"))
+    assert r.returncode == 0, r.stderr
+    assert real not in (run / "transcript.jsonl").read_text()
+    assert "[REDACTED:" in (run / "transcript.jsonl").read_text()
+
+
 def test_scrub_subcommand_cleans_runs_a_killed_harness_left(tmp_path):
     # A SIGKILLed harness never reaches run_one's finally; the broker runs
     # `scrub` over the output dir after every campaign instead.

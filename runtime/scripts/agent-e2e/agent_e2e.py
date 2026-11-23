@@ -263,16 +263,26 @@ _WRITE_NOFOLLOW = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_C
 
 
 def _is_secret(name: str, parent: str, st: os.stat_result) -> bool:
-    if stat.S_ISLNK(st.st_mode) or name.startswith(SECRET_FILE_PREFIXES):
+    # A hard link goes like a symlink: the redaction pass rewrites files in
+    # place, and through a second name that would rewrite a file outside.
+    if (stat.S_ISLNK(st.st_mode) or name.startswith(SECRET_FILE_PREFIXES)
+            or stat.S_ISREG(st.st_mode) and st.st_nlink > 1):
         return True
     return stat.S_ISDIR(st.st_mode) and (
         name in SECRET_DIRS or (name == "backups" and parent == ".claude"))
 
 
-def scrub_dir(path: pathlib.Path) -> list[str]:
-    """Strip account material and every link from the tree at PATH, keeping
-    the rest (ledgers, notes, transcripts) for review. Returns the errors;
-    one failed item never stops the others.
+def scrub_dir(path: pathlib.Path, *, require_redaction: bool = False) -> list[str]:
+    """Strip account material and every link from the tree at PATH, then
+    redact secrets in every file kept (ledgers, notes, transcripts) for
+    review. Returns the errors; one failed item never stops the others.
+    See redact_dir for REQUIRE_REDACTION."""
+    errors = _remove_secrets(path)
+    return errors + redact_dir(path, required=require_redaction)
+
+
+def _remove_secrets(path: pathlib.Path) -> list[str]:
+    """The removal pass of scrub_dir.
 
     Runs outside the sandbox on a tree a run could rewrite, so nothing here
     follows a link: PATH itself is opened O_NOFOLLOW and every step after it
@@ -315,6 +325,159 @@ def scrub_dir(path: pathlib.Path) -> list[str]:
     except OSError as exc:  # the root itself could not be listed
         record(exc)
     finally:
+        os.close(root)
+    return errors
+
+
+# Account material a run PRINTED rather than left as a file: an agent that
+# cats its staged credentials puts the token in transcript.jsonl, which the
+# broker's reviewers may Read. Detection is the `secret-redact` CLI (gitleaks
+# with pinned rules), the engine the output-redaction hook and the aggregator
+# also use, through the hook's own client module.
+SECRET_REDACT = "secret-redact"
+REDACT_TIMEOUT = 300.0
+REDACT_BATCH_FILES = 256     # open fds held per CLI call
+# Half the client's MAX_SCAN_CHARS (8 MiB): a batch is flushed once past it,
+# so batch + one more file stays inside what one CLI call may carry.
+SCAN_FILE_BYTES = 4 * 1024 * 1024
+_REDACTION = pathlib.Path(__file__).resolve().parents[2] / "hooks/secret_redaction.py"
+WITHHELD = "[withheld by the agent-e2e scrub: {why}]\n"
+
+
+def _redaction_client():
+    """runtime/hooks/secret_redaction.py, or None when this checkout lacks it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("secret_redaction", _REDACTION)
+    if spec is None or not _REDACTION.is_file():
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _withhold(fd: int, why: str) -> None:
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, WITHHELD.format(why=why).encode(), 0)
+
+
+def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
+    """Redact secrets in every regular file under PATH, in place. Returns the
+    errors. Each file is read and rewritten through one O_NOFOLLOW fd, so a
+    run cannot swap a path under it. A file is rewritten only when a secret
+    was found in it.
+
+    REQUIRED fails closed: a file that cannot be scanned (no scanner, a scan
+    that fails, a file past the scan limit or not writable) is withheld, its
+    content replaced by a WITHHELD line, and the error returned. The broker
+    sets it, because its runs are Read-allowed. Without it, a missing scanner
+    (a CI runner, where secret-redact cannot be installed) is a warning and
+    the files stay as they are; any other failure still withholds.
+    """
+    client = _redaction_client()
+    cli = shutil.which(SECRET_REDACT)
+    if client is None or cli is None:
+        why = (f"{SECRET_REDACT} is not on PATH" if cli is None
+               else f"no redaction client at {_REDACTION}")
+        if not required:
+            print(f"warning: {path} not redacted: {why}", file=sys.stderr)
+            return []
+    else:
+        why = None
+    errors: list[str] = []
+    batch: list[tuple[int, pathlib.Path, str]] = []
+
+    def flush() -> None:
+        if not batch:
+            return
+        def scan(texts: list[str]) -> tuple[list[str] | None, str]:
+            try:
+                if why is not None:
+                    raise RuntimeError(why)
+                return client.redact_value(texts, cli=cli, timeout=REDACT_TIMEOUT), ""
+            except (RuntimeError, OSError) as exc:
+                return None, str(exc)
+            except Exception as exc:  # the client's ScanError, and anything it did not expect
+                return None, f"{type(exc).__name__}: {exc}"
+
+        redacted, failed = scan([text for _, _, text in batch])
+        if redacted is not None:
+            results = [(r, "") for r in redacted]
+        elif why is None and len(batch) > 1:
+            # One file the scanner cannot take fails the whole call; scan the
+            # batch again file by file, so only that file is withheld.
+            results = []
+            for _, _, text in batch:
+                one, failed = scan([text])
+                results.append((one[0] if one else None, failed))
+        else:
+            results = [(None, failed)] * len(batch)
+        for (fd, where, text), (result, failed) in zip(batch, results):
+            try:
+                if result is None:
+                    _withhold(fd, f"not scanned for secrets: {failed}")
+                    errors.append(f"{where}: withheld, not scanned: {failed}")
+                elif result != text:
+                    os.ftruncate(fd, 0)
+                    os.pwrite(fd, result.encode(), 0)
+            except OSError as exc:
+                errors.append(f"{where}: could not redact: {exc}")
+            finally:
+                os.close(fd)
+        batch.clear()
+
+    try:
+        root = os.open(path, _DIR_NOFOLLOW)
+    except FileNotFoundError:
+        return errors
+    except OSError as exc:
+        return [f"{path}: {exc}"]
+    try:
+        for dirpath, _dirs, filenames, dfd in os.fwalk(
+                dir_fd=root, follow_symlinks=False,
+                onerror=lambda exc: errors.append(f"{path}: {exc}")):
+            for name in filenames:
+                where = path / dirpath / name
+                try:
+                    fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+                                 | os.O_CLOEXEC, dir_fd=dfd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:  # a link or FIFO the removal pass missed, a 0400 file
+                    errors.append(f"{where}: not scanned: {exc}")
+                    if required:
+                        try:
+                            os.unlink(name, dir_fd=dfd)
+                        except OSError as gone:
+                            errors.append(f"{where}: could not withhold: {gone}")
+                    continue
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                        os.close(fd)  # the removal pass takes hard links
+                        continue
+                    if st.st_size > SCAN_FILE_BYTES:
+                        _withhold(fd, "past the scan limit")
+                        errors.append(f"{where}: withheld, {st.st_size} bytes "
+                                      f"is past the {SCAN_FILE_BYTES}-byte scan limit")
+                        os.close(fd)
+                        continue
+                    chunks = []
+                    while chunk := os.read(fd, 1 << 20):
+                        chunks.append(chunk)
+                except OSError as exc:
+                    errors.append(f"{where}: not scanned: {exc}")
+                    os.close(fd)
+                    continue
+                # Bytes that are not UTF-8 reach the scanner as U+FFFD; the file
+                # is rewritten, and they with it, only when a secret was found.
+                batch.append((fd, where, b"".join(chunks).decode("utf-8", "replace")))
+                if (len(batch) >= REDACT_BATCH_FILES
+                        or sum(len(t) for _, _, t in batch) > SCAN_FILE_BYTES):
+                    flush()
+    except OSError as exc:
+        errors.append(f"{path}: {exc}")
+    finally:
+        flush()
         os.close(root)
     return errors
 
@@ -520,6 +683,8 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             errors = scrub_dir(run)
         except Exception as exc:
             errors = [f"{run}: scrub raised {exc!r}"]
+        if verdict is not None:
+            _take_redacted(run, verdict)
         if errors:
             print(f"scrub incomplete in {run}:\n  " + "\n  ".join(errors), file=sys.stderr)
             if verdict is not None:
@@ -533,6 +698,23 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
                 except (OSError, ValueError) as exc:
                     print(f"could not record scrub errors in {run / name}: {exc}",
                           file=sys.stderr)
+
+
+def _take_redacted(run: pathlib.Path, verdict: dict) -> None:
+    """Replace VERDICT, in place, by the scrubbed RUN/verdict.json: the copy in
+    memory still holds what the scrub redacted on disk, and it goes on to the
+    summary, stdout and any rewrite of verdict.json. A verdict.json that cannot
+    be read back (withheld, or never written) leaves only its grade."""
+    try:
+        with open(run / "verdict.json", encoding="utf-8") as f:
+            on_disk = json.load(f)
+    except (OSError, ValueError):
+        on_disk = None
+    if not isinstance(on_disk, dict) or on_disk.get("verdict") != verdict.get("verdict"):
+        on_disk = {k: verdict[k] for k in ("arm", "run", "config", "verdict") if k in verdict}
+        on_disk["why"] = "verdict.json withheld or unreadable after the scrub"
+    verdict.clear()
+    verdict.update(on_disk)
 
 
 def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
@@ -736,12 +918,14 @@ def main() -> int:
     sc = sub.add_parser("scrub", help="strip account material from every run "
                         "dir under DIR (runs a killed harness left unscrubbed)")
     sc.add_argument("dir")
+    sc.add_argument("--require-redaction", action="store_true",
+                    help="withhold every file that cannot be scanned for secrets")
     args = ap.parse_args()
     if args.cmd == "stage":
         print(stage(args.config, pathlib.Path(args.home).resolve()))
         return 0
     if args.cmd == "scrub":
-        errors = scrub_dir(pathlib.Path(args.dir))
+        errors = scrub_dir(pathlib.Path(args.dir), require_redaction=args.require_redaction)
         print("\n".join(errors), file=sys.stderr)
         return 1 if errors else 0
     return cmd_run(args)

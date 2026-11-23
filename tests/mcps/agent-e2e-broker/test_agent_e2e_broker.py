@@ -22,6 +22,12 @@ import unittest
 HERE = Path(__file__).resolve().parents[3] / "runtime" / "mcps" / "agent-e2e-broker"
 SERVER = HERE / "server.py"
 HARNESS = HERE.parents[1] / "scripts" / "agent-e2e" / "agent_e2e.py"
+REDACTION = HERE.parents[1] / "hooks" / "secret_redaction.py"
+# A stand-in `secret-redact` (the real one is a nixos-config package no CI
+# runner has): same contract, finds `sk-ant-` tokens, fails on FAIL-THE-SCAN.
+FAKE_REDACT = HERE.parents[2] / "tests" / "stubs" / "secret-redact-fake"
+POLICY = {"path": [str(FAKE_REDACT), *os.environ["PATH"].split(":")]}
+TOKEN = "sk-ant-oat01-" + "Q" * 40
 
 
 def load_server():
@@ -136,6 +142,8 @@ class Fixture(unittest.TestCase):
         harness = self.repo / "runtime/scripts/agent-e2e/agent_e2e.py"
         harness.parent.mkdir(parents=True)
         shutil.copy(HARNESS, harness)
+        (self.repo / "runtime/hooks").mkdir()
+        shutil.copy(REDACTION, self.repo / "runtime/hooks/secret_redaction.py")
         scen = self.repo / "tests/agent-e2e/demo"
         scen.mkdir(parents=True)
         (scen / "prompt.md").write_text("say hi\n")
@@ -168,7 +176,7 @@ class Fixture(unittest.TestCase):
             "stateDir": f"{self.state.name}/broker",
             "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
             "scenarioRoot": "tests/agent-e2e", "claudeExecutable": str(self.claude),
-            "path": os.environ["PATH"].split(":"),
+            "path": [str(FAKE_REDACT), *os.environ["PATH"].split(":")],
             "models": ["haiku", "sonnet"], "maxSamples": 2, "maxJobs": 2,
             "maxBudgetUsd": 3.0, "maxTimeoutSec": 900, "maxCallSec": 3600,
             "outputLimitChars": 20000, "readOnlyPaths": [],
@@ -205,18 +213,18 @@ class ScrubRunsTests(unittest.TestCase):
     def test_scrubs_runs_a_killed_unit_left(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = self._run_tree(Path(tmp) / "runs")
-            self.assertEqual(load_server()._scrub_runs(Path(tmp) / "runs"), "")
+            self.assertEqual(load_server()._scrub_runs(POLICY, Path(tmp) / "runs"), "")
             self.assertEqual(sorted(p.name for p in home.rglob("*")), [".claude", "notes.md"])
 
     def test_missing_runs_dir_is_not_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(load_server()._scrub_runs(Path(tmp) / "runs"), "")
+            self.assertEqual(load_server()._scrub_runs(POLICY, Path(tmp) / "runs"), "")
 
     def test_a_link_at_runs_is_refused_not_followed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = self._run_tree(Path(tmp) / "decoy")
             (Path(tmp) / "runs").symlink_to(Path(tmp) / "decoy")
-            self.assertIn("incomplete", load_server()._scrub_runs(Path(tmp) / "runs"))
+            self.assertIn("incomplete", load_server()._scrub_runs(POLICY, Path(tmp) / "runs"))
             self.assertTrue((home / ".claude.json").is_file())
 
     def _campaign(self, root: Path, name: str, runs: bool = True) -> Path:
@@ -238,14 +246,14 @@ class ScrubRunsTests(unittest.TestCase):
             live = self._campaign(root, "c-live")
             setup = self._campaign(root, "c-setup-done", runs=False)
             mine = self._campaign(root, "c-mine-done")
-            self.assertEqual(server._scrub_settled({}, root, root / "c-mine-done"), "")
+            self.assertEqual(server._scrub_settled(POLICY, root, root / "c-mine-done"), "")
             self.assertFalse((done / ".claude.json").exists())
             self.assertTrue((root / "c-done/scrubbed").exists())
             self.assertTrue((live / ".claude.json").is_file())
             self.assertTrue((mine / ".claude.json").is_file())
             self.assertFalse((setup / "scrubbed").exists())
             asked.clear()
-            server._scrub_settled({}, root, root / "c-mine-done")
+            server._scrub_settled(POLICY, root, root / "c-mine-done")
             self.assertNotIn(server.UNIT_PREFIX + "c-done", asked)
 
     def test_sweep_reports_a_failed_probe_instead_of_skipping_silently(self) -> None:
@@ -256,7 +264,7 @@ class ScrubRunsTests(unittest.TestCase):
         server._unit_state = broken
         with tempfile.TemporaryDirectory() as tmp:
             home = self._campaign(Path(tmp), "c-done")
-            self.assertIn("no bus", server._scrub_settled({}, Path(tmp), Path(tmp) / "x"))
+            self.assertIn("no bus", server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x"))
             self.assertTrue((home / ".claude.json").is_file())
 
     def test_probe_asks_the_user_manager_env(self) -> None:
@@ -292,9 +300,9 @@ class ScrubRunsTests(unittest.TestCase):
             (Path(tmp) / "c-done").chmod(0o500)
             try:
                 self.assertIn("could not mark c-done",
-                              server._scrub_settled({}, Path(tmp), Path(tmp) / "x"))
+                              server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x"))
                 self.assertIn("could not mark c-done",
-                              server._scrub_after_unit({}, Path(tmp) / "c-done"))
+                              server._scrub_after_unit(POLICY, Path(tmp) / "c-done"))
             finally:
                 (Path(tmp) / "c-done").chmod(0o700)
             self.assertFalse((home / ".claude.json").exists())
@@ -312,7 +320,7 @@ class ScrubRunsTests(unittest.TestCase):
             server._unit_state = state if callable(state) else (lambda p, u, s=state: s)
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
                 home = self._campaign(Path(tmp), "c")
-                report = server._scrub_after_unit({}, Path(tmp) / "c")
+                report = server._scrub_after_unit(POLICY, Path(tmp) / "c")
                 self.assertFalse((home / ".claude.json").exists(), "scrub skipped")
                 self.assertEqual((Path(tmp) / "c/scrubbed").exists(), marked)
                 if said:
@@ -330,15 +338,15 @@ class ScrubRunsTests(unittest.TestCase):
         server._unit_state = lambda policy, unit: states[-1]
         real = server._scrub_runs
 
-        def scrub_then_unit_writes(runs):
-            report = real(runs)
+        def scrub_then_unit_writes(policy, runs):
+            report = real(policy, runs)
             (runs / "sc/new/1/home/.claude.json").write_text("s\n")
             states.append("inactive")
             return report
         server._scrub_runs = scrub_then_unit_writes
         with tempfile.TemporaryDirectory() as tmp:
             self._campaign(Path(tmp), "c")
-            self.assertIn("still active", server._scrub_after_unit({}, Path(tmp) / "c"))
+            self.assertIn("still active", server._scrub_after_unit(POLICY, Path(tmp) / "c"))
             self.assertFalse((Path(tmp) / "c/scrubbed").exists())
 
     def _locked(self, home: Path, n: int) -> list:
@@ -358,8 +366,8 @@ class ScrubRunsTests(unittest.TestCase):
             home = self._campaign(Path(tmp), "c-done")
             locked = self._locked(home, 1)
             try:
-                first = server._scrub_settled({}, Path(tmp), Path(tmp) / "x")
-                again = server._scrub_settled({}, Path(tmp), Path(tmp) / "x")
+                first = server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x")
+                again = server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x")
             finally:
                 for d in locked:
                     d.chmod(0o700)
@@ -373,7 +381,7 @@ class ScrubRunsTests(unittest.TestCase):
             home = self._run_tree(Path(tmp) / "runs")
             locked = self._locked(home, 30)
             try:
-                report = load_server()._scrub_runs(Path(tmp) / "runs")
+                report = load_server()._scrub_runs(POLICY, Path(tmp) / "runs")
             finally:
                 for d in locked:
                     d.chmod(0o700)
@@ -1166,13 +1174,64 @@ class ReviewFindingTests(Fixture):
         self.assertEqual(list(self.out.glob("*/harness")), [])
         self.assertTrue(list(self.out.glob("*/out/runs/demo/new/1/verdict.json")))
 
-    def test_redacts_private_and_age_keys(self) -> None:
-        key = "AGE-SECRET-KEY-1" + "Q" * 58
-        pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
-        out = self.server._redact(f"{key}\n{pem}\nAKIA" + "A" * 16)
-        self.assertNotIn(key, out)
-        self.assertNotIn("abc", out)
-        self.assertNotIn("AKIA" + "A" * 16, out)
+    def test_redacts_through_the_shared_scanner(self) -> None:
+        cli = self.server._secret_redact(self.policy)
+        self.assertEqual(Path(cli).parent, FAKE_REDACT)
+        out = self.server._redact(f"a {TOKEN} b", cli)
+        self.assertNotIn(TOKEN, out)
+        self.assertIn("[REDACTED:anthropic-token:", out)
+
+    @unittest.skipIf(shutil.which("secret-redact") is None,
+                     "the real secret-redact (nixos-config) is not on PATH")
+    def test_the_real_scanner_covers_what_the_old_patterns_did(self) -> None:
+        # The broker's own regex list went when it moved to the shared scanner.
+        cli = shutil.which("secret-redact")
+        armor = "-" * 5 + "BEGIN OPENSSH PRIVATE KEY" + "-" * 5
+        for secret in ("AGE-SECRET-KEY-1" + "Q" * 58, "AKIA" + "IOSFODNN7EXAMPLQ",
+                       "sk-ant-api03-" + "x" * 40, "ghp_" + "a" * 36, "tvly-" + "b" * 24,
+                       f"{armor}\nabc\n{armor.replace('BEGIN', 'END')}",
+                       "xoxb-" + "1" * 12, "sk-proj-" + "z" * 30):
+            with self.subTest(secret=secret[:12]):
+                self.assertNotIn(secret, self.server._redact(f"x {secret} y", cli))
+
+    def test_no_scanner_on_the_policy_path_refuses_the_run(self) -> None:
+        empty = Path(self.tmp.name) / "empty-bin"
+        empty.mkdir()
+        self.raw["path"] = [str(empty)]
+        with self.assertRaisesRegex(RuntimeError, "BROKEN safety boundary: secret-redact"):
+            self.server._tool_run(self.req())
+
+    def test_a_failed_response_scan_withholds_the_body(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+
+        def broken(body, cli):
+            raise self.server.secret_redaction.ScanError("scanner down")
+        self.server._redact = broken
+        text = self.server._tool_run(self.req(n=1))
+        self.assertTrue(text.startswith("[agent-e2e-broker] response withheld: "
+                                        "the secret scan failed (scanner down); runs: "), text)
+        self.assertNotIn("--- per run ---", text)
+
+    def test_a_token_a_run_printed_is_redacted_on_disk(self) -> None:
+        # The campaign's own harness is origin/master's and may predate
+        # redaction: here it has no client to redact with, so only the broker's
+        # required scrub after the unit can make the Read-allowed tree clean.
+        require_units(self)
+        require_sandbox(self)
+        git(self.repo, "rm", "-q", "runtime/hooks/secret_redaction.py")
+        git(self.repo, "commit", "-qm", "master harness without redaction")
+        git(self.repo, "push", "-q", "origin", "master")
+        self.claude.write_text(
+            f"#!/usr/bin/env bash\necho {TOKEN} > \"$E2E_WORK/notes.txt\"\n"
+            "echo '{\"type\":\"result\",\"result\":\"the token is " + TOKEN
+            + "\",\"is_error\":false,\"total_cost_usd\":0.01}'\n")
+        text = self.server._tool_run(self.req(n=1))
+        self.assertNotIn(TOKEN, text)
+        kept = [p for p in self.out.rglob("*") if p.is_file() and not p.is_symlink()
+                and TOKEN.encode() in p.read_bytes()]
+        self.assertEqual(kept, [])
+        self.assertTrue(list(self.out.glob("*/scrubbed")), "clean campaign left unmarked")
 
     def test_pushed_scenario_code_reaches_no_token_and_writes_only_its_run(self) -> None:
         require_units(self)
@@ -1258,11 +1317,15 @@ class ReviewFindingTests(Fixture):
         root = Path(self.tmp.name)
         # The run dir is the one path bwrap binds back into its private /tmp.
         self.claude.write_text("#!/usr/bin/env bash\ntouch \"$E2E_RUN/started\"\nsleep 30\n")
-        broker = root / "broker"
-        broker.mkdir()
+        # The runtime layout the server finds its siblings by: mcps/<it>,
+        # mcps/broker_paths.py, hooks/secret_redaction.py.
+        broker = root / "rt/mcps/broker"
+        broker.mkdir(parents=True)
         source = SERVER.read_text()
         (broker / "server.py").write_text(source.replace('PROTOCOL = "https"', 'PROTOCOL = "file"'))
-        shutil.copy(HERE.parent / "broker_paths.py", root / "broker_paths.py")
+        shutil.copy(HERE.parent / "broker_paths.py", broker.parent / "broker_paths.py")
+        (root / "rt/hooks").mkdir()
+        shutil.copy(REDACTION, root / "rt/hooks/secret_redaction.py")
         (broker / "config.json").write_text(json.dumps({"agentE2eBroker": self.raw}))
         proc = subprocess.Popen([sys.executable, str(broker / "server.py")],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
