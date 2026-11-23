@@ -167,9 +167,14 @@ class Seen:
     def add(self, *items: str) -> None:
         self.items = (self.items + [i for i in items if i not in self.items])[-100:]
         fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=f".{self.session}.", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            json.dump(self.items, out)
-        os.replace(tmp, self.path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(self.items, out)
+            os.replace(tmp, self.path)
+        except BaseException:
+            # A failed write (disk full) leaves no stray temp file behind.
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def close(self) -> None:
         self.lock.close()
