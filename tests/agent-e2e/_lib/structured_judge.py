@@ -6,8 +6,9 @@ through `claude -p --json-schema`, and the caller reads typed fields from
 
 The judge's HOME and working directory are fresh and it runs with no tools,
 settings, MCP or skills, so the config under test cannot shape its grade. Its
-credentials are the real (passwd) home's file; an agent that spoils that file
-only makes the judge fail (INCONCLUSIVE), never pass.
+credentials are a private 0600 copy of the real (passwd) home's file, removed
+with the temp dir; nothing the judge does writes to the real file. An agent
+that spoils the real file only makes the judge fail (INCONCLUSIVE), never pass.
 
 usage (from a scenario's judge.py):
     from structured_judge import judge, Inconclusive
@@ -38,7 +39,15 @@ def judge(prompt: str, schema: dict, timeout: int = 600) -> dict:
             home, cwd = os.path.join(fresh, 'home'), os.path.join(fresh, 'cwd')
             os.makedirs(os.path.join(home, '.claude'))
             os.makedirs(cwd)
-            os.symlink(creds, os.path.join(home, '.claude', '.credentials.json'))
+            # A private copy, never a link: a token refresh during the run
+            # rewrites the copy, which is deleted with the temp dir, and never
+            # writes through to the real file.
+            with open(creds, 'rb') as src:
+                secret = src.read()
+            fd = os.open(os.path.join(home, '.claude', '.credentials.json'),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as dst:
+                dst.write(secret)
             env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE')}
             env['HOME'] = home
             proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
