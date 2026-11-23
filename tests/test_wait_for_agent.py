@@ -1,8 +1,10 @@
 """`wait-for agent` and the hook that asks the parent to arm it.
 
-A synthetic subagent transcript under a temporary HOME stands in for a real
-background agent; `systemctl`, `notify-send` and `sleep` are stubs, so every
-case finishes in well under a second.
+`wait-for agent` is a quiet-only alarm: it exits 5 when neither the subagent's
+transcript nor its meta file has been touched for the idle limit, and never
+reads the transcript's contents. A synthetic transcript under a temporary HOME
+stands in for a real background agent; `notify-send` and `sleep` are stubs, so
+every case finishes in a few seconds at most.
 """
 from __future__ import annotations
 
@@ -17,28 +19,15 @@ RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
 WAIT_FOR = RUNTIME / "scripts" / "wait-for"
 HOOK = RUNTIME / "hooks" / "agent-idle-alarm.py"
 
-SYSTEMCTL = """#!/usr/bin/env bash
-# Answers `systemctl --user show <unit> ...` from $STUB_DIR/units/<unit>:
-# the file holds the number of further polls the unit stays running.
-unit=""
-for a in "$@"; do case $a in --user|show|-p|ActiveState|SubState) ;; *) unit=$a ;; esac; done
-f="$STUB_DIR/units/$unit"
-echo "$unit" >> "$STUB_DIR/systemctl.log"
-if [ -f "$f" ]; then
-  n=$(cat "$f")
-  if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$f"; printf 'ActiveState=active\\nSubState=running\\n'; exit 0; fi
-  printf 'ActiveState=active\\nSubState=exited\\n'; exit 0
-fi
-printf 'ActiveState=inactive\\nSubState=dead\\n'
+SYSTEMCTL_ACTIVATING = """#!/usr/bin/env bash
+printf 'LoadState=loaded\\nActiveState=activating\\nSubState=start\\nTransient=no\\nType=simple\\n'
 """
 
 
 def make_env(tmp: Path) -> dict[str, str]:
     stub = tmp / "stub"
     (stub / "bin").mkdir(parents=True)
-    (stub / "units").mkdir()
     for name, body in {
-        "systemctl": SYSTEMCTL,
         "notify-send": '#!/bin/sh\necho "$*" >> "$STUB_DIR/notify.log"\n',
         "sleep": "#!/bin/sh\nexit 0\n",
     }.items():
@@ -53,22 +42,20 @@ def make_env(tmp: Path) -> dict[str, str]:
     }
 
 
-def write_agent(tmp: Path, agent: str, tool_uses: list[dict], *, finished: bool,
-                age: int = 600) -> Path:
+def write_agent(tmp: Path, agent: str, *, age: int = 600, meta_age: int | None = None,
+                meta: dict | None = {"agentType": "worker-hard"}) -> Path:
+    """A transcript `age` seconds old and, unless `meta` is None, its meta file."""
     d = tmp / "home" / ".claude" / "projects" / "p" / "sess" / "subagents"
     d.mkdir(parents=True, exist_ok=True)
     t = d / f"agent-{agent}.jsonl"
-    lines = [json.dumps({"type": "assistant", "message": {"content": [
-        {"type": "tool_use", **u}]}}) for u in tool_uses]
-    t.write_text("\n".join(lines) + '\n{"partial')
-    m = d / f"agent-{agent}.meta.json"
-    meta = {"agentType": "worker-hard"}
-    if finished:
-        meta["finished"] = True
-    m.write_text(json.dumps(meta))
-    old = time.time() - age
-    for f in (t, m):
-        os.utime(f, (old, old))
+    t.write_text('{"type": "assistant"}\n{"partial')
+    now = time.time()
+    os.utime(t, (now - age, now - age))
+    if meta is not None:
+        m = d / f"agent-{agent}.meta.json"
+        m.write_text(json.dumps(meta))
+        mt = now - (age if meta_age is None else meta_age)
+        os.utime(m, (mt, mt))
     return t
 
 
@@ -78,173 +65,106 @@ def run(env: dict[str, str], *args: str) -> tuple[int, str]:
     return p.returncode, p.stdout
 
 
-def bash(cmd: str, bg: bool = False) -> dict:
-    return {"name": "Bash", "input": {"command": cmd, "run_in_background": bg}}
-
-
 def notified(env: dict[str, str]) -> str:
     log = Path(env["STUB_DIR"]) / "notify.log"
     return log.read_text() if log.exists() else ""
 
 
-def test_finished_agent_exits_0_without_notification(tmp_path: Path) -> None:
+def test_quiet_transcript_and_meta_is_a_stall(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    write_agent(tmp_path, "aaa1", [bash("sleep infinity", bg=True)], finished=True)
-    rc, out = run(env, "aaa1", "--idle", "1")
-    assert rc == 0 and "finished" in out
-    assert notified(env) == ""
-
-
-def test_quiet_agent_with_no_unit_is_stalled(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    write_agent(tmp_path, "bbb2", [bash("ls"), bash('until ! pgrep -f "x"; do sleep 5; done', bg=True),
-                                   bash("cat log")], finished=False)
+    write_agent(tmp_path, "bbb2")
     rc, out = run(env, "bbb2", "--idle", "60")
     assert rc == 5, out
     assert out.startswith("agent bbb2 stalled: no activity for 10m")
-    assert 'last: background `until ! pgrep -f "x"; do sleep 5; done`' in out
+    assert "(idle limit 60s)" in out
     assert "bbb2 stalled" in notified(env)
+    assert "-u critical" in notified(env)
 
 
-def test_recent_activity_is_not_a_stall(tmp_path: Path) -> None:
+def test_fresh_transcript_is_not_a_stall(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    write_agent(tmp_path, "ccc3", [bash("sleep infinity", bg=True)], finished=False, age=0)
+    write_agent(tmp_path, "ccc3", age=0)
     rc, out = run(env, "ccc3", "--idle", "7200", "--timeout", "2")
     assert rc == 124, out
     assert notified(env) == ""
 
 
-def test_running_unit_holds_off_the_alarm_until_it_ends(tmp_path: Path) -> None:
+def test_fresh_meta_with_old_transcript_is_not_a_stall(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    write_agent(tmp_path, "ddd4", [
-        bash("systemd-run --user --unit=build-x -- make"),
-        bash("~/.claude/scripts/wait-for unit build-x --user", bg=True),
-    ], finished=False)
-    (Path(env["STUB_DIR"]) / "units" / "build-x").write_text("3")
-    # A unit seen running counts as activity and is then polled every step;
-    # after it ends the agent gets a full idle period: no stall in the timeout.
-    rc, out = run(env, "ddd4", "--idle", "60", "--timeout", "2")
+    write_agent(tmp_path, "ddd4", age=600, meta_age=0)
+    rc, out = run(env, "ddd4", "--idle", "300", "--timeout", "2")
     assert rc == 124, out
-    polls = (Path(env["STUB_DIR"]) / "systemctl.log").read_text().split()
-    assert polls.count("build-x") >= 1
     assert notified(env) == ""
 
 
-TIMED_SYSTEMCTL = """#!/usr/bin/env bash
-# Running until the wall-clock time in $STUB_DIR/end, then active/exited.
-end=$(cat "$STUB_DIR/end")
-now=$(date +%s.%N)
-if awk -v n="$now" -v e="$end" 'BEGIN{exit !(n<e)}'; then
-  printf 'ActiveState=active\\nSubState=running\\n'
-else
-  printf 'ActiveState=active\\nSubState=exited\\n'
-fi
-"""
-
-
-def test_stall_after_a_unit_ends_counts_from_its_end(tmp_path: Path) -> None:
+def test_absent_meta_and_old_transcript_is_a_stall(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    stub = Path(env["STUB_DIR"])
-    (stub / "bin" / "systemctl").write_text(TIMED_SYSTEMCTL)
-    write_agent(tmp_path, "ddd5", [bash("systemd-run --user --unit=build-y -- make")], finished=False)
-    end = time.time() + 1
-    (stub / "end").write_text(f"{end}")
-    rc, out = run(env, "ddd5", "--idle", "3", "--timeout", "20")
-    stalled_at = time.time()
+    write_agent(tmp_path, "eee5", meta=None)
+    rc, out = run(env, "eee5", "--idle", "60")
     assert rc == 5, out
-    # `date +%s` has one-second resolution: a full idle period is >= idle - 1 s,
-    # measured from the moment the unit ended, not from the start of the test.
-    assert stalled_at - end >= 2, f"stall only {stalled_at - end:.2f}s after the unit ended"
+    assert "eee5 stalled" in notified(env)
 
 
-def test_units_from_every_launcher_are_checked(tmp_path: Path) -> None:
+def test_finished_meta_is_not_a_finish_signal(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    write_agent(tmp_path, "eee5", [
-        bash("systemd-run --user --unit 'quoted-u' true"),
-        bash("~/.claude/scripts/wait-for job my-job -- ./run.sh", bg=True),
-        {"name": "mcp__jobs_broker__start", "input": {"slug": "nixbuild"}},
-    ], finished=False)
-    rc, _ = run(env, "eee5", "--idle", "60")
-    assert rc == 5
-    polled = set((Path(env["STUB_DIR"]) / "systemctl.log").read_text().split())
-    assert polled == {"quoted-u", "my-job", "claude-job-nixbuild"}
-
-
-def bg_launch(transcript: Path, tool_id: str, task: str, cmd: str, *, done: bool,
-              age: int = 600, resumed: bool = True) -> None:
-    """Append a background Bash launch, its launch result and maybe its completion.
-
-    A completion starts a new turn; `resumed` appends that turn's end, as a
-    real agent writes it. Without it the notification is the last row.
-    """
-    rows = [
-        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id,
-         "name": "Bash", "input": {"command": cmd, "run_in_background": True}}]}},
-        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id,
-         "content": f"Command running in background with ID: {task}. Output is being written to: /tmp/x/{task}.output"}]}},
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": "I'll wait for that notification."}],
-         "stop_reason": "end_turn"}},
-    ]
-    if done:
-        rows.append({"type": "user", "message": {"content":
-                     f"<task-notification>\n<task-id>{task}</task-id>\n<status>completed</status>"}})
-        if resumed:
-            rows.append({"type": "assistant", "message": {"content": [{"type": "text", "text": "It finished."}],
-                         "stop_reason": "end_turn"}})
-    body = transcript.read_text().removesuffix('{"partial')
-    transcript.write_text(body + "".join(json.dumps(r) + "\n" for r in rows))
-    old = time.time() - age
-    os.utime(transcript, (old, old))
-
-
-def test_turn_ended_on_a_pending_background_command_is_a_stall(tmp_path: Path) -> None:
-    # The 2026-11-22 shape: meta.json says finished, but the wait loop the
-    # worker launched in the background never reported back.
-    env = make_env(tmp_path)
-    t = write_agent(tmp_path, "ggg7", [bash("cargo build")], finished=True)
-    bg_launch(t, "toolu_1", "by457htew", 'until ! pgrep -f "cargo build" >/dev/null; do sleep 2; done',
-              done=False)
-    rc, out = run(env, "ggg7", "--idle", "60")
+    write_agent(tmp_path, "fff6", meta={"finished": True})
+    rc, out = run(env, "fff6", "--idle", "60")
     assert rc == 5, out
-    assert 'last: pending background `until ! pgrep -f "cargo build"' in out
-    assert "ggg7 stalled" in notified(env)
+    write_agent(tmp_path, "fff7", age=0, meta={"finished": True})
+    rc, out = run(env, "fff7", "--idle", "7200", "--timeout", "2")
+    assert rc == 124, out
 
 
-def test_pending_background_command_that_is_recent_is_not_a_stall(tmp_path: Path) -> None:
+def test_unknown_agent_is_exit_3_after_the_missing_limit(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    t = write_agent(tmp_path, "hhh8", [], finished=True)
-    bg_launch(t, "toolu_2", "bq1", "./long.sh", done=False, age=0)
-    rc, _ = run(env, "hhh8", "--idle", "7200", "--timeout", "2")
-    assert rc == 124
-    assert notified(env) == ""
-
-
-def test_finished_once_every_background_command_reported(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    t = write_agent(tmp_path, "iii9", [], finished=True)
-    bg_launch(t, "toolu_3", "bq2", "./a.sh", done=True)
-    bg_launch(t, "toolu_4", "bq3", "./b.sh", done=True)
-    rc, out = run(env, "iii9", "--idle", "60")
-    assert rc == 0 and "finished" in out
-
-
-def test_background_command_the_agent_stopped_is_not_pending(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    t = write_agent(tmp_path, "jjj10", [], finished=True)
-    bg_launch(t, "toolu_5", "bq4", "sleep infinity", done=False)
-    body = t.read_text()
-    t.write_text(body + json.dumps({"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "id": "toolu_6", "name": "TaskStop", "input": {"task_id": "bq4"}}]}}) + "\n")
-    rc, out = run(env, "jjj10", "--idle", "60")
-    assert rc == 0, out
-
-
-def test_unknown_agent_and_bad_id(tmp_path: Path) -> None:
-    env = make_env(tmp_path)
-    rc, out = run(env, "fff6", "--idle", "1")
+    rc, out = run(env, "ggg8", "--idle", "1")
     assert rc == 3 and "no transcript" in out
+
+
+def test_deleted_transcript_is_exit_3(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    t = write_agent(tmp_path, "hhh9", age=0)
+    p = subprocess.Popen([str(WAIT_FOR), "agent", "hhh9", "--idle", "2", "--timeout", "8"],
+                         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.7)
+    t.unlink()
+    out, err = p.communicate(timeout=30)
+    assert p.returncode == 3, (p.returncode, out, err)
+    assert "no transcript" in out
+
+
+def test_bad_id_is_a_usage_error(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
     rc, _ = run(env, "a;b")
     assert rc == 64
+
+
+def test_leading_zero_idle_is_eight_seconds(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    write_agent(tmp_path, "iii10")
+    rc, out = run(env, "iii10", "--idle", "08")
+    assert rc == 5, out
+    assert "(idle limit 8s)" in out
+
+
+def test_invalid_idle_is_a_usage_error_in_agent_mode_only(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    write_agent(tmp_path, "jjj11")
+    rc, _ = run(env, "jjj11", "--idle", "2h")
+    assert rc == 64
+    rc, _ = run(env, "jjj11", "--idle", "0")
+    assert rc == 64
+    # The idle limit is read from WAIT_FOR_AGENT_IDLE too, but only by `agent`.
+    rc, _ = run({**env, "WAIT_FOR_AGENT_IDLE": "2h"}, "jjj11")
+    assert rc == 64
+    (Path(env["STUB_DIR"]) / "bin" / "systemctl").write_text(SYSTEMCTL_ACTIVATING)
+    (Path(env["STUB_DIR"]) / "bin" / "systemctl").chmod(0o755)
+    cmd = [str(WAIT_FOR), "unit", "x", "--user", "--timeout", "2"]
+    clean = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
+    stray = subprocess.run(cmd, env={**env, "WAIT_FOR_AGENT_IDLE": "2h"},
+                           capture_output=True, text=True, timeout=10)
+    assert (stray.returncode, stray.stdout) == (clean.returncode, clean.stdout)
+    assert stray.returncode != 64
 
 
 def test_idle_is_agent_only(tmp_path: Path) -> None:
@@ -252,6 +172,20 @@ def test_idle_is_agent_only(tmp_path: Path) -> None:
     p = subprocess.run([str(WAIT_FOR), "unit", "x", "--idle", "5"], env=env,
                        capture_output=True, text=True, timeout=10)
     assert p.returncode == 64
+
+
+def test_non_agent_mode_leading_zero_timeout_is_eight_seconds(tmp_path: Path) -> None:
+    # `--timeout 08` was octal-parsed for every mode: "value too great for base".
+    env = make_env(tmp_path)
+    (Path(env["STUB_DIR"]) / "bin" / "systemctl").write_text(SYSTEMCTL_ACTIVATING)
+    (Path(env["STUB_DIR"]) / "bin" / "systemctl").chmod(0o755)
+    started = time.time()
+    p = subprocess.run([str(WAIT_FOR), "unit", "x", "--user", "--timeout", "08"], env=env,
+                       capture_output=True, text=True, timeout=40)
+    took = time.time() - started
+    assert "value too great" not in p.stderr, (p.returncode, p.stdout, p.stderr)
+    assert p.returncode == 124 and "timed out after 8s" in p.stdout and took >= 6, \
+        (p.returncode, p.stdout, p.stderr, took)
 
 
 def hook(payload: object) -> str:
@@ -266,7 +200,11 @@ def test_hook_names_the_wait_for_background_dispatch() -> None:
         "status": "async_launched", "agentId": "a0eb7360ac337731d"}}))
     spec = out["hookSpecificOutput"]
     assert spec["hookEventName"] == "PostToolUse"
-    assert "`~/.claude/scripts/wait-for agent a0eb7360ac337731d`" in spec["additionalContext"]
+    text = spec["additionalContext"]
+    assert "`~/.claude/scripts/wait-for agent a0eb7360ac337731d`" in text
+    assert "2 hours" in text and "TaskStop" in text
+    assert "exits 5" in text and "124" in text
+    assert "exits 0" not in text
 
 
 def test_hook_silent_otherwise() -> None:

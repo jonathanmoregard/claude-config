@@ -4,9 +4,9 @@
 PostToolUse on Agent fires at LAUNCH for a background dispatch, with
 ``tool_response = {"status": "async_launched", "agentId": ...}`` (measured,
 see artl-evidence.py). This hook adds one line of context naming the
-``wait-for agent <id>`` call to run in the background. That call exits 0 when
-the agent finishes and 5 when it stalls (unfinished, transcript quiet for the
-idle limit, no unit it launched still running), which wakes the parent.
+``wait-for agent <id>`` call to run in the background. That call exits 5 when
+the agent's transcript has been quiet for the idle limit, which wakes the
+parent; it has no "finished" exit, so the parent stops it with the result.
 
 Main session only: a subagent's background Bash is not promised to wake it.
 Prints nothing for any other call, and fails open on every error.
@@ -36,12 +36,13 @@ def context_for(payload: object) -> str | None:
     quiet = f"{limit} seconds" if limit.isdigit() and limit != "7200" else "2 hours"
     return (
         f"Background agent {agent} has no idle alarm yet. Arm "
-        f"`~/.claude/scripts/wait-for agent {agent}` in the background now "
-        "(Bash, run_in_background: true). It exits 0 when the agent finishes "
-        f"and 5 when the agent has stalled: quiet for {quiet} with no unit of "
-        "its own still running. On 5, inspect the agent and unblock or "
-        "replace it. Exit 124 means the wait timed out with the agent still "
-        "working; arm it again then."
+        f"`~/.claude/scripts/wait-for agent {agent}` in the background "
+        "(Bash, run_in_background: true). It exits 5 when the agent's "
+        f"transcript has been quiet for {quiet}, which usually means it "
+        "stalled or ended its turn waiting on something: then read the "
+        "transcript tail and unblock it, replace it, or re-arm with a longer "
+        "--idle. Stop the waiter (TaskStop) once you have the agent's result. "
+        "Exit 124 means the wait timed out; arm it again."
     )
 
 

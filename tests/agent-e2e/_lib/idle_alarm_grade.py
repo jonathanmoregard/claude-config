@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 """Grades the idle-alarm-* scenarios from commands.txt, notify.log and the transcript.
 
-    idle_alarm_grade.py RUN stall|quiet|live
+    idle_alarm_grade.py RUN stall|quiet
 
 stall: the parent armed `wait-for agent <id>` AND the alarm fired (notify.log
        names a stalled agent, and the wait's exit-5 line reached the parent).
-quiet: the parent armed `wait-for agent <id>`, no stall notification fired,
-       and the staged wait-for, replayed over the run's persisted subagent
-       files, reads the agent as finished (exit 0). finished_line is
-       diagnostic only: the wait's output stays in the sandbox's private /tmp.
-live:  quiet, AND the worker's job really ran as a (fake) unit AND its
-       transcript stayed quiet for at least 76 s (the 60 s idle limit plus the
-       15 s poll step and 1 s clock resolution, so the wait really polled the
-       unit past idle); otherwise the run never reached the situation and is
-       INCONCLUSIVE, not a vacuous pass.
+quiet: the parent armed `wait-for agent <id>`, no stall notification fired (no
+       false alarm within the run), AND the parent stopped the waiter once it
+       had the agent's result (a TaskStop/KillShell tool call, or a `kill` /
+       `pkill` of the wait-for process in commands.txt). Armed, not fired, but
+       the waiter left running is INCONCLUSIVE (exit 2): the run may simply
+       have ended before the idle limit.
 INCONCLUSIVE (exit 2) when no background Agent dispatch happened at all.
 """
-import datetime
 import json
-import os
 import pathlib
 import re
-import subprocess
 import sys
 
 run, mode = pathlib.Path(sys.argv[1]), sys.argv[2]
@@ -42,45 +36,35 @@ ids |= {p.name.removeprefix("agent-").removesuffix(".jsonl")
 armed = any(re.search(rf"wait-for agent {re.escape(i)}\b", commands) for i in ids)
 print(f"agent_ids={sorted(ids)}")
 stalled_seen = re.search(r"agent [A-Za-z0-9]+ stalled: no activity", transcript) is not None
-finished_seen = re.search(r"agent [A-Za-z0-9]+ finished", transcript) is not None
 fired = "stalled" in notify
-print(f"armed={armed} notify={fired} stalled_line={stalled_seen} finished_line={finished_seen}")
+
+
+def stopped_waiter() -> bool:
+    """The parent's own tool calls: TaskStop/KillShell, or kill/pkill of wait-for."""
+    for line in transcript.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "assistant" or event.get("agent_id"):
+            continue
+        content = (event.get("message") or {}).get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" \
+                    and block.get("name") in ("TaskStop", "KillShell"):
+                return True
+    return re.search(r"\b(?:pkill|kill)\b[^\n]*wait-for", commands) is not None
+
+
+stopped = stopped_waiter()
+print(f"armed={armed} notify={fired} stalled_line={stalled_seen} stopped={stopped}")
 if mode == "stall":
     sys.exit(0 if armed and fired and stalled_seen else 1)
-if mode in ("quiet", "live"):
-    home = run / "home"
-    transcripts = sorted(home.glob(".claude/projects/*/*/subagents/agent-*.jsonl"))
-    if len(transcripts) != 1:
-        print(f"expected one subagent transcript, found {len(transcripts)}")
+if mode == "quiet":
+    if not armed or fired:
+        sys.exit(1)
+    if not stopped:
+        print("the waiter was left running (not stopped, not fired)")
         sys.exit(2)
-    agent = transcripts[0].name.removeprefix("agent-").removesuffix(".jsonl")
-    if mode == "live":
-        calls = run / "fake-systemd" / "calls.log"
-        ran = calls.exists() and "systemd-run" in calls.read_text(errors="replace")
-        started = list((run / "fake-systemd").glob("*.started")) if ran else []
-        # The situation under test: the worker stayed quiet past the idle limit
-        # (60 s) while its unit ran. The wait polls every idle/4 = 15 s step and
-        # `date +%s` has 1 s resolution, so the gap must be >= 60 + 15 + 1 = 76 s
-        # for the wait to have been past idle at a poll. A worker that polled
-        # faster never reached it.
-        stamps = []
-        for line in transcripts[0].read_text(errors="replace").splitlines():
-            try:
-                ts = json.loads(line).get("timestamp")
-            except (ValueError, AttributeError):
-                continue
-            if isinstance(ts, str):
-                stamps.append(datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")))
-        gap = max(((b - a).total_seconds() for a, b in zip(stamps, stamps[1:])), default=0)
-        print(f"unit_ran={ran} max_quiet_gap={gap:.0f}s")
-        if not ran or not started or gap < 76:
-            sys.exit(2)
-    # The wait's own output stays in the sandbox's private /tmp, so its exit is
-    # pinned by replaying the staged wait-for over the run's persisted files:
-    # the agent's end state must read as finished (exit 0).
-    replay = subprocess.run(
-        [str(home / ".claude" / "scripts" / "wait-for"), "agent", agent, "--idle", "60", "--timeout", "5"],
-        env={**os.environ, "HOME": str(home)}, capture_output=True, text=True, timeout=60)
-    print(f"replay_exit={replay.returncode} {replay.stdout.strip()}")
-    sys.exit(0 if armed and not fired and replay.returncode == 0 else 1)
+    sys.exit(0)
 sys.exit(3)
