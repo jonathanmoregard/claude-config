@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """tests/agent-e2e/_lib/structured_judge.py returns a verdict only from a
 successful, schema-shaped judge result: a failed exit, an error result or a
-missing structured_output is Inconclusive, even when a verdict rides along.
-The judge CLI is a fake (E2E_JUDGE_CLAUDE); no model runs."""
+missing or non-object structured_output is Inconclusive, even when a verdict
+rides along. The judge runs isolated (fresh HOME and cwd, no tools, settings,
+MCP or slash commands) and gets the OAuth access token alone: no credentials
+file, no refresh token, no inherited API auth. The judge CLI is a fake
+(E2E_JUDGE_CLAUDE); no model runs."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-import stat
 import sys
 import tempfile
 import time
@@ -18,81 +21,116 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "agent-e2e" / "_lib"))
 from structured_judge import Inconclusive, judge  # noqa: E402
 
 VERDICT = '"structured_output":{"ok":true}'
+CLEAN = '{"is_error":false,' + VERDICT + '}'
 SCHEMA = {"type": "object"}
 TOKEN = "e2e-fake-access-token"
+REFRESH = "e2e-fake-refresh-token"
 FUTURE_MS = int(time.time() * 1000) + 24 * 3600 * 1000
 
 
-def fake(tmp: Path, stdout: str, code: int) -> str:
+def script(tmp: Path, body: str = "", stdout: str = CLEAN, code: int = 0) -> str:
     path = tmp / "claude"
-    path.write_text(f"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{stdout}'\nexit {code}\n",
-                    encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return str(path)
-
-
-@pytest.fixture
-def env(monkeypatch, tmp_path):
-    creds = tmp_path / "creds.json"
-    creds.write_text(json.dumps({"claudeAiOauth": {
-        "accessToken": TOKEN, "refreshToken": "e2e-fake-refresh", "expiresAt": FUTURE_MS}}),
-        encoding="utf-8")
-    monkeypatch.setenv("E2E_JUDGE_CREDS", str(creds))
-    monkeypatch.setenv("TMPDIR", str(tmp_path))
-    tempfile.tempdir = None
-    yield tmp_path
-    tempfile.tempdir = None
-
-
-def test_success_returns_the_structured_output(env, monkeypatch) -> None:
-    monkeypatch.setenv("E2E_JUDGE_CLAUDE", fake(env, '{"is_error":false,' + VERDICT + "}", 0))
-    assert judge("p", SCHEMA) == {"ok": True}
-
-
-@pytest.mark.parametrize("stdout,code", [
-    ('{"is_error":false,' + VERDICT + "}", 1),  # failed exit, clean-looking body
-    ('{"is_error":true,' + VERDICT + "}", 1),   # failed exit
-    ('{"is_error":true,' + VERDICT + "}", 0),   # error result, exit 0
-    ('{' + VERDICT + "}", 0),                   # no is_error field
-    ('{"is_error":false,"result":"ok"}', 0),    # no structured_output
-    ("not json", 0),
-])
-def test_anything_but_a_clean_result_is_inconclusive(env, monkeypatch, stdout, code) -> None:
-    monkeypatch.setenv("E2E_JUDGE_CLAUDE", fake(env, stdout, code))
-    with pytest.raises(Inconclusive):
-        judge("p", SCHEMA)
-
-
-def script(tmp: Path, body: str) -> str:
-    path = tmp / "claude"
-    path.write_text("#!/bin/sh\ncat >/dev/null\n" + body
-                    + "printf '%s\\n' '{\"is_error\":false," + VERDICT + "}'\n",
+    path.write_text(f"#!/bin/sh\ncat >/dev/null\n{body}printf '%s\\n' '{stdout}'\nexit {code}\n",
                     encoding="utf-8")
     path.chmod(0o755)
     return str(path)
 
 
-def test_judge_gets_the_access_token_only_and_no_credentials_file(env, monkeypatch) -> None:
-    seen = env / "seen"
-    before = (env / "creds.json").read_bytes()
+@pytest.fixture
+def env(monkeypatch, tmp_path):
+    """The caller's HOME holds the credentials, so a judge that stopped
+    overriding HOME would write the very file the tests check."""
+    home = tmp_path / "caller-home"
+    (home / ".claude").mkdir(parents=True)
+    creds = home / ".claude" / ".credentials.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": TOKEN, "refreshToken": REFRESH, "expiresAt": FUTURE_MS}}),
+        encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("E2E_JUDGE_CREDS", str(creds))
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    tempfile.tempdir = None
+    yield tmp_path
+    tempfile.tempdir = None
+
+
+def creds_of(tmp: Path) -> Path:
+    return tmp / "caller-home" / ".claude" / ".credentials.json"
+
+
+def test_success_returns_the_structured_output(env, monkeypatch) -> None:
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env))
+    assert judge("p", SCHEMA) == {"ok": True}
+
+
+@pytest.mark.parametrize("stdout,code", [
+    (CLEAN, 1),                                                 # failed exit, clean body
+    ('{"is_error":true,' + VERDICT + "}", 0),                   # error result, exit 0
+    ('{' + VERDICT + "}", 0),                                   # no is_error field
+    ('{"is_error":false,"result":"ok"}', 0),                    # no structured_output
+    ('{"is_error":false,"structured_output":null}', 0),         # null verdict
+    ('{"is_error":false,"structured_output":"ok"}', 0),         # string verdict
+    ("not json", 0),
+])
+def test_anything_but_a_clean_result_is_inconclusive(env, monkeypatch, stdout, code) -> None:
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, stdout=stdout, code=code))
+    with pytest.raises(Inconclusive):
+        judge("p", SCHEMA)
+
+
+def test_undecodable_output_is_inconclusive(env, monkeypatch) -> None:
+    path = env / "claude"
+    path.write_text("#!/bin/sh\ncat >/dev/null\nprintf '\\377'\n", encoding="utf-8")
+    path.chmod(0o755)
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", str(path))
+    with pytest.raises(Inconclusive):
+        judge("p", SCHEMA)
+
+
+def test_judge_runs_isolated(env, monkeypatch) -> None:
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, (
-        f'f="$HOME/.claude/.credentials.json"; [ -e "$f" ] || [ -L "$f" ] && echo file > {seen}\n'
-        f'echo "token=$CLAUDE_CODE_OAUTH_TOKEN" >> {seen}\n'
-        # A refresh would write here; it must not reach the real file.
+        f'pwd > {env}/cwd.txt; ls -A > {env}/ls.txt; printf %s "$HOME" > {env}/home.txt\n'
+        f'for a in "$@"; do printf "<%s>" "$a"; done > {env}/args.txt\n')))
+    judge("p", SCHEMA)
+    cwd = Path((env / "cwd.txt").read_text().strip())
+    home = Path((env / "home.txt").read_text())
+    args = (env / "args.txt").read_text()
+    assert cwd.name == "cwd" and cwd.parent == home.parent and cwd.parent.parent == env
+    assert home.name == "home"
+    assert (env / "ls.txt").read_text() == ""
+    for flags in ("<--tools><>", "<--strict-mcp-config>", "<--setting-sources><>",
+                  "<--disable-slash-commands>", "<--no-session-persistence>",
+                  "<--output-format><json>", "<--json-schema><" + json.dumps(SCHEMA) + ">"):
+        assert flags in args, flags
+
+
+def test_judge_gets_the_access_token_only(env, monkeypatch) -> None:
+    seen = env / "seen"
+    before = creds_of(env).read_bytes()
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, (
+        f'f="$HOME/.claude/.credentials.json"; {{ [ -e "$f" ] || [ -L "$f" ]; }} && touch {env}/had-file\n'
+        f'{{ env; printf "%s\\n" "$@"; }} > {seen}\n'
+        # A refresh would write here; it must not reach the caller's file.
         'mkdir -p "$HOME/.claude"; echo rotated > "$f"\n')))
     assert judge("p", SCHEMA) == {"ok": True}
-    assert seen.read_text() == f"token={TOKEN}\n"
-    assert (env / "creds.json").read_bytes() == before
+    dump = seen.read_text()
+    assert not (env / "had-file").exists()
+    assert f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}\n" in dump
+    assert REFRESH not in dump
+    assert creds_of(env).read_bytes() == before
 
 
-def test_inherited_claude_auth_is_not_passed_through(env, monkeypatch) -> None:
+def test_inherited_auth_is_not_passed_through(env, monkeypatch) -> None:
     seen = env / "seen"
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "inherited")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "billed-key")
-    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(
-        env, f'echo "$CLAUDE_CODE_OAUTH_TOKEN|${{ANTHROPIC_API_KEY-unset}}" > {seen}\n'))
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "other-token")
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, (
+        f'echo "$CLAUDE_CODE_OAUTH_TOKEN|${{ANTHROPIC_API_KEY-unset}}|'
+        f'${{ANTHROPIC_AUTH_TOKEN-unset}}" > {seen}\n')))
     judge("p", SCHEMA)
-    assert seen.read_text() == f"{TOKEN}|unset\n"
+    assert seen.read_text() == f"{TOKEN}|unset|unset\n"
 
 
 @pytest.mark.parametrize("creds", [
@@ -101,29 +139,56 @@ def test_inherited_claude_auth_is_not_passed_through(env, monkeypatch) -> None:
                        "expiresAt": int(time.time() * 1000) + 60_000}},  # expires mid-run
     {"claudeAiOauth": {"expiresAt": FUTURE_MS}},                      # no token
     {"claudeAiOauth": {"accessToken": "", "expiresAt": FUTURE_MS}},   # empty token
+    {"claudeAiOauth": {"accessToken": 7, "expiresAt": FUTURE_MS}},    # non-string token
+    {"claudeAiOauth": {"accessToken": TOKEN, "expiresAt": "soon"}},   # non-numeric expiry
     {"other": 1},
     "not json",
+    None,                                                             # no file at all
 ])
 def test_unusable_credentials_are_inconclusive_before_the_judge_runs(env, monkeypatch, creds) -> None:
-    path = env / "creds.json"
-    path.write_text(creds if isinstance(creds, str) else json.dumps(creds), encoding="utf-8")
-    before = path.read_bytes()
+    path = creds_of(env)
+    if creds is None:
+        path.unlink()
+    else:
+        path.write_text(creds if isinstance(creds, str) else json.dumps(creds), encoding="utf-8")
+    before = path.read_bytes() if path.exists() else None
     ran = env / "ran"
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, f"touch {ran}\n"))
     with pytest.raises(Inconclusive):
         judge("p", SCHEMA)
     assert not ran.exists()
-    assert path.read_bytes() == before
+    assert (path.read_bytes() if path.exists() else None) == before
 
 
-def test_token_never_reaches_the_raw_output_file(env, monkeypatch) -> None:
+def test_raw_output_is_kept_in_log_dir_with_the_token_redacted(env, monkeypatch) -> None:
+    logs = env / "run"
+    logs.mkdir()
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(
-        env, 'echo "out $CLAUDE_CODE_OAUTH_TOKEN"; echo "err $CLAUDE_CODE_OAUTH_TOKEN" >&2\n'))
-    with pytest.raises(Inconclusive) as exc:  # the echo spoils the JSON stdout
-        judge("p", SCHEMA)
-    raw = Path(str(exc.value).rsplit("see ", 1)[1]).read_text()
+        env, 'echo "err $CLAUDE_CODE_OAUTH_TOKEN" >&2\n', code=1))
+    with pytest.raises(Inconclusive):
+        judge("p", SCHEMA, log_dir=str(logs))
+    raw = (logs / "judge.out").read_text()
     assert "err [REDACTED]" in raw
     assert TOKEN not in raw
+    assert oct((logs / "judge.out").stat().st_mode & 0o777) == "0o600"
+
+
+def test_nothing_is_left_behind_without_a_log_dir(env, monkeypatch) -> None:
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env))
+    before = set(os.listdir(env))
+    judge("p", SCHEMA)
+    assert set(os.listdir(env)) == before
+
+
+def test_a_planted_log_link_is_not_followed(env, monkeypatch) -> None:
+    logs = env / "run"
+    logs.mkdir()
+    target = env / "victim"
+    target.write_text("keep", encoding="utf-8")
+    (logs / "judge.out").symlink_to(target)
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env))
+    assert judge("p", SCHEMA, log_dir=str(logs)) == {"ok": True}
+    assert target.read_text() == "keep"
 
 
 if __name__ == "__main__":

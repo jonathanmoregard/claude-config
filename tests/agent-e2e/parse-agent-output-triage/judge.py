@@ -2,16 +2,22 @@
 category out of claude's answer? A no-tools judge returns an enum through
 --json-schema (see ../_lib/structured_judge.py); this script compares fields.
 
-usage: judge.py TRIAGE_SH FINAL_TXT
+usage: judge.py RUN
 Headless runs in default mode may have the edit denied; the judge then grades
-the change the final message proposes.
+the change the final message proposes. check.sh runs on the host and the run
+dir is the agent's to write, so run files are read only as regular files
+reached without a symlink (helper_lang.read_run); anything else is a FAIL.
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
 """
 import os
+from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_lib'))
+from helper_lang import Refused, read_run  # noqa: E402
 from structured_judge import Inconclusive, judge  # noqa: E402
+
+LIMIT = 256 * 1024  # bytes per file; a triage script and a reply are far smaller
 
 METHODS = ['schema_enforced', 'json_unenforced', 'text_matching', 'unchanged', 'other']
 
@@ -49,20 +55,20 @@ SCHEMA = {
 
 
 def main() -> int:
-    path, final = sys.argv[1], sys.argv[2]
-    if not os.path.exists(path):
+    run = Path(sys.argv[1])
+    try:
+        script = read_run(run, 'work/scripts/triage.sh', LIMIT)
+        message = read_run(run, 'final.txt', LIMIT) or b''
+    except Refused as exc:
+        print(f'FAIL: refused run content: {exc}')
+        return 1
+    if script is None:
         print('FAIL: scripts/triage.sh is gone')
         return 1
-    with open(path, encoding='utf-8', errors='replace') as fh:
-        script = fh.read()
-    message = ''
-    if os.path.exists(final):
-        with open(final, encoding='utf-8', errors='replace') as fh:
-            message = fh.read()
-    prompt = (INSTRUCTIONS + '\n=== THE SCRIPT NOW ===\n' + script
-              + "\n=== THE ASSISTANT'S FINAL MESSAGE ===\n" + message)
+    prompt = (INSTRUCTIONS + '\n=== THE SCRIPT NOW ===\n' + script.decode('utf-8', 'replace')
+              + "\n=== THE ASSISTANT'S FINAL MESSAGE ===\n" + message.decode('utf-8', 'replace'))
     try:
-        v = judge(prompt, SCHEMA)
+        v = judge(prompt, SCHEMA, log_dir=str(run))
     except Inconclusive as exc:
         print(f'INCONCLUSIVE: judge failed: {exc}')
         return 2

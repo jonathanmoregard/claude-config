@@ -41,8 +41,9 @@ only asked for in the prompt. This holds for quick fixes and one-off scripts.
 
 ```bash
 schema='{"type":"object","additionalProperties":false,"required":["category"],
-  "properties":{"category":{"type":"string","enum":["bug","feature"]}}}'
-out=$(claude -p --output-format json --json-schema "$schema" "Classify this ticket: $(cat "$f")") \
+  "properties":{"category":{"type":"string","enum":["bug","feature","unclear"]}}}'
+ticket=$(cat "$f") || { echo "cannot read $f" >&2; exit 1; }
+out=$(claude -p --output-format json --json-schema "$schema" "Classify this ticket: $ticket") \
   || { echo "claude failed" >&2; exit 1; }
 CATEGORY=$(jq -er 'select(.is_error == false) | .structured_output.category
   | select(. == "bug" or . == "feature")' <<<"$out") || { echo "no category" >&2; exit 1; }
