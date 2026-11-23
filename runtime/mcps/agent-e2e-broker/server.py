@@ -73,6 +73,19 @@ _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outpu
                   "maxCampaigns", "maxQueueSec")
 SLOT_POLL_SEC = 2.0
 GIT_GRACE_SEC = 5
+# argv: LIMIT_SEC CMD... Runs CMD in the caller's process group (the watchdog
+# leads it) and SIGKILLs the whole group, itself included, after LIMIT_SEC.
+# Otherwise exits with CMD's status, a signal death as 128 + signal.
+_GROUP_WATCHDOG = """
+import os, signal, sys
+pid = os.fork()
+if pid == 0:
+    os.execvp(sys.argv[2], sys.argv[2:])
+signal.signal(signal.SIGALRM, lambda *_: os.killpg(0, signal.SIGKILL))
+signal.alarm(int(sys.argv[1]))
+code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+sys.exit(code if code >= 0 else 128 - code)
+"""
 # Worst case of the setup steps' own subprocess timeouts, in order: mirror init
 # 60, fetch 300, three refs resolved at up to 2 x 60 each, three scenario
 # cat-files at 60, harness cat-file 60 + clone 120 + checkout 120, scenario
@@ -243,11 +256,14 @@ def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
              ) -> subprocess.CompletedProcess:
     # Own process group, killed whole on timeout. Git and its helpers also
     # inherit the mirror lock's fd, so the flock stays held while any of them
-    # lives, even past the broker's death. coreutils timeout kills that group
-    # GIT_GRACE_SEC after the broker would have, so a git stalled after the
-    # broker died cannot keep the mirror locked.
+    # lives, even past the broker's death. A watchdog that leads the group kills
+    # all of it GIT_GRACE_SEC after the broker would have, so a git stalled
+    # after the broker died cannot keep the mirror locked. Not coreutils
+    # timeout: the uutils one (Ubuntu's default) signals git alone, and git's
+    # children kept the lock.
     _check_cancel(policy)
-    argv = ["timeout", "-s", "KILL", str(timeout + GIT_GRACE_SEC), "git", *_GIT_OVERRIDES, *argv]
+    argv = [sys.executable, "-I", "-S", "-c", _GROUP_WATCHDOG, str(timeout + GIT_GRACE_SEC),
+            "git", *_GIT_OVERRIDES, *argv]
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             env=_git_env(policy, protocol), stdin=subprocess.DEVNULL,
                             start_new_session=True, pass_fds=_mirror_fds(policy))

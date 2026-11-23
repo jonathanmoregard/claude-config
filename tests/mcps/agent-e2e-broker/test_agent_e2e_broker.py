@@ -376,7 +376,7 @@ class RunTests(Fixture):
                 rec, late, hit = self.server._InFlight(), [], []
 
                 def popen(argv, *a, **k):
-                    is_git = "git" in argv[:5]   # bare, or under `timeout -s KILL N`
+                    is_git = "git" in argv[:7]   # bare, or under the group watchdog
                     if rec.cancelled and is_git:
                         late.append(argv)
                     proc = real_popen(argv, *a, **k)
