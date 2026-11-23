@@ -427,7 +427,7 @@ def test_deleted_then_recreated_file_still_needs_a_read(sb):
     git(sb.work, "rm", "-q", old)
     git(sb.work, "commit", "-qm", "drop old")
     sb.commit("scripts/run.sh", SCRIPT_BODY)
-    sb.commit(old, "".join(f"rm -r /tmp/x{i}\n" for i in range(40)), msg="bring it back")
+    sb.commit(old, "".join(f"echo changed {i}\n" for i in range(40)), msg="bring it back")
     sb.review("PASS", reads=["scripts/run.sh"])
     out = sb.gate()
     assert is_deny(out) and old in reason(out)
