@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -219,12 +220,18 @@ def main_out(mod: object, payload: object, monkeypatch, capsys) -> str:
 def test_hanging_classifier_fails_open(tmp_path: Path, monkeypatch, capsys) -> None:
     bindir = tmp_path / "hangbin"
     bindir.mkdir()
-    (bindir / "claude").write_text("#!/bin/sh\nexec sleep 30\n")
+    # Answers QUESTION, but only after 30 s: without the timeout this denies.
+    (bindir / "claude").write_text(
+        f'#!/bin/sh\ntouch "{tmp_path}/classifier-ran"\n'
+        f'exec {PYTHON} -c "import time; time.sleep(30); print(\'QUESTION\')"\n')
     (bindir / "claude").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     mod = load_hook(tmp_path, monkeypatch)
     mod.CLASSIFY_TIMEOUT = 0.5
+    started = time.monotonic()
     assert main_out(mod, stop(AB), monkeypatch, capsys) == ""
+    assert time.monotonic() - started < 5
+    assert (tmp_path / "classifier-ran").exists()
 
 
 def test_missing_or_broken_config_fails_open(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -244,6 +251,10 @@ def test_stop_timeout_outlasts_classifier_and_gdbus() -> None:
     settings = json.loads((RUNTIME / "settings.json").read_text())
     text = (RUNTIME / "hooks" / "night-proceed.py").read_text()
     classify = int(re.search(r"^CLASSIFY_TIMEOUT = (\d+)", text, re.M).group(1))
-    timeouts = [h.get("timeout", 60) for entry in settings["hooks"]["Stop"]
+    def timeouts(event: str) -> list[int]:
+        return [h.get("timeout", 60) for entry in settings["hooks"][event]
                 for h in entry.get("hooks", []) if "night-proceed.py" in h.get("command", "")]
-    assert timeouts and all(t >= classify + 3 + 5 for t in timeouts), (timeouts, classify)
+    assert timeouts("Stop") and all(t >= classify + 3 + 5 for t in timeouts("Stop")), \
+        (timeouts("Stop"), classify)
+    # AskUserQuestion runs no classifier, only the 3 s gdbus query.
+    assert timeouts("PreToolUse") and all(t >= 3 + 5 for t in timeouts("PreToolUse"))

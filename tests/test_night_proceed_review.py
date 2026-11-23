@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 from test_night_proceed import HOOK, PYTHON, ask, fake_gdbus, run
@@ -58,6 +59,30 @@ def test_n6_parallel_asks_in_one_turn_get_one_reply(tmp_path: Path) -> None:
         if denied != 1:
             problems.append(f"round {rnd}: {denied} denies")
     assert not problems, problems
+
+
+def test_n6_hook_waits_for_the_session_lock(tmp_path: Path) -> None:
+    """While another hook holds the session lock, this one blocks; once that
+    hook records the turn and releases, this one sees it and stays silent."""
+    import fcntl
+    state = tmp_path / ".claude" / "tmp" / "night-proceed"
+    state.mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_NIGHT_PROCEED") and k != "CLAUDE_CODE_ENTRYPOINT"}
+    env.update(HOME=str(tmp_path), CLAUDE_NIGHT_PROCEED_TEST_NOW="02:00",
+               CLAUDE_NIGHT_PROCEED_TEST_LOCK="locked")
+    payload = {"hook_event_name": "PreToolUse", "session_id": "held", "prompt_id": "p1",
+               "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "q?"}]}}
+    with open(state / "held.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        p = subprocess.Popen([PYTHON, "-S", "-E", str(HOOK)], env=env, text=True,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.stdin.write(json.dumps(payload)); p.stdin.close()
+        time.sleep(1.0)
+        assert p.poll() is None, "hook did not wait for the session lock"
+        (state / "held.json").write_text(json.dumps(["turn:p1"]))
+    out, err = p.communicate(timeout=10)
+    assert p.returncode == 0 and out.strip() == "", (out, err)
 
 
 def test_n6_concurrent_asks_same_session_share_tmp(tmp_path: Path) -> None:

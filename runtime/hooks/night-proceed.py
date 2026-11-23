@@ -221,11 +221,24 @@ def decide(payload: object) -> dict | None:
     # night, and the classifier only for a stop not answered before.
     if not is_night() or not screen_locked():
         return None
+    def answered(seen: Seen) -> bool:
+        return key in seen or (turn is not None and turn in seen)
+
+    # The classifier (up to CLASSIFY_TIMEOUT) runs outside the session lock, so
+    # a same-session hook queued behind it is not held past its own timeout;
+    # the check is repeated under the lock before recording the reply.
+    if text is not None:
+        seen = Seen(session)
+        try:
+            if answered(seen):
+                return None
+        finally:
+            seen.close()
+        if not ends_on_question(text):
+            return None
     seen = Seen(session)
     try:
-        if key in seen or (turn is not None and turn in seen):
-            return None
-        if text is not None and not ends_on_question(text):
+        if answered(seen):
             return None
         seen.add(key, *([turn] if turn else []))
     finally:
