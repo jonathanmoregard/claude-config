@@ -55,6 +55,7 @@ FIDELITY
 from __future__ import annotations
 
 import argparse
+import errno
 import concurrent.futures as cf
 import hashlib
 import json
@@ -251,116 +252,78 @@ def stage(src: str, home: pathlib.Path) -> str:
     return provenance
 
 
-# Account material in a staged HOME: what stage() links in, whatever type the
-# run left it as (a token refresh replaces the credentials link with a real
-# file), plus what the CLI and tools write there. A retained run dir is read
-# by reviewers, so it must not keep any of it.
-HOME_SECRETS = (*LINKS, ".claude/backups", ".ssh", ".codex")
+# Account material a run leaves behind, found by name anywhere in its dir: a
+# HOME the run moved, a nested harness's runs and work/ all hold copies, and a
+# token refresh turns the credentials link into a real file. Every link goes
+# too: stage() links into the real HOME, and a run can plant more.
+SECRET_FILE_PREFIXES = (".claude.json", ".credentials.json")
+SECRET_DIRS = (".ssh", ".codex")
 _DIR_NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_WRITE_NOFOLLOW = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _lstat_at(dir_fd: int, name: str) -> os.stat_result | None:
-    """lstat NAME in DIR_FD; None when it is absent (nothing to scrub)."""
-    try:
-        return os.lstat(name, dir_fd=dir_fd)
-    except FileNotFoundError:
-        return None
+def _is_secret(name: str, parent: str, st: os.stat_result) -> bool:
+    if stat.S_ISLNK(st.st_mode) or name.startswith(SECRET_FILE_PREFIXES):
+        return True
+    return stat.S_ISDIR(st.st_mode) and (
+        name in SECRET_DIRS or (name == "backups" and parent == ".claude"))
 
 
-def _remove_at(dir_fd: int, name: str) -> None:
-    """Remove NAME in DIR_FD if present; a link is removed itself, never followed."""
-    st = _lstat_at(dir_fd, name)
-    if st is None:
-        return
-    if stat.S_ISDIR(st.st_mode):
-        shutil.rmtree(name, dir_fd=dir_fd)
-    else:
-        os.unlink(name, dir_fd=dir_fd)
+def scrub_dir(path: pathlib.Path) -> list[str]:
+    """Strip account material and every link from the tree at PATH, keeping
+    the rest (ledgers, notes, transcripts) for review. Returns the errors;
+    one failed item never stops the others.
 
-
-def _open_beneath(dir_fd: int, rel: str) -> int | None:
-    """Open directory REL under DIR_FD without following any link in it."""
-    fd = os.dup(dir_fd)
-    for part in filter(None, rel.split("/")):
-        try:
-            nxt = os.open(part, _DIR_NOFOLLOW, dir_fd=fd)
-        except OSError:  # missing, or a link: the link sweep removes that
-            os.close(fd)
-            return None
-        os.close(fd)
-        fd = nxt
-    return fd
-
-
-def scrub_home(home: pathlib.Path) -> list[str]:
-    """Strip a finished run's HOME of account material and of every link,
-    keeping the rest (ledgers, notes, transcripts) for review. Returns the
-    errors; one failed item never stops the others.
-
-    Runs outside the sandbox on a tree the run could rewrite, so nothing here
-    follows a link: every step goes through directory fds opened O_NOFOLLOW.
-    Read denies cannot stand in for this: Bash reads past them, and a run dir
-    can sit under any --out.
+    Runs outside the sandbox on a tree a run could rewrite, so nothing here
+    follows a link: PATH itself is opened O_NOFOLLOW and every step after it
+    goes through directory fds. Read denies cannot stand in for this: Bash
+    reads past them, and a run dir can sit under any --out.
     """
     errors: list[str] = []
     try:
-        run_fd = os.open(home.parent, os.O_RDONLY | os.O_DIRECTORY)
+        root = os.open(path, _DIR_NOFOLLOW)
     except FileNotFoundError:
         return errors
-    except OSError as exc:
-        return [f"{home.parent}: {exc}"]
+    except OSError as exc:  # a link planted at PATH (ELOOP) included
+        return [f"{path}: {exc}"]
     try:
-        try:
-            if not stat.S_ISDIR(os.lstat(home.name, dir_fd=run_fd).st_mode):
-                os.unlink(home.name, dir_fd=run_fd)  # a link swapped in for HOME
-                return errors
-            home_fd = os.open(home.name, _DIR_NOFOLLOW, dir_fd=run_fd)
-        except FileNotFoundError:
-            return errors
-        except OSError as exc:
-            return [f"{home}: {exc}"]
-        try:
-            names = [n for n in os.listdir(home_fd) if n.startswith(".claude.json")]
-            for rel in (*HOME_SECRETS, *names):
-                parent, _, name = rel.rpartition("/")
-                fd = _open_beneath(home_fd, parent)
-                if fd is None:
-                    continue
+        for dirpath, dirnames, filenames, dfd in os.fwalk(
+                dir_fd=root, follow_symlinks=False,
+                onerror=lambda exc: errors.append(f"{path}: {exc}")):
+            parent = os.path.basename(os.path.normpath(dirpath))
+            for name in [*dirnames, *filenames]:
+                where = path / dirpath / name
                 try:
-                    _remove_at(fd, name)
-                except OSError as exc:
-                    errors.append(f"{home / rel}: {exc}")
-                finally:
-                    os.close(fd)
-            for dirpath, dirnames, filenames, dfd in os.fwalk(
-                    dir_fd=home_fd, follow_symlinks=False,
-                    onerror=lambda exc: errors.append(f"{home}: {exc}")):
-                for name in [*dirnames, *filenames]:
-                    st = _lstat_at(dfd, name)
-                    if st is None or not stat.S_ISLNK(st.st_mode):
+                    st = os.lstat(name, dir_fd=dfd)
+                    if not _is_secret(name, parent, st):
                         continue
-                    try:
+                    if name in dirnames:
+                        dirnames.remove(name)
+                    if stat.S_ISDIR(st.st_mode):
+                        shutil.rmtree(name, dir_fd=dfd)
+                    else:
                         os.unlink(name, dir_fd=dfd)
-                        if name in dirnames:
-                            dirnames.remove(name)
-                    except OSError as exc:
-                        errors.append(f"{home / dirpath / name}: {exc}")
-        finally:
-            os.close(home_fd)
+                except FileNotFoundError:
+                    continue  # gone already: nothing left to scrub
+                except OSError as exc:
+                    errors.append(f"{where}: {exc}")
     finally:
-        os.close(run_fd)
+        os.close(root)
     return errors
 
 
-def scrub_tree(root: pathlib.Path) -> list[str]:
-    """scrub_home every run dir (one holding home/ and work/) under ROOT."""
-    errors: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        names = {*dirnames, *filenames}
-        if "home" in names and "work" in names:
-            errors += scrub_home(pathlib.Path(dirpath) / "home")
-            dirnames[:] = [d for d in dirnames if d not in ("home", "work")]
-    return errors
+def write_run_file(run: pathlib.Path, name: str, text: str) -> None:
+    """Write RUN/NAME without following a link the run planted there."""
+    path = run / name
+    try:
+        fd = os.open(path, _WRITE_NOFOLLOW, 0o644)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        os.unlink(path)
+        fd = os.open(path, _WRITE_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 def path_guard() -> list[str]:
@@ -531,21 +494,23 @@ def result_event(events: list[dict]) -> dict:
 
 def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             out: pathlib.Path, args) -> dict:
-    """One run, its HOME scrubbed on every way out once check.sh is done.
-    A SIGKILLed harness skips this; `scrub` over the output dir covers that."""
+    """One run, its dir scrubbed on every way out once check.sh is done.
+    A SIGKILLed harness skips this; `scrub` over the output dir covers that.
+    Scrub errors land in scrub-errors.txt, and in verdict.json when there is
+    a verdict (a run that raised gets its fault verdict from cmd_run)."""
     verdict = None
     try:
         verdict = _run_one(scenario, arm, src, idx, out, args)
         return verdict
     finally:
         run = out / arm / str(idx)
-        errors = scrub_home(run / "home")
+        errors = scrub_dir(run)
         if errors:
             print(f"scrub incomplete in {run}:\n  " + "\n  ".join(errors), file=sys.stderr)
+            write_run_file(run, "scrub-errors.txt", "\n".join(errors) + "\n")
             if verdict is not None:
                 verdict["scrub_errors"] = errors
-                (run / "verdict.json").write_text(json.dumps(verdict, indent=2),
-                                                  encoding="utf-8")
+                write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
 
 
 def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
@@ -593,11 +558,11 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     script_env = {**env, "PATH": HARNESS_PATH}
     setup = subprocess.run([BASH, str(scenario / "setup.sh"), str(work), str(run)],
                            env=script_env, capture_output=True, text=True)
-    (run / "setup.log").write_text(setup.stdout + setup.stderr, encoding="utf-8")
+    write_run_file(run, "setup.log", setup.stdout + setup.stderr)
     verdict = {"arm": arm, "run": idx, "config": provenance, "resume_key": key}
     if setup.returncode != 0:
         verdict.update(verdict="INCONCLUSIVE", why=f"setup.sh exit {setup.returncode}")
-        (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
+        write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
         return verdict
     prompt = (scenario / "prompt.md").read_text(encoding="utf-8")
     argv = [args.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
@@ -626,14 +591,13 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         code = 124
         stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = f"timeout after {args.timeout}s"
-    (run / "transcript.jsonl").write_text(stdout, encoding="utf-8")
-    (run / "stderr.txt").write_text(stderr, encoding="utf-8")
+    write_run_file(run, "transcript.jsonl", stdout)
+    write_run_file(run, "stderr.txt", stderr)
     events = events_of(stdout)
     final = final_text(events)
     res = result_event(events)
-    (run / "final.txt").write_text(final, encoding="utf-8")
-    (run / "commands.txt").write_text("\n".join(bash_commands(events)) + "\n",
-                                      encoding="utf-8")
+    write_run_file(run, "final.txt", final)
+    write_run_file(run, "commands.txt", "\n".join(bash_commands(events)) + "\n")
     verdict.update(seconds=round(time.monotonic() - t0, 1),
                    cost_usd=res.get("total_cost_usd"), exit=code)
     if code != 0 or res.get("is_error") or not final.strip():
@@ -647,7 +611,7 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     else:
         chk = subprocess.run([BASH, str(scenario / "check.sh"), str(run)],
                              env=script_env, capture_output=True, text=True)
-        (run / "check.log").write_text(chk.stdout + chk.stderr, encoding="utf-8")
+        write_run_file(run, "check.log", chk.stdout + chk.stderr)
         why = (chk.stdout.strip().splitlines() or [""])[-1][:300]
         outcome = {0: "PASS", 1: "FAIL"}.get(chk.returncode, "INCONCLUSIVE")
         # A FAIL always carries its reason, because every grader prints one
@@ -660,7 +624,7 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             why = "grader exited 1 without a verdict; see check.log"
         verdict["verdict"] = outcome
         verdict["why"] = why
-    (run / "verdict.json").write_text(json.dumps(verdict, indent=2), encoding="utf-8")
+    write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
     return verdict
 
 
@@ -714,8 +678,7 @@ def cmd_run(args) -> int:
                 try:
                     fault = out / name / str(i)
                     fault.mkdir(parents=True, exist_ok=True)
-                    (fault / "verdict.json").write_text(
-                        json.dumps(v, indent=2), encoding="utf-8")
+                    write_run_file(fault, "verdict.json", json.dumps(v, indent=2))
                 except OSError:
                     pass  # the in-memory verdict still reaches the summary
             verdicts.append(v)
@@ -756,7 +719,7 @@ def main() -> int:
         print(stage(args.config, pathlib.Path(args.home).resolve()))
         return 0
     if args.cmd == "scrub":
-        errors = scrub_tree(pathlib.Path(args.dir))
+        errors = scrub_dir(pathlib.Path(args.dir))
         print("\n".join(errors), file=sys.stderr)
         return 1 if errors else 0
     return cmd_run(args)

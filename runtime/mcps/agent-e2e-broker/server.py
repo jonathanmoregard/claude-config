@@ -511,7 +511,7 @@ def _scrub_runs(runs: Path) -> str:
     """Strip account material from every run dir under RUNS. The unit is
     SIGKILLed on cancel and RuntimeMaxSec, which skips the harness's own
     per-run scrub. Returns an error report, or "" when clean; never raises."""
-    if not runs.is_dir():
+    if not os.path.lexists(runs):  # a link planted here is scrub's to refuse
         return ""
     try:
         p = subprocess.run([sys.executable, "-I", str(SCRUBBER), "scrub", str(runs)],
@@ -522,6 +522,33 @@ def _scrub_runs(runs: Path) -> str:
     if p.returncode != 0:
         return f"{TAG} scrub of {runs} incomplete (exit {p.returncode}):\n{p.stderr.strip()}"
     return ""
+
+
+def _unit_settled(policy: dict, unit: str) -> bool:
+    """Whether UNIT is gone or stopped for good; anything else may still write."""
+    systemctl = shutil.which("systemctl", path=":".join(policy["path"]))
+    if not systemctl:
+        return False
+    try:
+        p = subprocess.run([systemctl, "--user", "show", "-p", "ActiveState", "--value",
+                            f"{unit}.service"], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0 and p.stdout.strip() in ("inactive", "failed")
+
+
+def _scrub_settled(policy: dict, campaigns: Path) -> str:
+    """Scrub every campaign whose unit has stopped. A broker that exits
+    mid-campaign takes its unit down (pdeathsig) before its own post-unit
+    scrub runs; the next campaign on any broker catches that one here."""
+    reports = []
+    for entry in os.scandir(campaigns):
+        if entry.is_dir(follow_symlinks=False) and _unit_settled(policy, UNIT_PREFIX + entry.name):
+            report = _scrub_runs(Path(entry.path) / "out" / "runs")
+            if report:
+                reports.append(report)
+    return "\n".join(reports)
 
 
 def _launch(argv: list[str], env: dict, lock_fd: int) -> subprocess.Popen:
@@ -670,6 +697,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 _check_cancel(policy)   # before the local, unbounded prune
                 campaigns = _private_dir(policy["campaigns"])
                 _prune(campaigns)
+                swept = _scrub_settled(policy, campaigns)
                 stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
                 campaign = Path(tempfile.mkdtemp(prefix=f"{stamp}-{req['scenario']}-{new[:8]}-",
                                                  dir=campaigns))
@@ -706,7 +734,8 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
         finally:
             scrubbed = _scrub_runs(out / "runs")
             shutil.rmtree(campaign / "harness", ignore_errors=True)
-        stderr = "\n".join(part for part in (stderr.rstrip(), client.strip(), scrubbed) if part)
+        stderr = "\n".join(part for part in (stderr.rstrip(), client.strip(), swept, scrubbed)
+                           if part)
     finally:
         os.close(lock)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "

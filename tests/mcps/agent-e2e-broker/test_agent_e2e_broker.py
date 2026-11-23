@@ -188,27 +188,74 @@ class Fixture(unittest.TestCase):
 
 
 class ScrubRunsTests(unittest.TestCase):
-    """The broker scrubs every run after the unit ends: a SIGKILLed unit
-    (cancel, RuntimeMaxSec) never reaches the harness's own per-run scrub."""
+    """The broker scrubs campaign runs itself: a SIGKILLed unit (cancel,
+    RuntimeMaxSec, a broker that exits) never reaches the harness's own scrub."""
+
+    def _run_tree(self, runs: Path) -> Path:
+        home = runs / "sc/new/1/home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude.json").write_text("s\n")
+        (home / ".claude/.credentials.json").symlink_to("/etc/hostname")
+        (home / "notes.md").write_text("keep\n")
+        return home
 
     def test_scrubber_is_the_deployed_harness(self) -> None:
         self.assertEqual(load_server().SCRUBBER.resolve(), HARNESS.resolve())
 
     def test_scrubs_runs_a_killed_unit_left(self) -> None:
-        server = load_server()
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp) / "runs/sc/new/1/home"
-            (home.parent / "work").mkdir(parents=True)
-            (home / ".claude").mkdir(parents=True)
-            (home / ".claude.json").write_text("s\n")
-            (home / ".claude/.credentials.json").symlink_to("/etc/hostname")
-            (home / "notes.md").write_text("keep\n")
-            self.assertEqual(server._scrub_runs(Path(tmp) / "runs"), "")
+            home = self._run_tree(Path(tmp) / "runs")
+            self.assertEqual(load_server()._scrub_runs(Path(tmp) / "runs"), "")
             self.assertEqual(sorted(p.name for p in home.rglob("*")), [".claude", "notes.md"])
 
     def test_missing_runs_dir_is_not_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(load_server()._scrub_runs(Path(tmp) / "runs"), "")
+
+    def test_a_link_at_runs_is_refused_not_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "decoy")
+            (Path(tmp) / "runs").symlink_to(Path(tmp) / "decoy")
+            self.assertIn("incomplete", load_server()._scrub_runs(Path(tmp) / "runs"))
+            self.assertTrue((home / ".claude.json").is_file())
+
+    def test_sweep_scrubs_only_campaigns_whose_unit_stopped(self) -> None:
+        server = load_server()
+        server._unit_settled = lambda policy, unit: unit.endswith("-done")
+        with tempfile.TemporaryDirectory() as tmp:
+            done = self._run_tree(Path(tmp) / "c-done/out/runs")
+            live = self._run_tree(Path(tmp) / "c-live/out/runs")
+            self.assertEqual(server._scrub_settled({}, Path(tmp)), "")
+            self.assertFalse((done / ".claude.json").exists())
+            self.assertTrue((live / ".claude.json").is_file())
+
+
+class KilledCampaignTests(Fixture):
+    def test_a_campaign_killed_mid_run_is_scrubbed_by_the_broker(self) -> None:
+        # The stub plants account material in its staged HOME and hangs; the
+        # campaign is then stopped the way a cancel stops it (SIGTERM to the
+        # supervisor, which stops the unit with SIGKILL), so the harness's own
+        # per-run scrub never runs. Only the broker's scrub can remove it.
+        require_units(self)
+        require_sandbox(self)
+        self.claude.write_text("#!/usr/bin/env bash\necho s > \"$HOME/.claude.json\"\n"
+                               "touch \"$E2E_RUN/planted\"\nsleep 300\n")
+        rec = self.server._InFlight()
+
+        def stop_once_planted() -> None:
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if rec.proc is not None and list(self.out.glob("*/out/runs/*/*/*/planted")):
+                    os.killpg(rec.proc.pid, signal.SIGTERM)
+                    return
+                time.sleep(0.5)
+
+        import signal
+        import threading
+        threading.Thread(target=stop_once_planted, daemon=True).start()
+        self.server._tool_run(self.req(n=1), rec)
+        self.assertTrue(list(self.out.glob("*/out/runs/*/*/*/planted")), "stub never ran")
+        self.assertEqual(list(self.out.glob("*/out/runs/**/.claude.json")), [])
 
 
 class ValidationTests(Fixture):
