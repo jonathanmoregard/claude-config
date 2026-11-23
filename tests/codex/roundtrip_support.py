@@ -229,6 +229,12 @@ class RoundTrip:
     def check(self) -> subprocess.CompletedProcess[str]:
         return self.run("check.py")
 
+    def render_unchecked(self) -> None:
+        """Publish the render without the check: what a failed sync rolled
+        back, for a test that names the files its check reported."""
+        result = self.run("render_codex.py")
+        assert result.returncode == 0, describe(result)
+
     def sync_ok(self) -> None:
         result = self.sync()
         assert result.returncode == 0, describe(result)

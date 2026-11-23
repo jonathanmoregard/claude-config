@@ -156,6 +156,58 @@ def test_unsupported_budget_keys_are_rejected() -> None:
         assert f"unsupported budget setting {key} must not be generated" in errors_after(edit)
 
 
+def test_profile_layer_with_only_harmless_keys_passes() -> None:
+    # `codex --profile p` layers ~/.codex/p.config.toml over config.toml.
+    # Keys that cannot widen the session, and a server edit that keeps the
+    # floors (tables merge key by key), are the profile's business.
+    harmless = {
+        "model": "gpt-5",
+        "model_reasoning_effort": "low",
+        "skills": {"max_context_tokens": 5440},
+        "mcp_servers": {"git_broker": {"env": {"A": "1"}}, "memory": {"args": ["--x"]}},
+    }
+    assert check.profile_invariant_errors(safe_config(), harmless) == []
+
+
+def test_profile_layer_cannot_loosen_the_floors_of_config_toml() -> None:
+    # Codex 0.161.0 merges a profile's tables into config.toml's key by key
+    # and replaces every other value, arrays included (`codex --profile p mcp
+    # get` shows both), so each floor holds on the merged config.
+    cases = [
+        ({"approval_policy": "on-request"}, "approval_policy must be never"),
+        ({"default_permissions": "repos_readonly"}, "default_permissions must be repos_dev"),
+        ({"sandbox_mode": "danger-full-access"}, "legacy sandbox_mode must be absent"),
+        ({"approvals_reviewer": "auto_review"}, "legacy approvals_reviewer must be absent"),
+        # arftl-allow: permission-widened (a profile layer the check must reject)
+        ({"permissions": {"repos_dev": {}}}, "repos_dev must be absent from user config"),
+        ({"features": {"hooks": False}}, "features.hooks must be true"),
+        ({"mcp_servers": {"git_broker": {"required": False}}}, "git_broker must be required"),
+        ({"mcp_servers": {"git_broker": {"disabled_tools": []}}}, "generic exec tool"),
+        ({"mcp_servers": {"git_broker": {"enabled_tools": ["exec"]}}}, "generic exec tool"),
+        (
+            {"mcp_servers": {"github": {"disabled_tools": ["delete_file"]}}},
+            "mcp_servers.github: GitHub server must disable",
+        ),
+        (
+            {"mcp_servers": {"github_new_owner": {"command": "gh-mcp"}}},
+            "mcp_servers.github_new_owner: GitHub server must disable",
+        ),
+        ({"apps": {CONNECTOR: {"enabled": True}}}, "built-in GitHub connector must be disabled"),
+    ]
+    for profile, expected in cases:
+        errors = check.profile_invariant_errors(safe_config(), profile)
+        assert any(expected in error for error in errors), (profile, expected, errors)
+
+
+def test_profile_layer_is_not_blamed_for_what_config_toml_breaks() -> None:
+    # config.toml's own findings are reported against config.toml.
+    base = safe_config()
+    base["approval_policy"] = "on-request"
+    assert check.profile_invariant_errors(base, {"model": "gpt-5"}) == []
+    assert check.profile_invariant_errors(None, {"model": "gpt-5"}) == []
+    assert check.profile_invariant_errors(None, {"approval_policy": "never"}) == []
+
+
 def test_rules_reject_persisted_allow_in_direct_calls() -> None:
     allowed = [
         'prefix_rule(pattern=["python3"])\n',
@@ -348,6 +400,9 @@ if __name__ == "__main__":
     test_every_github_server_keeps_the_exclusion_floor()
     test_builtin_github_connector_must_stay_disabled()
     test_unsupported_budget_keys_are_rejected()
+    test_profile_layer_with_only_harmless_keys_passes()
+    test_profile_layer_cannot_loosen_the_floors_of_config_toml()
+    test_profile_layer_is_not_blamed_for_what_config_toml_breaks()
     test_rules_reject_persisted_allow_in_direct_calls()
     test_rules_reject_prefix_rule_references_that_are_not_direct_calls()
     test_rules_fail_closed_on_unknown_decisions_and_syntax()

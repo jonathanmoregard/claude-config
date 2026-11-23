@@ -2907,12 +2907,14 @@ def render_plan_drift(plan: RenderPlan) -> list[str]:
     return errors
 
 
-def main() -> int:
+def load_render_plan() -> RenderPlan:
     manifest = load_json(MANIFEST, {})
     if not manifest:
         raise SystemExit(f"missing manifest; run {REPO / 'scripts' / 'import_claude.py'}")
-    support = load_support()
-    plan = prepare_render_plan(manifest, support)
+    return prepare_render_plan(manifest, load_support())
+
+
+def publish(plan: RenderPlan) -> None:
     publish_render_plan(plan)
     print(
         "rendered Codex: "
@@ -2921,6 +2923,10 @@ def main() -> int:
         f"agents={len(plan.agents)} "
         f"mcp={len(plan.mcp)}"
     )
+
+
+def main() -> int:
+    publish(load_render_plan())
     return 0
 
 

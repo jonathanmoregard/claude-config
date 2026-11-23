@@ -183,6 +183,17 @@ def plugin_mcp_invariant_errors(document: object) -> list[str]:
 
 def config_invariant_errors(config: dict[str, Any]) -> list[str]:
     """Safety properties of a parsed config.toml, independent of the renderer."""
+    errors = config_authority_errors(config)
+    errors.extend(
+        f"unsupported budget setting {key} must not be generated"
+        for key in unsupported_budget_config_keys(config)
+    )
+    return errors
+
+
+def config_authority_errors(config: dict[str, Any]) -> list[str]:
+    """The floors on what a config can let a session do: every config
+    invariant but the render's own hygiene."""
     errors: list[str] = []
     for key in LEGACY_SANDBOX_KEYS:
         if key in config:
@@ -210,12 +221,49 @@ def config_invariant_errors(config: dict[str, Any]) -> list[str]:
     app = apps.get(BUILTIN_GITHUB_CONNECTOR_APP_ID) if isinstance(apps, dict) else None
     if not isinstance(app, dict) or app.get("enabled") is not False:
         errors.append("built-in GitHub connector must be disabled")
-
-    errors.extend(
-        f"unsupported budget setting {key} must not be generated"
-        for key in unsupported_budget_config_keys(config)
-    )
     return errors
+
+
+def layered_config(base: dict[str, Any], layer: dict[str, Any]) -> dict[str, Any]:
+    """base with layer on top, as Codex 0.161.0 layers config files: tables
+    merge key by key, any other value (an array included) replaces."""
+    merged = dict(base)
+    for key, value in layer.items():
+        below = merged.get(key)
+        if isinstance(below, dict) and isinstance(value, dict):
+            merged[key] = layered_config(below, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def profile_paths() -> list[Path]:
+    """Every file `codex --profile <name>` can layer over config.toml.
+
+    Codex 0.161.0 reads $CODEX_HOME/<name>.config.toml and nothing else: the
+    name must be plain (no `/`, no leading `.`), so none is nested, and a
+    `.codex/<name>.config.toml` in a project is not read. A missing file is
+    no layer. The glob is a superset of the names Codex accepts.
+    """
+    return sorted(path for path in CODEX.glob("*.config.toml") if path.is_file())
+
+
+def profile_invariant_errors(
+    base: dict[str, Any] | None, profile: dict[str, Any]
+) -> list[str]:
+    """The config.toml floors that only the profile layer breaks.
+
+    A profile file is outside the mirror, so only what can widen a session is
+    floored: harmless keys (model, reasoning effort, ...) pass. A finding
+    config.toml already has is reported against config.toml, not here.
+    """
+    base = base if base is not None else {}
+    inherited = set(config_authority_errors(base))
+    return [
+        error
+        for error in config_authority_errors(layered_config(base, profile))
+        if error not in inherited
+    ]
 
 
 def agent_role_invariant_errors(role: dict[str, Any]) -> list[str]:
@@ -635,7 +683,18 @@ def output_invariant_errors() -> list[str]:
     config = read_toml(config_path, errors)
     if config is not None:
         errors.extend(f"{config_path}: {error}" for error in config_invariant_errors(config))
-    for role_path in agent_role_paths(config):
+    role_paths = set(agent_role_paths(config))
+    # Profile layers sit outside the mirror: the sync neither writes nor
+    # removes them, so a loosening one fails every check until a human acts.
+    for profile_path in profile_paths():
+        profile = read_toml(profile_path, errors)
+        if profile is None:
+            continue
+        errors.extend(
+            f"{profile_path}: {error}" for error in profile_invariant_errors(config, profile)
+        )
+        role_paths.update(agent_role_paths(layered_config(config or {}, profile)))
+    for role_path in sorted(role_paths):
         role = read_toml(role_path, errors)
         if role is not None:
             errors.extend(

@@ -158,15 +158,23 @@ def test_a_candidate_hook_disabled_under_codex_fails_the_sync() -> None:
         result = rt.sync()
         assert result.returncode == 1, describe(result)
         assert "ai-client-config check FAILED" in result.stdout, describe(result)
+        suffix = ": hook wrapper contains the blanket disable guard"
         wrappers = sorted(
-            path
-            for path in (rt.codex / "hooks").rglob("*.sh")
-            if check.HOOK_DISABLE_GUARD in path.read_text(encoding="utf-8")
+            Path(line[2 : -len(suffix)])
+            for line in result.stdout.splitlines()
+            if line.startswith("- ") and line.endswith(suffix)
         )
-        assert wrappers, f"no rendered wrapper carries the guard\n{describe(result)}"
+        assert wrappers, f"check named no guarded wrapper\n{describe(result)}"
+        hooks_root = rt.codex / "hooks"
         for wrapper in wrappers:
-            line = f"- {wrapper}: hook wrapper contains the blanket disable guard"
-            assert line in result.stdout.splitlines(), f"missing {line!r}\n{describe(result)}"
+            assert wrapper.is_relative_to(hooks_root), f"{wrapper} outside {hooks_root}"
+            # The failed check rolled the run back, so the guarded wrapper it
+            # rendered must not be left published.
+            assert not wrapper.exists(), f"{wrapper} still published after rollback"
+        assert not any(
+            check.HOOK_DISABLE_GUARD in path.read_text(encoding="utf-8")
+            for path in hooks_root.rglob("*.sh")
+        ), f"a guarded wrapper survived the rollback\n{describe(result)}"
 
 
 if __name__ == "__main__":

@@ -1037,7 +1037,9 @@ def test_nested_allow_fails_closed_with_an_actionable_message() -> None:
         )
         for _ in range(2):
             result = rt.sync()
-            # As published: the render may reflow the text around its block.
+            # As rendered: the render may reflow the text around its block,
+            # and the failed sync rolled its output back.
+            rt.render_unchecked()
             line = rules.read_text(encoding="utf-8").splitlines().index(
                 '    prefix_rule(pattern=["sh"], decision="allow")'
             ) + 1
@@ -1137,7 +1139,10 @@ def test_hook_command_invariants_read_the_generated_wrappers() -> None:
     guarded = '[ -n "${CODEX_CLAUDE_MIRROR_ENABLE_HOOKS:-}" ] || exit 0; echo stopped'
     inputs = Inputs(hooks={"Stop": [{"hooks": [{"type": "command", "command": guarded}]}]})
     with round_trip(inputs, synced=False) as rt:
-        for result in (rt.sync(), rt.sync()):
+        results = (rt.sync(), rt.sync())
+        # The failed syncs rolled their output back; name what they checked.
+        rt.render_unchecked()
+        for result in results:
             assert result.returncode == 1, describe(result)
             wrapper = next(
                 path
@@ -1246,6 +1251,8 @@ def test_a_claude_matcher_the_fan_out_cannot_compile_fails_the_sync() -> None:
     with round_trip(Inputs(hooks=hooks), synced=False) as rt:
         result = rt.sync()
         assert result.returncode == 1, describe(result)
+        # The failed sync rolled its output back; name what it checked.
+        rt.render_unchecked()
         plan = next(
             path for path in hook_generation_files(rt) if path.name.startswith("pretooluse-plan-")
         )
@@ -1350,6 +1357,80 @@ def test_agent_role_files_cannot_loosen_the_session() -> None:
         )
         assert_check_fails(rt, f"{outside}: approval_policy must be absent or never")
         rt.sync_ok()
+
+
+def test_profile_config_files_cannot_loosen_the_session() -> None:
+    # `codex --profile <name>` layers ~/.codex/<name>.config.toml over
+    # config.toml; with approval_policy = "on-request" there, `codex debug
+    # prompt-input` shows the escalation instructions. Such a file is outside
+    # the mirror, so the sync neither renders nor removes it; the check floors
+    # what it can loosen and names it.
+    with round_trip() as rt:
+        loose = rt.codex / "p.config.toml"
+        loose.write_text('approval_policy = "on-request"\n', encoding="utf-8")
+        harmless = rt.codex / "work.config.toml"
+        harmless.write_text('model = "gpt-5"\nmodel_reasoning_effort = "low"\n', encoding="utf-8")
+        # A profile can point an agent role at a file the check must read too.
+        outside = rt.home / "role.toml"
+        outside.write_text('name = "x"\napproval_policy = "on-request"\n', encoding="utf-8")
+        roles = rt.codex / "roles.config.toml"
+        roles.write_text(f'[agents.reviewer]\nconfig_file = "{outside}"\n', encoding="utf-8")
+        # Not a file Codex can load as a layer.
+        (rt.codex / "dir.config.toml").mkdir()
+
+        result = assert_check_fails(
+            rt,
+            f"{loose}: approval_policy must be never",
+            f"{outside}: approval_policy must be absent or never",
+        )
+        assert str(harmless) not in result.stdout, describe(result)
+        assert "dir.config.toml" not in result.stdout, describe(result)
+
+        loose.write_text('approval_policy = "never"\n', encoding="utf-8")
+        outside.write_text('name = "x"\n', encoding="utf-8")
+        rt.sync_ok()
+        assert loose.read_text(encoding="utf-8") == 'approval_policy = "never"\n'
+        assert harmless.exists() and roles.exists()
+
+
+def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
+    # Production checks a staged home and publishes only what passed; a
+    # direct run publishes in place, so a failed check must undo the publish.
+    # The importer's manifest, under the repository, is the one thing the
+    # run changes.
+    with round_trip() as rt:
+        # Give the publish something to do: a new Claude skill, and drift in
+        # the managed paths, config.toml included.
+        skill = rt.home / ".claude" / "skills" / "new-skill" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            "---\nname: new-skill\ndescription: Use when testing rollback.\n---\n",
+            encoding="utf-8",
+        )
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        (rt.codex / "hooks.json").unlink()
+        (rt.codex / "rules" / "extra.rules").write_text("# unplanned\n", encoding="utf-8")
+        rt.edit_config(lambda config: config.pop("features"))
+        # The check fails on a file outside the mirror, which no publish fixes.
+        profile = rt.codex / "p.config.toml"
+        profile.write_text('approval_policy = "on-request"\n', encoding="utf-8")
+        before = snapshot(rt.home, ("",))
+        manifest = rt.manifest.read_bytes()
+
+        result = rt.sync()
+        assert result.returncode == 1, describe(result)
+        assert "ai-client-config check FAILED" in result.stdout, describe(result)
+        assert f"{profile}: approval_policy must be never" in result.stdout, describe(result)
+        after = snapshot(rt.home, ("",))
+        changed = sorted(
+            key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
+        )
+        assert changed == [], changed
+        assert rt.manifest.read_bytes() != manifest
+
+        profile.unlink()
+        rt.sync_ok()
+        assert (rt.codex / "skills" / "new-skill" / "SKILL.md").is_file()
 
 
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
@@ -1581,6 +1662,8 @@ if __name__ == "__main__":
     test_mcp_floors_hold_in_the_plugin_mcp_json_too()
     test_invariants_reject_a_json_document_that_is_not_an_object()
     test_agent_role_files_cannot_loosen_the_session()
+    test_profile_config_files_cannot_loosen_the_session()
+    test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()
