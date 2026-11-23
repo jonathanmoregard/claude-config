@@ -187,6 +187,30 @@ class Fixture(unittest.TestCase):
                 "model": "haiku", **over}
 
 
+class ScrubRunsTests(unittest.TestCase):
+    """The broker scrubs every run after the unit ends: a SIGKILLed unit
+    (cancel, RuntimeMaxSec) never reaches the harness's own per-run scrub."""
+
+    def test_scrubber_is_the_deployed_harness(self) -> None:
+        self.assertEqual(load_server().SCRUBBER.resolve(), HARNESS.resolve())
+
+    def test_scrubs_runs_a_killed_unit_left(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "runs/sc/new/1/home"
+            (home.parent / "work").mkdir(parents=True)
+            (home / ".claude").mkdir(parents=True)
+            (home / ".claude.json").write_text("s\n")
+            (home / ".claude/.credentials.json").symlink_to("/etc/hostname")
+            (home / "notes.md").write_text("keep\n")
+            self.assertEqual(server._scrub_runs(Path(tmp) / "runs"), "")
+            self.assertEqual(sorted(p.name for p in home.rglob("*")), [".claude", "notes.md"])
+
+    def test_missing_runs_dir_is_not_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(load_server()._scrub_runs(Path(tmp) / "runs"), "")
+
+
 class ValidationTests(Fixture):
     def test_rejects_unknown_fields_and_bad_values(self) -> None:
         bad = [

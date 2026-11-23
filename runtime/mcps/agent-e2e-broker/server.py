@@ -502,6 +502,28 @@ def _supervised(argv: list[str], policy: dict, campaign: Path, runtime: int) -> 
             tools["python3"], "-I", "-c", _SCOPE_ABSTRACT_SOCKETS, *argv]
 
 
+# The deployed harness beside this server, not the campaign's master checkout:
+# `scrub` must exist whenever this code does, and that checkout is deleted.
+SCRUBBER = HERE.parents[1] / "scripts/agent-e2e/agent_e2e.py"
+
+
+def _scrub_runs(runs: Path) -> str:
+    """Strip account material from every run dir under RUNS. The unit is
+    SIGKILLed on cancel and RuntimeMaxSec, which skips the harness's own
+    per-run scrub. Returns an error report, or "" when clean; never raises."""
+    if not runs.is_dir():
+        return ""
+    try:
+        p = subprocess.run([sys.executable, "-I", str(SCRUBBER), "scrub", str(runs)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=600)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{TAG} scrub of {runs} failed: {exc!r}"
+    if p.returncode != 0:
+        return f"{TAG} scrub of {runs} incomplete (exit {p.returncode}):\n{p.stderr.strip()}"
+    return ""
+
+
 def _launch(argv: list[str], env: dict, lock_fd: int) -> subprocess.Popen:
     return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
@@ -677,12 +699,14 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             if campaign is not None:
                 shutil.rmtree(campaign, ignore_errors=True)
             raise
+        scrubbed = ""
         try:
             rc, _, client = _run_argv(proc, req["call_timeout"] + 60, rec)
             stdout, stderr = (_read_beneath(campaign, name) for name in ("harness.out", "harness.err"))
-            stderr = "\n".join(part for part in (stderr.rstrip(), client.strip()) if part)
         finally:
+            scrubbed = _scrub_runs(out / "runs")
             shutil.rmtree(campaign / "harness", ignore_errors=True)
+        stderr = "\n".join(part for part in (stderr.rstrip(), client.strip(), scrubbed) if part)
     finally:
         os.close(lock)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "

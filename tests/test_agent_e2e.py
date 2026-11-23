@@ -265,16 +265,32 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 
 _SECRETS = (".claude.json", ".claude.json.backup", ".claude/backups/.claude.json.backup.1",
-            ".ssh/id_x", ".codex/auth.json")
+            ".ssh/id_x", ".codex/auth.json", ".claude/.credentials.json")
+# Plants every secret in $HOME. The credentials entry is a link to the REAL
+# file, so it is removed first: writing through it would overwrite the real one.
+# A token refresh leaves it a regular file, which is what this plants.
+_PLANT = "\n".join(
+    ['rm -f "$HOME/.claude/.credentials.json"']
+    + [f'mkdir -p "$(dirname "$HOME/{rel}")"; echo s > "$HOME/{rel}"' for rel in _SECRETS]
+    + ['ln -s / "$HOME/.local-root"', 'ln -s /etc/hostname "$HOME/.claude/out-link"'])
 
 
 def _assert_home_scrubbed(home: pathlib.Path):
-    left = [rel for rel in _SECRETS if (home / rel).exists()]
+    left = [rel for rel in _SECRETS if (home / rel).exists() or (home / rel).is_symlink()]
     assert not left, f"retained after the run: {left}"
-    run = home.parent.resolve()
-    links = [str(p.relative_to(home)) for p in home.rglob("*")
-             if p.is_symlink() and not p.resolve().is_relative_to(run)]
-    assert not links, f"links out of the run dir retained: {links}"
+    links = [str(p.relative_to(home)) for p in home.rglob("*") if p.is_symlink()]
+    assert not links, f"links retained: {links}"
+
+
+def _decoy(path: pathlib.Path) -> list[pathlib.Path]:
+    """Files outside every run dir that a scrub following links would delete."""
+    files = [path / ".ssh/id", path / ".claude/backups/b", path / ".claude.json",
+             path / "backups/b", path / ".credentials.json", path / "plugins/p"]
+    for f in files:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("keep\n")
+    (path / "lnk").symlink_to("/etc/hostname")
+    return [*files, path / "lnk"]
 
 
 def test_retained_home_is_scrubbed_after_check_but_state_survives(tmp_path):
@@ -282,9 +298,7 @@ def test_retained_home_is_scrubbed_after_check_but_state_survives(tmp_path):
     # staged HOME carries links into the real HOME plus account files the CLI
     # writes there. check.sh must still see them; nothing after it may.
     _require_sandbox()
-    writes = "\n".join(f'mkdir -p "$(dirname "$HOME/{rel}")"; echo s > "$HOME/{rel}"'
-                       for rel in _SECRETS)
-    claude = fake_claude(tmp_path, f"""{writes}
+    claude = fake_claude(tmp_path, f"""{_PLANT}
 mkdir -p "$HOME/.local/state/n"; echo row > "$HOME/.local/state/n/ledger.tsv"
 cat <<'EOF'
 {stream("ok", [])}
@@ -303,10 +317,67 @@ EOF
 def test_home_is_scrubbed_when_setup_fails(tmp_path):
     claude = fake_claude(tmp_path, "exit 0\n")
     sc = _scenario(tmp_path, "exit 0")
-    (sc / "setup.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (sc / "setup.sh").write_text(f"#!/usr/bin/env bash\n{_PLANT}\nexit 1\n")
     _, out, verdicts = _run(tmp_path, sc, claude)
     assert verdicts[0]["verdict"] == "INCONCLUSIVE"
     _assert_home_scrubbed(out / "sc/new/1/home")
+
+
+@pytest.mark.parametrize("swap", [
+    'cd /; mv "$HOME" "$E2E_RUN/h2"; ln -s {decoy} "$E2E_RUN/home"',
+    'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"',
+    'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"',
+])
+def test_scrub_never_follows_a_link_the_run_planted(tmp_path, swap):
+    # The scrub runs outside the sandbox on a tree the run could rewrite: a
+    # link swapped in for HOME or a directory in it must not aim its deletes.
+    decoy = tmp_path / "decoy"
+    kept = _decoy(decoy)
+    claude = fake_claude(tmp_path, swap.format(decoy=decoy)
+                         + f"\ncat <<'EOF'\n{stream('ok', [])}\nEOF\n")
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    assert verdicts[0]["verdict"] == "PASS"
+    gone = [str(p) for p in kept if not (p.exists() or p.is_symlink())]
+    assert not gone, f"scrub deleted outside the run dir: {gone}"
+    assert not (out / "sc/new/1/home").is_symlink()
+
+
+def test_a_failed_scrub_item_keeps_the_verdict_and_the_rest_of_the_scrub(tmp_path):
+    claude = fake_claude(tmp_path, f"""{_PLANT}
+mkdir -p "$HOME/.ssh/locked"; touch "$HOME/.ssh/locked/f"; chmod 000 "$HOME/.ssh/locked"
+cat <<'EOF'
+{stream("ok", [])}
+EOF
+""")
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    run = out / "sc/new/1"
+    try:
+        assert verdicts[0]["verdict"] == "PASS"
+        assert any(".ssh" in e for e in verdicts[0]["scrub_errors"])
+        assert not (run / "home/.claude.json").exists()
+        assert not (run / "home/.claude/.credentials.json").exists()
+        assert not [p for p in (run / "home").rglob("*") if p.is_symlink()]
+    finally:
+        locked = run / "home/.ssh/locked"
+        if locked.exists():
+            locked.chmod(0o700)
+
+
+def test_scrub_subcommand_cleans_runs_a_killed_harness_left(tmp_path):
+    # A SIGKILLed harness never reaches run_one's finally; the broker runs
+    # `scrub` over the output dir after every campaign instead.
+    homes = [tmp_path / "out/sc/old/1/home", tmp_path / "out/sc/final/2/home"]
+    for home in homes:
+        (home.parent / "work").mkdir(parents=True)
+        (home / ".claude/backups").mkdir(parents=True)
+        (home / ".claude.json").write_text("s\n")
+        (home / ".claude/backups/b").write_text("s\n")
+        (home / ".claude/.credentials.json").symlink_to("/etc/hostname")
+        (home / "notes.md").write_text("keep\n")
+    r = harness("scrub", str(tmp_path / "out"))
+    assert r.returncode == 0, r.stderr
+    for home in homes:
+        assert sorted(str(p.relative_to(home)) for p in home.rglob("*")) == [".claude", "notes.md"]
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):

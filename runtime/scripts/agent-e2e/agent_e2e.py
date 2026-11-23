@@ -63,6 +63,7 @@ import pathlib
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -250,38 +251,107 @@ def stage(src: str, home: pathlib.Path) -> str:
     return provenance
 
 
-# Account material the CLI and tools write into a staged HOME during a run.
-# A retained run dir is read by reviewers, so it must not keep these.
-HOME_SECRETS = (".claude/backups", ".ssh", ".codex")
+# Account material in a staged HOME: what stage() links in, whatever type the
+# run left it as (a token refresh replaces the credentials link with a real
+# file), plus what the CLI and tools write there. A retained run dir is read
+# by reviewers, so it must not keep any of it.
+HOME_SECRETS = (*LINKS, ".claude/backups", ".ssh", ".codex")
+_DIR_NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def scrub_home(home: pathlib.Path) -> None:
-    """Strip a finished run's HOME of account material and of links out of
-    the run dir, keeping the rest (ledgers, notes, transcripts) for review.
+def _remove_at(dir_fd: int, name: str) -> None:
+    """Remove NAME in DIR_FD; a link is removed itself, never followed."""
+    if stat.S_ISDIR(os.lstat(name, dir_fd=dir_fd).st_mode):
+        shutil.rmtree(name, dir_fd=dir_fd)
+    else:
+        os.unlink(name, dir_fd=dir_fd)
 
-    Runs after check.sh, which may still need all of it. Read denies cannot
-    stand in for this: Bash reads past them, and a run dir can sit anywhere.
+
+def _open_beneath(dir_fd: int, rel: str) -> int | None:
+    """Open directory REL under DIR_FD without following any link in it."""
+    fd = os.dup(dir_fd)
+    for part in filter(None, rel.split("/")):
+        try:
+            nxt = os.open(part, _DIR_NOFOLLOW, dir_fd=fd)
+        except OSError:  # missing, or a link: the link sweep removes that
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = nxt
+    return fd
+
+
+def scrub_home(home: pathlib.Path) -> list[str]:
+    """Strip a finished run's HOME of account material and of every link,
+    keeping the rest (ledgers, notes, transcripts) for review. Returns the
+    errors; one failed item never stops the others.
+
+    Runs outside the sandbox on a tree the run could rewrite, so nothing here
+    follows a link: every step goes through directory fds opened O_NOFOLLOW.
+    Read denies cannot stand in for this: Bash reads past them, and a run dir
+    can sit under any --out.
     """
-    for rel in LINKS:
-        if (home / rel).is_symlink():
-            (home / rel).unlink()
-    for p in home.glob(".claude.json*"):
-        if p.is_dir() and not p.is_symlink():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
-    for rel in HOME_SECRETS:
-        p = home / rel
-        if p.is_symlink() or p.is_file():
-            p.unlink()
-        elif p.is_dir():
-            shutil.rmtree(p)
-    run = home.parent.resolve()
-    for dirpath, dirnames, filenames in os.walk(home):
-        for name in dirnames + filenames:
-            p = pathlib.Path(dirpath) / name
-            if p.is_symlink() and not p.resolve().is_relative_to(run):
-                p.unlink()
+    errors: list[str] = []
+    try:
+        run_fd = os.open(home.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return errors
+    except OSError as exc:
+        return [f"{home.parent}: {exc}"]
+    try:
+        try:
+            if not stat.S_ISDIR(os.lstat(home.name, dir_fd=run_fd).st_mode):
+                os.unlink(home.name, dir_fd=run_fd)  # a link swapped in for HOME
+                return errors
+            home_fd = os.open(home.name, _DIR_NOFOLLOW, dir_fd=run_fd)
+        except FileNotFoundError:
+            return errors
+        except OSError as exc:
+            return [f"{home}: {exc}"]
+        try:
+            names = [n for n in os.listdir(home_fd) if n.startswith(".claude.json")]
+            for rel in (*HOME_SECRETS, *names):
+                parent, _, name = rel.rpartition("/")
+                fd = _open_beneath(home_fd, parent)
+                if fd is None:
+                    continue
+                try:
+                    _remove_at(fd, name)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    errors.append(f"{home / rel}: {exc}")
+                finally:
+                    os.close(fd)
+            for dirpath, dirnames, filenames, dfd in os.fwalk(
+                    dir_fd=home_fd, follow_symlinks=False,
+                    onerror=lambda exc: errors.append(f"{home}: {exc}")):
+                for name in [*dirnames, *filenames]:
+                    try:
+                        if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
+                            os.unlink(name, dir_fd=dfd)
+                            if name in dirnames:
+                                dirnames.remove(name)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        errors.append(f"{home / dirpath / name}: {exc}")
+        finally:
+            os.close(home_fd)
+    finally:
+        os.close(run_fd)
+    return errors
+
+
+def scrub_tree(root: pathlib.Path) -> list[str]:
+    """scrub_home every run dir (one holding home/ and work/) under ROOT."""
+    errors: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        names = {*dirnames, *filenames}
+        if "home" in names and "work" in names:
+            errors += scrub_home(pathlib.Path(dirpath) / "home")
+            dirnames[:] = [d for d in dirnames if d not in ("home", "work")]
+    return errors
 
 
 def path_guard() -> list[str]:
@@ -452,13 +522,21 @@ def result_event(events: list[dict]) -> dict:
 
 def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             out: pathlib.Path, args) -> dict:
-    """One run, its HOME scrubbed on every way out once check.sh is done."""
+    """One run, its HOME scrubbed on every way out once check.sh is done.
+    A SIGKILLed harness skips this; `scrub` over the output dir covers that."""
+    verdict = None
     try:
-        return _run_one(scenario, arm, src, idx, out, args)
+        verdict = _run_one(scenario, arm, src, idx, out, args)
+        return verdict
     finally:
-        home = out / arm / str(idx) / "home"
-        if home.is_dir():
-            scrub_home(home)
+        run = out / arm / str(idx)
+        errors = scrub_home(run / "home")
+        if errors:
+            print(f"scrub incomplete in {run}:\n  " + "\n  ".join(errors), file=sys.stderr)
+            if verdict is not None:
+                verdict["scrub_errors"] = errors
+                (run / "verdict.json").write_text(json.dumps(verdict, indent=2),
+                                                  encoding="utf-8")
 
 
 def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
@@ -661,10 +739,17 @@ def main() -> int:
     rn.add_argument("--out", default=(f"{nested}/nested-e2e" if nested else
                                       os.environ.get("TMPDIR", "/tmp") + "/agent-e2e"))
     rn.add_argument("--claude", default=shutil.which("claude") or "claude")
+    sc = sub.add_parser("scrub", help="strip account material from every run "
+                        "dir under DIR (runs a killed harness left unscrubbed)")
+    sc.add_argument("dir")
     args = ap.parse_args()
     if args.cmd == "stage":
         print(stage(args.config, pathlib.Path(args.home).resolve()))
         return 0
+    if args.cmd == "scrub":
+        errors = scrub_tree(pathlib.Path(args.dir))
+        print("\n".join(errors), file=sys.stderr)
+        return 1 if errors else 0
     return cmd_run(args)
 
 
