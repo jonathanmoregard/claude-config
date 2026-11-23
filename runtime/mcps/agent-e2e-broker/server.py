@@ -135,10 +135,13 @@ def _load_policy(config: dict) -> dict:
     if any(r == policy["stateDir"] or r in policy["stateDir"].parents for r in roots(home)):
         raise RuntimeError("policy stateDir must lie outside ~/Repos and ~/worktrees")
     policy["mirror"] = policy["stateDir"] / "mirror.git"
-    # The mirror lock serialises git work on the shared mirror and pruning; it is
-    # held only while a campaign is set up. Each running campaign holds one slot.
-    policy["lock"] = policy["stateDir"] / "lock"
-    policy["slots"] = [policy["stateDir"] / f"slot-{i}" for i in range(raw["maxCampaigns"])]
+    # Each running campaign holds one slot. Slot 0 is the pre-slot broker's
+    # single campaign lock, so a broker still running that code in an open
+    # session occupies a slot instead of standing outside the cap. The mirror
+    # lock serialises git work on the shared mirror and pruning during setup.
+    policy["slots"] = [policy["stateDir"] / "lock",
+                       *(policy["stateDir"] / f"slot-{i}" for i in range(1, raw["maxCampaigns"]))]
+    policy["lock"] = policy["stateDir"] / "mirror.lock"
     policy["campaigns"] = policy["stateDir"] / "campaigns"
     policy["readOnlyPaths"] = [canonical(p, home) for p in extra
                                if not isinstance(p, str) or os.path.lexists(p)]
@@ -342,11 +345,18 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
                                 sha, "--", policy["scenarioRoot"]], stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=_git_env(policy, "file"),
                                stdin=subprocess.DEVNULL)
-    tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
-                         capture_output=True, env=_env(policy), timeout=120)
-    archive.stdout.close()
-    if archive.wait(timeout=120) != 0 or tar.returncode != 0:
-        raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
+    # The archive must be gone before the caller frees the mirror lock, on every path.
+    try:
+        tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
+                             capture_output=True, env=_env(policy), timeout=120)
+        archive.stdout.close()
+        if archive.wait(timeout=120) != 0 or tar.returncode != 0:
+            raise RuntimeError(f"could not extract {policy['scenarioRoot']} from {sha}")
+    finally:
+        if archive.poll() is None:
+            archive.kill()
+            archive.wait()
+        archive.stdout.close()
 
 
 # The harness runs in a hardened user unit, because scenario setup.sh and
@@ -588,6 +598,8 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                                  | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
             _extract_scenarios(policy, new, campaign / "scenarios")
             harness = _checkout_harness(policy, master, campaign / "harness")
+            if rec is not None and rec.cancelled:
+                raise RuntimeError("cancelled during campaign setup")
         except BaseException:
             if campaign is not None:
                 shutil.rmtree(campaign / "harness", ignore_errors=True)
@@ -631,7 +643,8 @@ TOOLS = [{
         "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
         "(origin/<branch> or a pushed 40-hex commit). Up to maxCampaigns campaigns run at "
         "once; when every slot is busy the call waits for one to free (up to maxQueueSec, "
-        "not strictly first-come-first-served), then blocks until done (up to an hour). Returns the harness summary table, every run's "
+        "not strictly first-come-first-served), then blocks until the run is done (up to an hour "
+        "after setup). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "
         "FAIL and INCONCLUSIVE is reported; nothing is retried."),
     "inputSchema": {

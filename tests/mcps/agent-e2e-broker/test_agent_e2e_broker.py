@@ -309,6 +309,33 @@ class RunTests(Fixture):
             fcntl.flock(fh, fcntl.LOCK_EX)
         return stack
 
+    def test_pre_slot_broker_lock_counts_as_a_slot(self) -> None:
+        legacy = self.policy["stateDir"] / "lock"
+        self.assertEqual(self.policy["slots"][0], legacy)
+        self.assertNotEqual(self.policy["lock"], legacy)
+        with self._hold([legacy]):   # an old broker mid-campaign
+            self.assertIn("harness exit 0", self.server._tool_run(self.req()))
+        with self._hold([legacy, *self.policy["slots"][1:]]):
+            with self.assertRaisesRegex(RuntimeError, "slots stayed busy"):
+                self.server._tool_run(self.req())
+
+    def test_cancel_during_setup_starts_no_unit(self) -> None:
+        rec = self.server._InFlight()
+        real = self.server._checkout_harness
+        def checkout_then_cancel(*a, **k):
+            rec.cancelled = True
+            return real(*a, **k)
+        self.server._checkout_harness = checkout_then_cancel
+        try:
+            with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+                self.server._tool_run(self.req(), rec)
+        finally:
+            self.server._checkout_harness = real
+        self.assertEqual(list(self.out.glob("*/out/runs/*")), [])
+        self.assertEqual(list(self.out.glob("*/harness")), [])
+        with self._hold(self.policy["slots"]):
+            pass  # every slot was given back
+
     def test_runs_while_another_campaign_holds_a_slot(self) -> None:
         with self._hold(self.policy["slots"][:1]):
             text = self.server._tool_run(self.req())

@@ -38,7 +38,7 @@ push the branch, then call the MCP tool `mcp__agent_e2e_broker__run`:
 It runs origin/master's harness outside the Bash sandbox, with the scenario
 from `new_ref`, and returns the summary table, every verdict and the
 transcripts' directory. It blocks until done. A few campaigns run at once; when
-every slot is busy the call waits for one, so a busy broker needs no retry.
+every slot is busy the call waits up to 30 minutes for one before it errors.
 `model` is haiku or sonnet and `n` at most 2 per call, so call it again for
 more samples and add the counts. Independent calls can go in one message to
 run in parallel.
