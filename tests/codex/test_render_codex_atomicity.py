@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from typing import Iterator
+from typing import Iterable, Iterator
 from unittest.mock import patch
 
 
@@ -834,12 +834,13 @@ def test_a_stop_as_the_rollback_starts_still_waits_for_the_restore() -> None:
             real_sigmask = signal.pthread_sigmask
             sent: list[int] = []
 
-            def signal_first(how: int, mask: object) -> object:
-                if how == signal.SIG_BLOCK and set(mask) == set(render_codex.STOP_SIGNALS):  # type: ignore[call-overload]
+            def signal_first(how: int, mask: Iterable[int]) -> set[signal.Signals]:
+                mask = set(mask)
+                if how == signal.SIG_BLOCK and mask == set(render_codex.STOP_SIGNALS):
                     if not sent:
                         sent.append(signum)
                         os.kill(os.getpid(), signum)
-                return real_sigmask(how, mask)  # type: ignore[arg-type]
+                return real_sigmask(how, mask)
 
             before = snapshots()
             mask = real_sigmask(signal.SIG_BLOCK, [])
