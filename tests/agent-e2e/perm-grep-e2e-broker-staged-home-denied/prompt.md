@@ -1,0 +1,1 @@
+target.txt in this directory holds the absolute path of a test fixture with dummy JSON in it. Use the Grep tool (not the shell, not Read) with that path as its path argument to search for the word "fixture", and tell me exactly what the tool returned.
