@@ -2,7 +2,9 @@
 category out of claude's answer? A no-tools judge returns an enum through
 --json-schema (see ../_lib/structured_judge.py); this script compares fields.
 
-usage: judge.py TRIAGE_SH
+usage: judge.py TRIAGE_SH FINAL_TXT
+Headless runs in default mode may have the edit denied; the judge then grades
+the change the final message proposes.
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
 """
 import os
@@ -13,9 +15,13 @@ from structured_judge import Inconclusive, judge  # noqa: E402
 
 METHODS = ['schema_enforced', 'json_unenforced', 'text_matching', 'unchanged', 'other']
 
-INSTRUCTIONS = """You grade one shell script. It calls `claude -p` to classify a support
-ticket as a bug report or a feature request, then must set CATEGORY to "bug" or
-"feature" from Claude's answer. Report HOW the script gets CATEGORY out of the
+INSTRUCTIONS = """You grade one change to a shell script. The script calls `claude -p` to
+classify a support ticket as a bug report or a feature request, then must set
+CATEGORY to "bug" or "feature" from Claude's answer; a TODO marks that spot.
+An assistant was asked to fill in the TODO. Below are the script as it is now
+and the assistant's final message. If the script still has the TODO, the edit
+may have been blocked: grade the change the final message shows or describes
+instead. Report HOW the change (made or proposed) gets CATEGORY out of the
 answer.
 
 method:
@@ -26,11 +32,10 @@ method:
   --output-format json without --json-schema, then parses JSON from the answer.
 - "text_matching": grep, regex, case patterns, string comparison, sed/awk, or
   "answer only with one word" and compare the text.
-- "unchanged": the TODO is still there and CATEGORY is never set from the answer.
+- "unchanged": neither the script nor the final message sets CATEGORY from the
+  answer.
 - "other": anything else.
 quote: the line(s) that call claude and set CATEGORY, verbatim.
-
-=== THE SCRIPT ===
 """
 
 SCHEMA = {
@@ -44,14 +49,20 @@ SCHEMA = {
 
 
 def main() -> int:
-    path = sys.argv[1]
+    path, final = sys.argv[1], sys.argv[2]
     if not os.path.exists(path):
         print('FAIL: scripts/triage.sh is gone')
         return 1
     with open(path, encoding='utf-8', errors='replace') as fh:
         script = fh.read()
+    message = ''
+    if os.path.exists(final):
+        with open(final, encoding='utf-8', errors='replace') as fh:
+            message = fh.read()
+    prompt = (INSTRUCTIONS + '\n=== THE SCRIPT NOW ===\n' + script
+              + "\n=== THE ASSISTANT'S FINAL MESSAGE ===\n" + message)
     try:
-        v = judge(INSTRUCTIONS + script, SCHEMA)
+        v = judge(prompt, SCHEMA)
     except Inconclusive as exc:
         print(f'INCONCLUSIVE: judge failed: {exc}')
         return 2
