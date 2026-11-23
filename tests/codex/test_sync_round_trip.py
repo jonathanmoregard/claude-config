@@ -23,6 +23,7 @@ from typing import Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from roundtrip_support import (  # noqa: E402
+    LEAF_KINDS,
     Inputs,
     RoundTrip,
     assert_check_fails,
@@ -128,10 +129,12 @@ def test_unchanged_hourly_run_from_a_staged_home_publishes_nothing() -> None:
 
 def test_check_fails_for_every_corrupted_or_deleted_published_file() -> None:
     with round_trip(RICH_INPUTS) as rt:
-        published = snapshot(rt.home)
+        published = {
+            key: entry for key, entry in snapshot(rt.home).items() if entry[0] in LEAF_KINDS
+        }
         # The rich inputs exercise every publish step, links included.
         kinds = {kind for kind, _payload, _mode in published.values()}
-        assert kinds == {"file", "symlink"}, kinds
+        assert kinds == LEAF_KINDS, kinds
 
         for key, entry in sorted(published.items()):
             path = rt.home / key

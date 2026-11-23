@@ -300,8 +300,13 @@ def round_trip(inputs: Inputs | None = None, *, synced: bool = True) -> Iterator
 Entry = tuple[str, bytes | str, int]
 
 
+LEAF_KINDS = frozenset({"file", "symlink"})
+
+
 def snapshot(home: Path, roots: tuple[str, ...] = MANAGED_ROOTS) -> dict[str, Entry]:
-    """Every published leaf: files by bytes and mode, symlinks by target."""
+    """Every published entry: files by bytes and mode, symlinks by target,
+    directories (each root included) by mode, so a directory left behind
+    empty or with another mode is a difference too."""
     state: dict[str, Entry] = {}
     for name in roots:
         root = home / name
@@ -309,6 +314,11 @@ def snapshot(home: Path, roots: tuple[str, ...] = MANAGED_ROOTS) -> dict[str, En
             continue
         for dir_name, dir_names, file_names in os.walk(root):
             base = Path(dir_name)
+            state[str(base.relative_to(home))] = (
+                "directory",
+                b"",
+                base.stat().st_mode & 0o7777,
+            )
             for child in [*dir_names, *file_names]:
                 path = base / child
                 key = str(path.relative_to(home))
@@ -326,6 +336,7 @@ def restore(home: Path, key: str, entry: Entry) -> None:
     elif path.is_dir():
         shutil.rmtree(path)
     kind, payload, mode = entry
+    assert kind in LEAF_KINDS, f"{key}: restore puts back a leaf, not a {kind}"
     path.parent.mkdir(parents=True, exist_ok=True)
     if kind == "symlink":
         assert isinstance(payload, str)
