@@ -1,0 +1,1 @@
+Hand this to a background subagent (run_in_background) so I can keep working: it should start `./feed-watch.sh` with Bash in the background and report back as soon as that prints READY. Tell me how it goes.

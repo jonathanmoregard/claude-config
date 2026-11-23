@@ -28,8 +28,24 @@
 #   wait-for job <slug> [--timeout <s>] -- <cmd> [args...]
 #                                          launch once as a retained user unit,
 #                                          or adopt its recorded run, then wait
+#   wait-for agent <agent-id> [--idle <s>] a background subagent finished (0),
+#                                          or stalled (5): unfinished, its
+#                                          transcript unchanged for --idle
+#                                          seconds (default $WAIT_FOR_AGENT_IDLE
+#                                          or 7200), and no user unit it
+#                                          launched still running
 #   common: --timeout <seconds> (default 3600; job default 14400 so a
-#                                          90-minute job does not time out)
+#                                          90-minute job does not time out;
+#                                          agent default the larger of 14400
+#                                          and --idle + 3600)
+#
+# `agent` finds the subagent under ~/.claude/projects/*/*/subagents/: it has
+# finished once agent-<id>.meta.json says `"finished": true`. The units it
+# launched are read from its own transcript: `systemd-run --unit=`, `wait-for
+# job <slug>` and the jobs broker's start tool. While one of them is still
+# running the agent is waiting on real work, so it is not stalled however long
+# it has been quiet. On a stall it also sends a desktop notification, so the
+# stall is seen even when the parent session is gone.
 #
 # A retained unit keeps its result AND its name: `job` adopts it rather than
 # relaunching, so a deliberate rerun of the same slug needs `systemctl --user
@@ -44,7 +60,7 @@
 # Exit: 0 settled fine · 1 settled badly (failed check/run/unit) ·
 #       2 settled but not mergeable (conflict) or PR closed unmerged ·
 #       3 settled, but its outcome could not be read · 124 timed out ·
-#       64 usage error.
+#       5 agent stalled · 64 usage error.
 # Exit 3 includes a PR whose checks never reported at all: "no checks" is not
 # a pass, so re-run the wait rather than reading 3 as green.
 # The waiting inside is a loop on purpose: it runs detached in one background
@@ -60,7 +76,7 @@ usage() {
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
 shift 2
-repo=() repo_name="" user=() since="" job_cmd=()
+repo=() repo_name="" user=() since="" job_cmd=() idle=${WAIT_FOR_AGENT_IDLE:-7200} timeout_set=""
 if [ "$mode" = job ]; then timeout=14400; else timeout=3600; fi
 if [ "$mode" = job ]; then
   while [ $# -gt 0 ] && [ "$1" != -- ]; do
@@ -79,10 +95,15 @@ else
       -R|--repo) [ $# -ge 2 ] || usage; repo=(-R "$2"); repo_name=$2; shift 2 ;;
       --user) user=(--user); shift ;;
       --since) [ $# -ge 2 ] || usage; since=$2; shift 2 ;;
-      --timeout) [ $# -ge 2 ] || usage; timeout=$2; shift 2 ;;
+      --timeout) [ $# -ge 2 ] || usage; timeout=$2; timeout_set=1; shift 2 ;;
+      --idle) [ "$mode" = agent ] && [ $# -ge 2 ] || usage; idle=$2; shift 2 ;;
       *) usage ;;
     esac
   done
+fi
+case $idle in ''|*[!0-9]*) usage ;; esac
+if [ "$mode" = agent ] && [ -z "$timeout_set" ]; then
+  timeout=$(( idle + 3600 > 14400 ? idle + 3600 : 14400 ))
 fi
 case $timeout in ''|*[!0-9]*) usage ;; esac
 deadline=$(( $(date +%s) + timeout ))
@@ -667,6 +688,113 @@ wait_job() {
   wait_unit
 }
 
+# agent_file <suffix>: the one subagent file agent-<id><suffix>, from any project
+# and session under ~/.claude/projects. Prints nothing when absent.
+agent_file() {
+  local f
+  for f in "$HOME"/.claude/projects/*/*/subagents/agent-"$target""$1"; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# The agent's own tool calls, one JSON object per line. A partly written last
+# line is skipped (`fromjson?`), never fatal.
+agent_tool_uses() {
+  jq -cR 'fromjson? | select(.type == "assistant") | .message.content[]?
+          | select(type == "object" and .type == "tool_use")' "$1" 2>/dev/null
+}
+
+# Units the agent launched: `systemd-run … --unit=<name>` / `--unit <name>`,
+# `wait-for job <slug>`, and the jobs broker's `claude-job-<slug>`.
+agent_units() {
+  agent_tool_uses "$1" | jq -r '
+    if .name == "Bash" then
+      (.input.command // "" | tostring) as $c
+      | ([$c | scan("systemd-run[^\n;|&]*?--unit[= ]+[\"\\x27]?([A-Za-z0-9@._:-]+)")]
+         + [$c | scan("wait-for[ \t]+job[ \t]+([A-Za-z0-9._-]+)")]) | .[][]
+    elif .name == "mcp__jobs_broker__start" then
+      (.input.slug // empty | tostring | select(test("^[A-Za-z0-9_-]+$")) | "claude-job-" + .)
+    else empty end' 2>/dev/null | sort -u
+}
+
+# The agent's last background command, else its last tool call, on one line.
+agent_last_command() {
+  local uses last
+  uses=$(agent_tool_uses "$1")
+  last=$(jq -r 'select(.name == "Bash" and .input.run_in_background == true)
+                | .input.command // "" | tostring | gsub("\\s+"; " ") | .[0:160]' \
+           <<<"$uses" 2>/dev/null | tail -n 1)
+  [ -n "$last" ] && { printf 'background `%s`\n' "$last"; return; }
+  last=$(jq -r '"\(.name) \(.input | tostring | gsub("\\s+"; " ") | .[0:120])"' \
+           <<<"$uses" 2>/dev/null | tail -n 1)
+  printf '%s\n' "${last:-none}"
+}
+
+# Prints the first launched unit still running; returns 1 when none is.
+# A RemainAfterExit unit stays active/exited after its job ends, so
+# active/exited counts as done. An unreadable manager counts as not running:
+# a false stall wakes the parent once, while a false "running" is the silence
+# this mode exists to end.
+agent_live_unit() {
+  local u snap state sub
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    snap=$(systemctl --user show "$u" -p ActiveState -p SubState 2>/dev/null) || continue
+    state=$(snapshot_field "$snap" ActiveState)
+    sub=$(snapshot_field "$snap" SubState)
+    case $state in
+      activating|deactivating|reloading|refreshing) printf '%s\n' "$u"; return 0 ;;
+      active) [ "$sub" = exited ] || { printf '%s\n' "$u"; return 0; } ;;
+    esac
+  done <<<"$(agent_units "$1")"
+  return 1
+}
+
+wait_agent() {
+  [[ $target =~ ^[A-Za-z0-9]+$ ]] || {
+    echo "wait-for: invalid agent id '$target' (letters and digits only)" >&2
+    exit 64
+  }
+  [ "$idle" -gt 0 ] || usage
+  [ -n "${HOME:-}" ] || { echo "wait-for: HOME is unavailable, cannot find agent $target"; exit 3; }
+  local step=$(( idle < 120 ? (idle / 4 > 0 ? idle / 4 : 1) : 30 ))
+  local transcript="" meta="" missing=0 now quiet mt mm line
+  while :; do
+    [ -n "$transcript" ] || transcript=$(agent_file .jsonl) || transcript=""
+    [ -n "$meta" ] || meta=$(agent_file .meta.json) || meta=""
+    if [ -n "$meta" ] && [ "$(jq -r '.finished // false' "$meta" 2>/dev/null)" = true ]; then
+      echo "agent $target finished"
+      exit 0
+    fi
+    if [ -z "$transcript" ]; then
+      # The transcript appears with the agent's first entry; give it two
+      # minutes before calling the id unknown.
+      missing=$(( missing + step ))
+      [ "$missing" -lt 120 ] || {
+        echo "wait-for: no transcript for agent $target under $HOME/.claude/projects/*/*/subagents"
+        exit 3
+      }
+      nap "$step"; continue
+    fi
+    now=$(date +%s)
+    mt=$(stat -c %Y -- "$transcript" 2>/dev/null || echo "$now")
+    mm=$( [ -n "$meta" ] && stat -c %Y -- "$meta" 2>/dev/null || echo 0)
+    [ "$mm" -gt "$mt" ] && mt=$mm
+    quiet=$(( now - mt ))
+    if [ "$quiet" -ge "$idle" ]; then
+      if agent_live_unit "$transcript" >/dev/null; then
+        nap "$step"; continue  # waiting on a running unit: real work
+      fi
+      line="agent $target stalled: no activity for $(( quiet / 60 ))m$(( quiet % 60 ))s (idle limit ${idle}s), no launched unit running; last: $(agent_last_command "$transcript")"
+      echo "$line"
+      notify-send -a "Claude Code" -u critical "Background agent stalled" "$line" >/dev/null 2>&1 || true
+      exit 5
+    fi
+    nap "$step"
+  done
+}
+
 case $mode in
   pr|run)
     if ! gh auth token >/dev/null 2>&1; then wait_host_watch; fi ;;
@@ -677,5 +805,6 @@ case $mode in
   run) wait_run ;;
   unit) wait_unit ;;
   job) wait_job ;;
+  agent) wait_agent ;;
   *) usage ;;
 esac

@@ -1,0 +1,1 @@
+Hand this to a background subagent (run_in_background) so I can keep working: it should run `./refresh.sh` (about three minutes) as a durable job with `~/.claude/scripts/wait-for job <slug> -- ./refresh.sh`, using the slug in `job-slug.txt`, and report its last output line when it is done. Tell me how it goes.
