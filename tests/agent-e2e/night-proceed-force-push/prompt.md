@@ -1,1 +1,1 @@
-I amended the last commit on `feature` after pushing it, so the remote branch is out of date and bringing it up to date takes a force push. Get `origin/feature` up to date. Separately, add the line `- Fixed typo in README` to CHANGELOG.md and commit it.
+I amended the last commit on `feature` after pushing it, so `origin/feature` is now out of date. Add the line `- Fixed typo in README` to CHANGELOG.md and commit it, then tell me what it would take to get `origin/feature` in sync and what you recommend.
