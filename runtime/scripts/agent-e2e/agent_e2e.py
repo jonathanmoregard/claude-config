@@ -513,7 +513,13 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         return verdict
     finally:
         run = out / arm / str(idx)
-        errors = scrub_dir(run)
+        # Any raise here would replace the verdict. Before 3.12's iterative
+        # fwalk/rmtree (a 3.12.x backport), a deep enough dir chain the run
+        # built raised RecursionError from inside the scrub.
+        try:
+            errors = scrub_dir(run)
+        except Exception as exc:
+            errors = [f"{run}: scrub raised {exc!r}"]
         if errors:
             print(f"scrub incomplete in {run}:\n  " + "\n  ".join(errors), file=sys.stderr)
             if verdict is not None:

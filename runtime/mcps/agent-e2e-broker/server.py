@@ -510,7 +510,9 @@ SCRUBBER = HERE.parents[1] / "scripts/agent-e2e/agent_e2e.py"
 def _scrub_runs(runs: Path) -> str:
     """Strip account material from every run dir under RUNS. The unit is
     SIGKILLed on cancel and RuntimeMaxSec, which skips the harness's own
-    per-run scrub. Returns an error report, or "" when clean; never raises."""
+    per-run scrub. Returns an error report, or "" when clean; never raises.
+    The report names at most SCRUB_REPORT_LINES entries: it leads the tool
+    response, so an unbounded one would push the verdicts past the cut."""
     if not os.path.lexists(runs):  # a link planted here is scrub's to refuse
         return ""
     try:
@@ -519,12 +521,19 @@ def _scrub_runs(runs: Path) -> str:
                            timeout=600)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"{TAG} scrub of {runs} failed: {exc!r}"
-    if p.returncode != 0:
-        return f"{TAG} scrub of {runs} incomplete (exit {p.returncode}):\n{p.stderr.strip()}"
-    return ""
+    if p.returncode == 0:
+        return ""
+    lines = p.stderr.strip().splitlines()
+    if len(lines) > SCRUB_REPORT_LINES:
+        lines = [*lines[:SCRUB_REPORT_LINES],
+                 f"... {len(lines) - SCRUB_REPORT_LINES} more; `scrub {runs}` lists them all"]
+    return f"{TAG} scrub of {runs} incomplete (exit {p.returncode}):\n" + "\n".join(lines)
 
 
+SCRUB_REPORT_LINES = 10
+SCRUB_REPORT_CHARS = 4000    # the whole scrub section of one response
 SCRUBBED_MARK = "scrubbed"   # in the campaign dir, which no unit can write
+REPORTED_MARK = "scrub-reported"
 
 
 def _unit_state(policy: dict, unit: str) -> str:
@@ -540,31 +549,45 @@ def _unit_state(policy: dict, unit: str) -> str:
     return p.stdout.strip()
 
 
-def _mark_scrubbed(campaign: Path) -> str:
-    """Mark CAMPAIGN done. Returns an error report, or "" ; never raises: an
-    unmarked campaign is only scrubbed again by the next sweep."""
+def _mark(campaign: Path, name: str) -> str:
+    """Create CAMPAIGN/NAME. Returns an error report, or ""; never raises: a
+    missing mark only means the next sweep looks at the campaign again."""
     try:
-        os.close(os.open(campaign / SCRUBBED_MARK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+        os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
                          | os.O_CLOEXEC, 0o600))
     except OSError as exc:
-        return f"{TAG} could not mark {campaign.name} scrubbed; the next sweep retries: {exc}"
+        return f"{TAG} could not mark {campaign.name} {name}; the next sweep retries: {exc}"
     return ""
 
 
-def _scrub_after_unit(policy: dict, campaign: Path) -> str:
-    """Post-unit scrub of CAMPAIGN. Scrubs best-effort either way, but marks it
-    only once systemd says its unit has stopped: a unit that outlived the
-    broker's wait can still write, so the sweep must look at it again."""
+def _scrub_stopped(campaign: Path) -> str:
+    """Scrub CAMPAIGN, whose unit systemd has said is stopped, and mark it when
+    clean. Left dirty, it is scrubbed again by every sweep, but only its first
+    report is given in full: after that it costs each response one line."""
     report = _scrub_runs(campaign / "out" / "runs")
+    if not report:
+        return _mark(campaign, SCRUBBED_MARK)
+    if os.path.lexists(campaign / REPORTED_MARK):
+        return (f"{TAG} {campaign / 'out' / 'runs'} still incomplete, as reported "
+                f"before; `scrub` it after fixing what blocks it")
+    return "\n".join(p for p in (report, _mark(campaign, REPORTED_MARK)) if p)
+
+
+def _scrub_after_unit(policy: dict, campaign: Path) -> str:
+    """Post-unit scrub of CAMPAIGN. Asks systemd first: a unit that outlived the
+    broker's wait can still write, so a scrub that ran before the unit was
+    known stopped proves nothing. Such a campaign is scrubbed best-effort and
+    left unmarked for the sweep."""
     try:
         state = _unit_state(policy, UNIT_PREFIX + campaign.name)
     except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-        return "\n".join(p for p in (report, f"{TAG} cannot ask systemd about "
-                                     f"{campaign.name}: {exc}; left for the sweep") if p)
-    if state not in ("inactive", "failed"):
-        return "\n".join(p for p in (report, f"{TAG} unit for {campaign.name} still "
-                                     f"{state or 'unknown'}; left for the sweep") if p)
-    return report or _mark_scrubbed(campaign)
+        state, why = None, f"cannot ask systemd about {campaign.name}: {exc}"
+    else:
+        why = f"unit for {campaign.name} still {state or 'unknown'}"
+    if state in ("inactive", "failed"):
+        return _scrub_stopped(campaign)
+    report = _scrub_runs(campaign / "out" / "runs")
+    return "\n".join(p for p in (report, f"{TAG} {why}; left for the sweep") if p)
 
 
 def _scrub_settled(policy: dict, campaigns: Path, skip: Path) -> str:
@@ -587,7 +610,7 @@ def _scrub_settled(policy: dict, campaigns: Path, skip: Path) -> str:
             break
         if state not in ("inactive", "failed"):
             continue
-        report = _scrub_runs(campaign / "out" / "runs") or _mark_scrubbed(campaign)
+        report = _scrub_stopped(campaign)
         if report:
             reports.append(report)
     return "\n".join(reports)
@@ -782,6 +805,8 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
         os.close(lock)
     # First, so a response cut at outputLimitChars still carries it.
     scrub_report = "\n".join(part for part in (scrubbed, swept) if part)
+    if len(scrub_report) > SCRUB_REPORT_CHARS:
+        scrub_report = scrub_report[:SCRUB_REPORT_CHARS] + f"\n{TAG} scrub reports cut"
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
               + (f"{scrub_report}\n" if scrub_report else "")

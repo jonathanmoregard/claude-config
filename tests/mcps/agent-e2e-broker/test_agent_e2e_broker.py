@@ -321,6 +321,68 @@ class ScrubRunsTests(unittest.TestCase):
                     self.assertEqual(report, "")
 
 
+    def test_post_unit_scrub_asks_systemd_before_it_scrubs(self) -> None:
+        # The unit is still running when asked and stops during the scrub,
+        # after writing into a run the scrub already walked: a probe taken
+        # after the scrub would read "inactive" and mark a dirty campaign.
+        server = load_server()
+        states = ["active"]
+        server._unit_state = lambda policy, unit: states[-1]
+        real = server._scrub_runs
+
+        def scrub_then_unit_writes(runs):
+            report = real(runs)
+            (runs / "sc/new/1/home/.claude.json").write_text("s\n")
+            states.append("inactive")
+            return report
+        server._scrub_runs = scrub_then_unit_writes
+        with tempfile.TemporaryDirectory() as tmp:
+            self._campaign(Path(tmp), "c")
+            self.assertIn("still active", server._scrub_after_unit({}, Path(tmp) / "c"))
+            self.assertFalse((Path(tmp) / "c/scrubbed").exists())
+
+    def _locked(self, home: Path, n: int) -> list:
+        locked = []
+        for i in range(n):
+            d = home / f".ssh/k_{i}"
+            d.mkdir(parents=True)
+            (d / "f").write_text("s\n")
+            d.chmod(0o000)
+            locked.append(d)
+        return locked
+
+    def test_a_dirty_campaign_is_reported_in_full_once_then_in_one_line(self) -> None:
+        server = load_server()
+        server._unit_state = lambda policy, unit: "inactive"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-done")
+            locked = self._locked(home, 1)
+            try:
+                first = server._scrub_settled({}, Path(tmp), Path(tmp) / "x")
+                again = server._scrub_settled({}, Path(tmp), Path(tmp) / "x")
+            finally:
+                for d in locked:
+                    d.chmod(0o700)
+            self.assertIn("k_0", first)
+            self.assertEqual(again.count("\n"), 0, again)
+            self.assertIn("as reported before", again)
+            self.assertFalse((Path(tmp) / "c-done/scrubbed").exists())
+
+    def test_a_scrub_report_names_a_bounded_number_of_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "runs")
+            locked = self._locked(home, 30)
+            try:
+                report = load_server()._scrub_runs(Path(tmp) / "runs")
+            finally:
+                for d in locked:
+                    d.chmod(0o700)
+        lines = report.splitlines()
+        self.assertEqual(len(lines), 1 + load_server().SCRUB_REPORT_LINES + 1, report)
+        self.assertRegex(lines[-1], r"^\.\.\. \d+ more; `scrub ")
+        self.assertLess(report.count("k_"), 30, report)
+
+
 class KilledCampaignTests(Fixture):
     def test_a_campaign_killed_mid_run_is_scrubbed_by_the_broker(self) -> None:
         # The stub plants account material in its staged HOME and hangs; the
@@ -382,6 +444,23 @@ class KilledCampaignTests(Fixture):
         self.assertEqual(len(own), 1)
         self.assertIn(f"{own[0]}/out/runs incomplete", head)
         self.assertFalse((settled / "out/runs/sc/new/1/home/.claude.json").exists())
+
+    def test_many_unremovable_entries_leave_the_verdicts_in_the_response(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        self.claude.write_text(
+            "#!/usr/bin/env bash\nfor i in $(seq 1 150); do d=\"$HOME/.ssh/k_$i\"; "
+            "mkdir -p \"$d\"; touch \"$d/f\"; chmod 000 \"$d\"; done\n"
+            "echo '{\"type\":\"result\",\"result\":\"hi\",\"is_error\":false,"
+            "\"total_cost_usd\":0.01}'\n")
+        try:
+            text = self.server._tool_run(self.req(n=1))
+        finally:
+            for d in self.out.glob("*/out/runs/**/.ssh/k_*"):
+                d.chmod(0o700)
+        self.assertIn("harness = origin/master", text)
+        self.assertIn("--- per run ---", text)
+        self.assertIn("more; `scrub", text)
 
 
 class ValidationTests(Fixture):

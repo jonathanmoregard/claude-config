@@ -464,8 +464,30 @@ def test_scrub_subcommand_refuses_a_link_for_its_root(tmp_path):
     decoy = _decoy(tmp_path / "decoy")
     (tmp_path / "out").symlink_to(tmp_path / "decoy")
     r = harness("scrub", str(tmp_path / "out"))
+    # A refusal, not a crash: an uncaught raise also exits 1.
     assert r.returncode == 1, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.stderr.startswith(f"{tmp_path / 'out'}: "), r.stderr
     _assert_decoy_intact(decoy)
+
+
+def test_a_raising_scrub_does_not_cost_the_verdict(tmp_path, monkeypatch):
+    # Before the iterative fwalk/rmtree, a deep dir chain raised
+    # RecursionError from inside the scrub (reproduced on 3.11).
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_e2e_inproc", HARNESS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def deep(path):
+        raise RecursionError("maximum recursion depth exceeded")
+    monkeypatch.setattr(mod, "scrub_dir", deep)
+    monkeypatch.setattr(mod, "_run_one", lambda *a: {"verdict": "PASS"})
+    (tmp_path / "out/new/1").mkdir(parents=True)
+    verdict = mod.run_one(tmp_path / "sc", "new", "HEAD", 1, tmp_path / "out", None)
+    assert verdict["verdict"] == "PASS"
+    assert "RecursionError" in verdict["scrub_errors"][0], verdict
+    assert "RecursionError" in (tmp_path / "out/new/1/scrub-errors.txt").read_text()
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):
