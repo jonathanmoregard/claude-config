@@ -76,6 +76,10 @@
   },
   "permissions": {
     "allow": [
+      "Bash(~/.claude/scripts/unit-read *)",
+      "Bash(/home/jonathan/.claude/scripts/unit-read *)",
+      "Bash(~/.claude/scripts/wait-for unit *)",
+      "Bash(/home/jonathan/.claude/scripts/wait-for unit *)",
       "Glob",
       "Grep",
       "Skill",

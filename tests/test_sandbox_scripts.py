@@ -397,3 +397,13 @@ def test_trash_empties_no_entry_for_a_record_naming_the_trash_itself(home: Path,
     proc = run_trash(home, str(home / "worktrees" / "project" / "f"))
     assert proc.returncode == 0, proc.stderr
     assert (trash / "files" / "young").exists()
+
+
+def test_every_excluded_command_runs_without_a_prompt() -> None:
+    # An excluded command leaves the sandbox, so autoAllowBashIfSandboxed does
+    # not cover it; with no bare Bash allow it needs a rule of its own.
+    import json
+    settings = json.loads((REPO / "runtime" / "settings.json").read_text())
+    allow = settings["permissions"]["allow"]
+    missing = [c for c in settings["sandbox"]["excludedCommands"] if f"Bash({c})" not in allow]
+    assert missing == []

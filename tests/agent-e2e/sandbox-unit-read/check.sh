@@ -3,6 +3,10 @@ set -uo pipefail
 run=${1:?run dir}
 log=$run/systemctl.log
 if [ ! -s "$log" ]; then
+  if grep -q 'unit-read' "$run/commands.txt" 2>/dev/null; then
+    echo "FAIL: unit-read was called but never reached systemctl (a prompt refused it)"
+    exit 1
+  fi
   echo "INCONCLUSIVE: the agent never ran systemctl"
   exit 2
 fi
