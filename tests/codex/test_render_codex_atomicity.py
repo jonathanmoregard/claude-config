@@ -816,6 +816,58 @@ def test_a_parent_the_rollback_cannot_remove_still_delivers_a_held_stop() -> Non
         assert caught.code == 128 + signum, (signum.name, caught.code)
 
 
+def test_a_stop_as_the_rollback_starts_still_waits_for_the_restore() -> None:
+    # A stop arriving after the block failed but before the rollback held
+    # the stop signals ran its handler there (CPython runs pending handlers
+    # inside pthread_sigmask), and its SystemExit left the failed output
+    # live. The restore runs first; the stop still ends the run.
+    def stop(number: int, frame: object) -> None:
+        raise SystemExit(128 + number)
+
+    def snapshots() -> set[Path]:
+        return set(Path(tempfile.gettempdir()).glob("codex-render-rollback-*"))
+
+    for signum in render_codex.STOP_SIGNALS:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "AGENTS.md"
+            target.write_text("before\n", encoding="utf-8")
+            real_sigmask = signal.pthread_sigmask
+            sent: list[int] = []
+
+            def signal_first(how: int, mask: object) -> object:
+                if how == signal.SIG_BLOCK and set(mask) == set(render_codex.STOP_SIGNALS):  # type: ignore[call-overload]
+                    if not sent:
+                        sent.append(signum)
+                        os.kill(os.getpid(), signum)
+                return real_sigmask(how, mask)  # type: ignore[arg-type]
+
+            before = snapshots()
+            mask = real_sigmask(signal.SIG_BLOCK, [])
+            previous = {number: signal.signal(number, stop) for number in render_codex.STOP_SIGNALS}
+            caught: BaseException | None = None
+            try:
+                with patch.object(render_codex.signal, "pthread_sigmask", signal_first):
+                    try:
+                        with render_codex.rollback_paths_on_error([target]):
+                            target.write_text("failed output\n", encoding="utf-8")
+                            raise OSError("injected check failure")
+                    except BaseException as exc:
+                        caught = exc
+                left_mask = real_sigmask(signal.SIG_BLOCK, [])
+            finally:
+                for number in render_codex.STOP_SIGNALS:
+                    signal.signal(number, signal.SIG_IGN)
+                real_sigmask(signal.SIG_SETMASK, mask)
+                for number, handler in previous.items():
+                    signal.signal(number, handler)
+            assert sent == [signum], sent
+            assert target.read_text(encoding="utf-8") == "before\n", signum.name
+            assert isinstance(caught, SystemExit), (signum.name, repr(caught))
+            assert caught.code == 128 + signum, (signum.name, caught.code)
+            assert left_mask == mask, (signum.name, left_mask)
+            assert snapshots() == before, signum.name
+
+
 def test_rollback_never_leaves_a_restored_path_missing() -> None:
     # A rollback removed every target before restoring any: a Codex session
     # starting meanwhile found no config.toml or hooks.json. Each one is
@@ -1459,6 +1511,7 @@ if __name__ == "__main__":
     test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot()
     test_a_parent_the_rollback_cannot_remove_never_replaces_the_failure()
     test_a_parent_the_rollback_cannot_remove_still_delivers_a_held_stop()
+    test_a_stop_as_the_rollback_starts_still_waits_for_the_restore()
     test_rollback_never_leaves_a_restored_path_missing()
     test_rollback_leaves_no_snapshot_behind()
     test_a_no_op_publish_leaves_mcp_assets_in_place()

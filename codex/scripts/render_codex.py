@@ -2610,10 +2610,14 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
 
     STOP_SIGNALS are held off for the whole rollback, whatever started it,
     so a stop cannot leave the restore half done; one that came meanwhile
-    is delivered once the restore has finished. After a rollback that
-    failed it is dropped instead: the run is ending on the error naming the
-    snapshot, which the stop would otherwise replace.
+    is delivered once the restore has finished, as is one whose handler
+    ran as the rollback started. After a rollback that failed it is dropped
+    instead: the run is ending on the error naming the snapshot, which the
+    stop would otherwise replace.
     """
+    # The mask to put back, taken before the block: a stop handler can run
+    # inside the rollback's own SIG_BLOCK, which then returns nothing.
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, [])
     targets = outermost_paths(paths)
     missing_parents: set[Path] = set()
     for target in targets:
@@ -2660,7 +2664,16 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
     try:
         yield
     except BaseException as failure:
-        held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        # A stop that came after the block failed runs its handler at
+        # Python's next signal check, inside pthread_sigmask at the latest
+        # (CPython checks there): its exit waits for the restore.
+        stopped: BaseException | None = None
+        while True:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+                break
+            except (SystemExit, KeyboardInterrupt) as stop:
+                stopped = stop
         restored = False
         try:
             try:
@@ -2696,6 +2709,8 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
             # A stop held off above is delivered here once the restore is
             # complete, and dropped after one that failed (see above).
             release_stop_signals(held, deliver=restored)
+        if stopped is not None:
+            raise stopped
         raise
     shutil.rmtree(snapshot_root, ignore_errors=True)
 
