@@ -7,9 +7,13 @@ into the live home only after it exits 0. A direct run renders in place,
 since the output names absolute paths under HOME (hook commands, wrappers,
 role files), so it publishes first and checks the result: a failed check
 rolls every path the publish may change back to what was there before the
-run, config.toml included, as production's backup restore does.
+run, config.toml included, as production's backup restore does. So does
+SIGTERM, SIGHUP or SIGINT before the check has passed.
 """
 from __future__ import annotations
+
+import signal
+from types import FrameType
 
 import check
 import import_claude
@@ -20,7 +24,23 @@ class CheckFailed(Exception):
     """The published output failed the check; the rollback undoes it."""
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+def stop(signum: int, frame: FrameType | None) -> None:
+    """A stop signal as an exception, so the rollback runs: by default
+    SIGTERM and SIGHUP end the process without unwinding, and the unchecked
+    output would stay live. A repeat cannot interrupt the rollback."""
+    for other in STOP_SIGNALS:
+        signal.signal(other, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 def main() -> int:
+    for signum in STOP_SIGNALS:
+        # One the caller ignores (nohup) stays ignored.
+        if signal.getsignal(signum) is not signal.SIG_IGN:
+            signal.signal(signum, stop)
     import_claude.main()
     plan = render_codex.load_render_plan()
     # config.toml is outside the publish's own rollback set, because Codex

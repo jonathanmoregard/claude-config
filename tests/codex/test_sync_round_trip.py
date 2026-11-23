@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1435,6 +1436,59 @@ def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
         assert (rt.codex / "skills" / "new-skill" / "SKILL.md").is_file()
 
 
+# Runs sync_codex.main() with the check parked until a signal arrives: the
+# publish is live and unchecked when the parent sends it.
+PARKED_CHECK_SYNC = """
+import signal, sys
+sys.path.insert(0, sys.argv[1])
+import check, sync_codex
+def parked():
+    print("CHECK PARKED", flush=True)
+    signal.pause()
+    return 0
+check.main = parked
+raise SystemExit(sync_codex.main())
+"""
+
+
+def test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was() -> None:
+    # SIGTERM (systemd stop, timeout) or SIGHUP (a closed terminal) between
+    # the publish and the end of the check killed the run without unwinding:
+    # the unchecked output stayed live, and a later failed run rolled back to
+    # it. Signalled, the run rolls back like a failed check.
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        (rt.codex / "hooks.json").unlink()
+        rt.edit_config(lambda config: config.pop("features"))
+        before = snapshot(rt.home, ("",))
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            sync = subprocess.Popen(
+                [sys.executable, "-B", "-c", PARKED_CHECK_SYNC, str(rt.repo / "scripts")],
+                env={**os.environ, "HOME": str(rt.home)},
+                cwd=rt.home,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            output: list[str] = []
+            assert sync.stdout is not None
+            for line in sync.stdout:
+                output.append(line)
+                if line.strip() == "CHECK PARKED":
+                    break
+            assert snapshot(rt.home, ("",)) != before, "".join(output)
+            sync.send_signal(signum)
+            output.append(sync.communicate(timeout=60)[0])
+            context = f"{signum.name} rc={sync.returncode}\n{''.join(output)}"
+            assert sync.returncode == 128 + signum, context
+            after = snapshot(rt.home, ("",))
+            changed = sorted(
+                key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
+            )
+            assert changed == [], (changed, context)
+
+
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
     # Codex reads skills from both roots, and commands render as skills too.
     with round_trip() as rt:
@@ -1666,6 +1720,7 @@ if __name__ == "__main__":
     test_agent_role_files_cannot_loosen_the_session()
     test_profile_config_files_cannot_loosen_the_session()
     test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
+    test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()
