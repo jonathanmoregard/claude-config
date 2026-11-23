@@ -53,10 +53,16 @@ def agent_done() -> list[dict]:
                       summary="done")]
 
 
+def task_stop(task: str) -> dict:
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": f"s-{task}", "name": "TaskStop", "input": {"task_id": task}}]}}
+
+
 def killed(task: str = "b1", desc: str = "Arm idle alarm") -> list[dict]:
-    """A TaskStop: the task is killed and its notification's summary is the
-    model-written Bash description, verbatim."""
-    return [sys_event("task_updated", task_id=task, patch={"status": "killed"}),
+    """The parent's TaskStop: the task is killed and its notification's summary
+    is the model-written Bash description, verbatim."""
+    return [task_stop(task),
+            sys_event("task_updated", task_id=task, patch={"status": "killed"}),
             sys_event("task_notification", task_id=task, status="stopped", summary=desc)]
 
 
@@ -154,6 +160,29 @@ def test_stall_cut_short_by_the_headless_time_limit_is_inconclusive(tmp_path: Pa
 def test_waiter_that_died_at_once_fails_quiet(tmp_path: Path) -> None:
     events = launched() + armed() + [exited("b1", 64)] + agent_done() + killed()
     assert grade(tmp_path, events, "quiet") == 1
+
+
+def test_other_agent_finishing_is_not_the_watched_one(tmp_path: Path) -> None:
+    other = "b0b0b0b0b0b0b0b0b"
+    events = launched() + [
+        sys_event("task_started", task_id=other, task_type="local_agent", is_backgrounded=True),
+        sys_event("task_updated", task_id=other, patch={"status": "completed"})] \
+        + armed() + killed() + agent_done()
+    assert grade(tmp_path, events, "quiet") == 2
+
+
+def test_kill_without_a_parent_stop_call_is_not_the_parents(tmp_path: Path) -> None:
+    events = launched() + armed() + agent_done() + [
+        sys_event("task_updated", task_id="b1", patch={"status": "killed"}),
+        sys_event("task_notification", task_id="b1", status="stopped",
+                  summary='Background command "wait" was stopped for some new reason')]
+    assert grade(tmp_path, events, "quiet") == 2
+
+
+def test_time_limit_does_not_mask_a_broken_rearm(tmp_path: Path) -> None:
+    events = launched() + armed() + time_limit() + armed(task="b2", tool="t2") \
+        + [exited("b2", 64, tool="t2"), say()]
+    assert grade(tmp_path, events, "stall", alarm=False) == 1
 
 
 def test_missing_transcript_is_inconclusive(tmp_path: Path) -> None:

@@ -5,18 +5,23 @@
 
 The harness reports every background Bash as a task: `task_started` (with the
 Bash call's tool_use_id), `task_updated` (status `killed` when stopped) and
-`task_notification` (summary "... exit code N" when it exits non-zero). A
-waiter is a background task the parent started from a Bash call that runs
+`task_notification` (status `failed` + 'Background command "<desc>" failed
+with exit code N', or status `stopped` + '... was stopped after reaching its
+background time limit' when Claude Code itself stopped it). A waiter is a
+background task the parent started from a Bash call that runs
 `wait-for ... agent <id>` for the agent it dispatched. Grading on these events,
 not on command text, means a foreground `pgrep -f "wait-for agent X"`, a
 denied TaskStop or a kill of some other task cannot count.
 
-stall: a waiter, AND notify.log shows the alarm, AND a waiter's notification
-       reports exit code 5 followed by a parent turn (the parent saw it).
-quiet: a waiter, no alarm, AND a waiter was killed (the parent stopped it once
-       it had the result). A waiter that failed with any other code means
-       arming was broken: FAIL. Armed, not fired, left running: INCONCLUSIVE
-       (exit 2), the run may have ended before the idle limit.
+stall: PASS = a waiter, notify.log shows the alarm, and a waiter's
+       notification reports exit code 5 followed by a parent turn.
+       INCONCLUSIVE = no alarm because Claude Code stopped the waiter (headless
+       time limit, memory) and nothing else went wrong. Else FAIL.
+quiet: PASS = a waiter, no alarm, and the parent's own TaskStop/KillShell
+       killed a waiter after the agent it watches completed, with no waiter
+       left running. FAIL = not armed, alarm fired, or a waiter exited with
+       any other code (arming broken). Else INCONCLUSIVE (exit 2): stopped
+       too early, left running, or the run ended before the idle limit.
 INCONCLUSIVE (exit 2) with no transcript or no background Agent dispatch.
 """
 from __future__ import annotations
@@ -62,15 +67,16 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
                 commands[b.get("id")] = str((b.get("input") or {}).get("command", ""))
 
-    def runs_wait_for(cmd: str) -> bool:
-        return "wait-for" in cmd and any(
-            re.search(rf"\bagent\s+['\"]?{re.escape(i)}\b", cmd) for i in ids)
+    def watches_agent(cmd: str, agent: str) -> bool:
+        return "wait-for" in cmd and re.search(
+            rf"\bagent\s+['\"]?{re.escape(agent)}\b", cmd) is not None
 
-    waiters = {e["task_id"] for e in events
-               if e.get("type") == "system" and e.get("subtype") == "task_started"
-               and e.get("task_type") == "local_bash" and not e.get("owned_by_subagent")
-               and isinstance(e.get("task_id"), str)
-               and runs_wait_for(commands.get(e.get("tool_use_id"), ""))}
+    waiter_tool = {e["task_id"]: e.get("tool_use_id") for e in events
+                   if e.get("type") == "system" and e.get("subtype") == "task_started"
+                   and e.get("task_type") == "local_bash" and not e.get("owned_by_subagent")
+                   and isinstance(e.get("task_id"), str)
+                   and any(watches_agent(commands.get(e.get("tool_use_id"), ""), i) for i in ids)}
+    waiters = set(waiter_tool)
     # Summaries quote the model-written Bash description first, so match the
     # harness's own wording after the closing quote, to the end. A TaskStop'd
     # task's summary is the bare description, which proves nothing either way.
@@ -90,18 +96,32 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
     kills = {e.get("task_id"): n for n, e in enumerate(events)
              if e.get("subtype") == "task_updated" and e.get("task_id") in waiters
              and (e.get("patch") or {}).get("status") == "killed"}
-    parent_kills = {t: n for t, n in kills.items() if t not in system_stopped}
+    # A stop is the parent's only when one of its TaskStop/KillShell calls
+    # named that task; anything else that killed it was not the parent.
+    asked_stop = {str(v) for e in events if e.get("type") == "assistant"
+                  for b in ((e.get("message") or {}).get("content") or [])
+                  if isinstance(b, dict) and b.get("type") == "tool_use"
+                  and b.get("name") in ("TaskStop", "KillShell")
+                  for v in (b.get("input") or {}).values()}
+    parent_kills = {t: n for t, n in kills.items() if t in asked_stop and t not in system_stopped}
     ended = set(kills) | {t for _, t, _ in exits}
-    agent_done = min((n for n, e in enumerate(events) if e.get("task_id") in ids
-                      and e.get("subtype") in ("task_updated", "task_notification")
-                      and (e.get("status") or (e.get("patch") or {}).get("status")) == "completed"),
-                     default=None)
+    # Each waiter watches the agent its command names; "after the result" is
+    # after that agent completed, not after any agent did.
+    done_at = {}
+    for n, e in enumerate(events):
+        status = e.get("status") or (e.get("patch") or {}).get("status")
+        if e.get("task_id") in ids and status == "completed" \
+                and e.get("subtype") in ("task_updated", "task_notification"):
+            done_at.setdefault(e["task_id"], n)
+    watches = {t: next((i for i in ids if watches_agent(commands.get(tool, ""), i)), None)
+               for t, tool in waiter_tool.items()}
 
     seen = any(code == 5 and any(e.get("type") == "assistant" for e in events[n + 1:])
                for n, _, code in exits)
     broken = sorted({code for _, _, code in exits if code != 5})
     live = sorted(waiters - ended)
-    stopped_after = agent_done is not None and any(n > agent_done for n in parent_kills.values())
+    stopped_after = any(watches.get(t) in done_at and n > done_at[watches[t]]
+                        for t, n in parent_kills.items())
 
     summary = (f"agent_ids={sorted(ids)} waiters={sorted(waiters)} notify={fired} "
                f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
@@ -110,7 +130,7 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
     if mode == "stall":
         if armed and fired and seen:
             return 0, summary
-        if armed and not fired and system_stopped:
+        if armed and not fired and system_stopped and not broken and not parent_kills:
             # Claude Code stopped the waiter before it could fire: a resource
             # result of the headless run, not a verdict.
             return 2, summary + " (waiter stopped by Claude Code before the alarm)"
