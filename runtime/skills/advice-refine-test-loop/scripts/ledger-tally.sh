@@ -1,31 +1,21 @@
 #!/usr/bin/env bash
 # Tally every repository's review ledger (format: ../references/ledger.md).
 #
-# Usage: ledger-tally.sh [--root DIR] [--decided FILE] [check...]
+# Usage: ledger-tally.sh [--root DIR] [check...]
 #
 # Prints one tab-separated line per check:
 #   check runs findings reproduced fixed refuted advice_taken propose
 # where propose is drop, reword or -, from the thresholds in ledger.md. Then
 # one line per fp_reason that meets the exclusion threshold:
 #   exclude? reason rows runs
-# A reason the decisions file marks accepted or rejected (exact fp_reason
-# string) is never proposed again. Named checks restrict the per-check lines only.
-# No ledger files: prints nothing, exits 0. --root defaults to
-# ~/.local/state/claude-tasks, --decided to ../references/exclusion-decisions.tsv.
+# Named checks restrict the per-check lines only. No ledger files: prints
+# nothing, exits 0. --root defaults to ~/.local/state/claude-tasks.
 set -euo pipefail
 
 root="$HOME/.local/state/claude-tasks"
-decided="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../references/exclusion-decisions.tsv"
-while (( $# )); do
-  case $1 in
-    --root) root=${2:?--root needs a directory}; shift 2 ;;
-    --decided) decided=${2:?--decided needs a file}; shift 2 ;;
-    *) break ;;
-  esac
-done
-if [[ ! -e $decided ]]; then decided=/dev/null   # no decisions file: none decided
-elif [[ -d $decided || ! -r $decided ]]; then
-  echo "ledger-tally: $decided: unreadable, no decisions applied" >&2; decided=/dev/null
+if [[ ${1:-} == --root ]]; then
+  root=${2:?--root needs a directory}
+  shift 2
 fi
 
 shopt -s nullglob
@@ -33,17 +23,8 @@ ledgers=("$root"/*/review-ledger.tsv)
 (( ${#ledgers[@]} )) || exit 0
 
 only=$(IFS=$'\t'; echo "$*")      # tab-joined: a lens name may hold spaces
-awk -F'\t' -v only="$only" -v decided="$decided" '
-BEGIN {
-  n = split(only, w, "\t"); for (i = 1; i <= n; i++) want[w[i]] = 1
-  while ((getline line < decided) > 0) {            # fp_reason decision date
-    split(line, d, "\t")
-    if (d[2] == "accepted" || d[2] == "rejected") done[d[1]] = 1
-    else if (d[1] != "fp_reason" && line != "")
-      printf "ledger-tally: %s: unknown decision \x27%s\x27 for \x27%s\x27, ignored\n",
-        decided, d[2], d[1] > "/dev/stderr"
-  }
-}
+awk -F'\t' -v only="$only" '
+BEGIN { n = split(only, w, "\t"); for (i = 1; i <= n; i++) want[w[i]] = 1 }
 FNR == 1 && $1 == "date" { next }                   # header row
 NF != 10 {                                          # not a ledger row: say so
   printf "ledger-tally: %s:%d: skipped, not ten fields\n", FILENAME, FNR > "/dev/stderr"
@@ -77,7 +58,7 @@ END {
   }
   close("sort")
   for (r in rows)
-    if (rows[r] >= 3 && rruns[r] >= 2 && !(r in done))
+    if (rows[r] >= 3 && rruns[r] >= 2)
       printf "exclude?\t%s\t%d\t%d\n", r, rows[r], rruns[r] | "sort"
   close("sort")
 }' "${ledgers[@]}"

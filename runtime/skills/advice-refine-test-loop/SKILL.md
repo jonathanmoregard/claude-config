@@ -150,7 +150,9 @@ that ran and reported nothing.
 
 End the report with the `ledger-tally.sh` line for each check that ran in
 this close-out. If a line says `drop` or `reword`, or an `exclude?` line
-appears, put it to the user as one closed question. Change nothing yourself.
+appears that `references/exclusion-decisions.tsv` does not already decide
+(by meaning, not wording; see `references/ledger.md`), put it to the user as
+one closed question. Change nothing yourself.
 
 Never claim broad audit coverage from this bounded close-out review. Two
 empty rounds are two samples, not proof.

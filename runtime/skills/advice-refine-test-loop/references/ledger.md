@@ -53,11 +53,12 @@ Then propose, to the user, never on your own:
 3. **Exclude** a category when the same `fp_reason` appears on three or more
    rows across two or more runs: one entry in `exclusions.md`.
 
-Every answer to rule 3, yes or no, also gets a row in
-`exclusion-decisions.tsv` (`fp_reason`, `accepted` or `rejected`, date) in
-the same change. The tally never proposes a listed `fp_reason` again. It
-matches the exact string, so write new rows' `fp_reason` in the wording
-already listed, and never put a listed reason to the user.
+Before putting an `exclude?` line to the user, read
+`exclusion-decisions.tsv`: the categories the user already accepted or
+rejected. Drop, without asking, every candidate that means the same as a
+listed category, however it is worded; the tally counts exact strings and
+cannot tell. Every answer to rule 3, yes or no, gets a row there
+(`fp_reason`, `accepted` or `rejected`, date) in the same change.
 
 `A` cannot be dropped; it is reworded. A change the user accepts goes through
 the normal change process for these files, tally included.
