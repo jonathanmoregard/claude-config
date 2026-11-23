@@ -222,14 +222,20 @@ def _remote_protocol(policy: dict) -> str:
     return policy["remoteUrl"].split("://", 1)[0]
 
 
+def _mirror_fds(policy: dict) -> tuple:
+    fd = policy.get("mirror_fd")
+    return (fd,) if fd is not None else ()
+
+
 def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
              ) -> subprocess.CompletedProcess:
-    # Own process group, killed whole on timeout: a fetch's remote helper and
-    # index-pack must not outlive the mirror lock that covers them.
+    # Own process group, killed whole on timeout. Git and its helpers also
+    # inherit the mirror lock's fd, so the flock stays held while any of them
+    # lives, even past the broker's death.
     argv = ["git", *_GIT_OVERRIDES, *argv]
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             env=_git_env(policy, protocol), stdin=subprocess.DEVNULL,
-                            start_new_session=True)
+                            start_new_session=True, pass_fds=_mirror_fds(policy))
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -358,7 +364,7 @@ def _extract_scenarios(policy: dict, sha: str, dest: Path) -> None:
     archive = subprocess.Popen(["git", *_GIT_OVERRIDES, f"--git-dir={policy['mirror']}", "archive",
                                 sha, "--", policy["scenarioRoot"]], stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=_git_env(policy, "file"),
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL, pass_fds=_mirror_fds(policy))
     # The archive must be gone before the caller frees the mirror lock, on every path.
     try:
         tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)], stdin=archive.stdout,
@@ -591,6 +597,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
         mirror = _acquire([policy["lock"]], deadline, rec, "the mirror lock",
                           f"the agent-e2e mirror lock stayed busy past the "
                           f"{policy['maxQueueSec']}s queue limit; try again later")
+        policy["mirror_fd"] = mirror
         try:
             def check_cancel() -> None:
                 if rec is not None and rec.cancelled:
@@ -599,8 +606,11 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
             _update_mirror(policy)
             check_cancel()
             master = _resolve(policy, "origin/master")
+            check_cancel()
             old = _resolve(policy, req["old_ref"])
+            check_cancel()
             new = _resolve(policy, req["new_ref"])
+            check_cancel()
             scen_rel = f"{policy['scenarioRoot']}/{req['scenario']}"
             for name in _RUN_FILES:
                 if _git(policy, "cat-file", "-e", f"{new}:{scen_rel}/{name}").returncode != 0:
@@ -624,6 +634,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 shutil.rmtree(campaign / "harness", ignore_errors=True)
             raise
         finally:
+            policy.pop("mirror_fd", None)
             os.close(mirror)
         try:
             argv = [sys.executable, "-I", str(harness), "run",
@@ -662,8 +673,8 @@ TOOLS = [{
         "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
         "(origin/<branch> or a pushed 40-hex commit). Up to maxCampaigns campaigns run at "
         "once; when every slot is busy the call waits for one to free (up to maxQueueSec, "
-        "not strictly first-come-first-served), then blocks until the run is done (up to an hour "
-        "after setup). Returns the harness summary table, every run's "
+        "not strictly first-come-first-served), then blocks until the run is done (about an hour at "
+        "most after setup). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "
         "FAIL and INCONCLUSIVE is reported; nothing is retried."),
     "inputSchema": {

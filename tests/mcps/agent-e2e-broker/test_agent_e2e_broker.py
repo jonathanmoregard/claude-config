@@ -414,11 +414,29 @@ class RunTests(Fixture):
         self._assert_campaign_after(released)
 
     def test_mirror_lock_wait_shares_the_queue_deadline(self) -> None:
+        # Slots free at 1s (taken at the 2s poll), mirror busy throughout, 3s
+        # budget, 2s polls: a shared deadline gives up at the 4s poll; a fresh
+        # mirror deadline (2s + 3s) would give up at 6s.
+        self._release_later(self.policy["slots"])
         with self._hold([self.policy["lock"]]):
             t0 = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "mirror lock stayed busy"):
                 self.server._tool_run(self.req())
-            self.assertLess(time.monotonic() - t0, self.raw["maxQueueSec"] + 2.5)
+            self.assertLess(time.monotonic() - t0, self.raw["maxQueueSec"] + 2.0)
+
+    def test_git_holds_the_mirror_lock_while_it_lives(self) -> None:
+        import fcntl
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        fd = self.server._open_lock(self.policy["lock"])
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.policy["mirror_fd"] = fd
+        # A helper git leaves behind, detached from git's output pipes.
+        alias = "!sleep 5 </dev/null >/dev/null 2>&1 &"
+        self.server._git_run(self.policy, ["-c", f"alias.bg={alias}", "bg"], timeout=10)
+        os.close(fd)   # the broker's own copy is gone, as if it died
+        with open(self.policy["lock"], "w") as fh:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_cancel_while_waiting_for_the_mirror_lock(self) -> None:
         rec = self.server._InFlight()
