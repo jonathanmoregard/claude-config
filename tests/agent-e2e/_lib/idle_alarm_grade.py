@@ -13,8 +13,10 @@ background task the parent started from a Bash call that runs
 not on command text, means a foreground `pgrep -f "wait-for agent X"`, a
 denied TaskStop or a kill of some other task cannot count.
 
-stall: PASS = a waiter, notify.log shows the alarm, and a waiter's
-       notification reports exit code 5 followed by a parent turn.
+Either mode: FAIL first if notify.log holds the stall toast ("Background agent
+stalled"): a stall must not reach the desktop. Other hooks' toasts are ignored.
+stall: PASS = a waiter whose notification reports exit code 5, followed by
+       a parent turn.
        INCONCLUSIVE = no alarm because Claude Code stopped the waiter (headless
        time limit, memory) and nothing else went wrong. Else FAIL.
 quiet: PASS = a waiter, no alarm, and the parent's own TaskStop/KillShell
@@ -33,12 +35,18 @@ import sys
 
 
 def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
+    notify_path = run / "notify.log"
+    # The alarm is the waiter's exit 5; the stall toast is a regression in any
+    # mode, so it is checked before every other verdict. Other hooks' toasts
+    # (harness-tripwire) land in the same stub log and are not this scenario's
+    # business, so match the stall toast's title.
+    if notify_path.exists() and \
+            "Background agent stalled" in notify_path.read_text(errors="replace"):
+        return 1, "stall toast sent (notify.log has 'Background agent stalled')"
     try:
         transcript = (run / "transcript.jsonl").read_text(errors="replace")
     except OSError:
         return 2, "no transcript"
-    notify_path = run / "notify.log"
-    fired = notify_path.exists() and "stalled" in notify_path.read_text(errors="replace")
 
     events = []
     for line in transcript.splitlines():
@@ -124,16 +132,19 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
     stopped_after = any(watches.get(t) in done_at and n > done_at[watches[t]]
                         for t, n in parent_kills.items())
 
-    summary = (f"agent_ids={sorted(ids)} waiters={sorted(waiters)} notify={fired} "
+    summary = (f"agent_ids={sorted(ids)} waiters={sorted(waiters)} "
                f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
                f"system_stopped={sorted(system_stopped)} live={live} other_exits={broken}")
     armed = bool(waiters)
+    # The alarm fired: some waiter exited 5. Neither lenient verdict below
+    # applies once it has, as before when notify.log stood for this.
+    fired = any(code == 5 for _, _, code in exits)
     if broken == [3] and not fired and not any((run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")):
         # No subagent transcript was ever written: the harness did not persist
         # the session, so wait-for could only say "no transcript". Not a verdict.
         return 2, summary + " (no subagent transcript persisted)"
     if mode == "stall":
-        if armed and fired and seen:
+        if armed and seen:
             return 0, summary
         if armed and not fired and system_stopped and not broken and not parent_kills:
             # Claude Code stopped the waiter before it could fire: a resource
@@ -141,7 +152,7 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
             return 2, summary + " (waiter stopped by Claude Code before the alarm)"
         return 1, summary
     if mode == "quiet":
-        if not armed or fired or broken or any(code == 5 for _, _, code in exits):
+        if not armed or broken or any(code == 5 for _, _, code in exits):
             return 1, summary
         if live or not stopped_after:
             return 2, summary + " (waiter not stopped after the result, or one left running)"
