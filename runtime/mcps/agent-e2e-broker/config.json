@@ -18,8 +18,6 @@
     "maxTimeoutSec": 900,
     "maxCallSec": 3600,
     "outputLimitChars": 20000,
-    "readOnlyPaths": ["/home/jonathan/Repos/router-agent"],
-    "maxCampaigns": 3,
-    "maxQueueSec": 1800
+    "readOnlyPaths": ["/home/jonathan/Repos/router-agent"]
   }
 }

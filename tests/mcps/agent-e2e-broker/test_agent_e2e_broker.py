@@ -216,14 +216,38 @@ class ValidationTests(Fixture):
             self.server._validate_request(self.req(n=2, jobs=1, timeout_sec=900), policy)
 
     def test_client_timeout_covers_queue_wait_plus_longest_call(self) -> None:
-        raw = json.loads((HERE / "config.json").read_text())["agentE2eBroker"]
+        self.server.PROTOCOL = "https"
+        policy = self.server._load_policy(json.loads((HERE / "config.json").read_text()))
         servers = json.loads((HERE.parents[2] / "runtime/mcp-servers.json").read_text())
         timeout_ms = servers["agent_e2e_broker"]["timeout"]
         # Queue + mirror wait share maxQueueSec; then setup at its worst; then the
         # run's call_timeout (worst + 120), _run_argv's +60 and its 10s TERM grace.
-        need = (raw["maxQueueSec"] + self.server.SETUP_BOUND_SEC
-                + raw["maxCallSec"] + 120 + 60 + 10)
+        need = (policy["maxQueueSec"] + self.server.SETUP_BOUND_SEC
+                + policy["maxCallSec"] + 120 + 60 + 10)
         self.assertGreaterEqual(timeout_ms, need * 1000)
+
+    # The keys a broker accepted before campaign slots. A broker already running
+    # in an open session re-reads config.json on every call and refuses unknown
+    # keys, and the deploy rewrites that file in place: a key outside this set
+    # fails every call of every such session until its MCP server restarts.
+    # New policy keys therefore stay optional, with in-code defaults.
+    _PRE_SLOT_POLICY_KEYS = ("version", "remoteUrl", "stateDir", "harness", "scenarioRoot",
+                             "claudeExecutable", "path", "models", "maxSamples", "maxJobs",
+                             "maxBudgetUsd", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
+                             "readOnlyPaths")
+
+    def test_shipped_config_loads_in_a_broker_still_running_older_code(self) -> None:
+        raw = json.loads((HERE / "config.json").read_text())["agentE2eBroker"]
+        self.assertLessEqual(set(raw), set(self._PRE_SLOT_POLICY_KEYS))
+
+    def test_queue_limits_default_when_absent_and_are_checked_when_present(self) -> None:
+        raw = {k: v for k, v in self.raw.items() if k not in ("maxCampaigns", "maxQueueSec")}
+        policy = self.server._load_policy({"agentE2eBroker": raw})
+        self.assertEqual((len(policy["slots"]), policy["maxQueueSec"]), (3, 1800))
+        for key in ("maxCampaigns", "maxQueueSec"):
+            for bad in (0, -1, True, "3", 1.5):
+                with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
+                    self.server._load_policy({"agentE2eBroker": {**raw, key: bad}})
 
     def test_shipped_config_names_paths_of_this_repo(self) -> None:
         self.server.PROTOCOL = "https"
@@ -331,63 +355,109 @@ class RunTests(Fixture):
         with self._hold([legacy]):   # an old broker mid-campaign
             self.assertIn("harness exit 0", self.server._tool_run(self.req()))
 
-    def test_cancel_during_setup_starts_no_unit(self) -> None:
-        rec = self.server._InFlight()
-        real = self.server._checkout_harness
-        def checkout_then_cancel(*a, **k):
-            rec.cancelled = True
-            return real(*a, **k)
-        self.server._checkout_harness = checkout_then_cancel
-        try:
-            with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
-                self.server._tool_run(self.req(), rec)
-        finally:
-            self.server._checkout_harness = real
-        # Nothing of the campaign is left: no run, no harness, no campaign dir.
-        self.assertEqual(list(self.out.glob("*")), [])
-        self._assert_slots_free()
+    # Setup's git children in order, each named by one exact argv element. old_ref
+    # is a SHA so the SHA path of _resolve runs too.
+    _SETUP_STEPS = ("init", "fetch", "refs/remotes/origin/master^{commit}", "OLD^{commit}",
+                    "--contains", "NEW:tests/agent-e2e/demo/prompt.md",
+                    "NEW:tests/agent-e2e/demo/check.sh", "prune", "archive", "clone",
+                    "checkout")
 
-    def test_cancel_during_fetch_skips_the_rest_of_setup(self) -> None:
-        rec = self.server._InFlight()
-        real, resolved = self.server._update_mirror, []
-        def fetch_then_cancel(policy):
-            real(policy)
-            rec.cancelled = True
-        self.server._update_mirror = fetch_then_cancel
-        real_resolve = self.server._resolve
-        self.server._resolve = lambda *a: resolved.append(a) or real_resolve(*a)
-        with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
-            self.server._tool_run(self.req(), rec)
-        self.assertEqual(resolved, [])
-        self.assertEqual(list(self.out.glob("*")), [])
+    def test_cancel_at_any_setup_step_spawns_no_more_git_and_leaves_no_campaign(self) -> None:
+        from unittest import mock
+        old = git(self.repo, "rev-parse", "origin/master")
+        new = git(self.repo, "rev-parse", "origin/feat/x")
+        real_popen = subprocess.Popen
+        for i, step in enumerate(self._SETUP_STEPS):
+            step = step.replace("OLD", old).replace("NEW", new)
+            with self.subTest(step=step):
+                self.raw["stateDir"] = f"{self.state.name}/broker-{i}"
+                policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
+                rec, late, hit = self.server._InFlight(), [], []
 
-    def test_cancel_after_the_scenario_checks_extracts_nothing(self) -> None:
-        rec = self.server._InFlight()
-        real_prune, real_extract, extracted = self.server._prune, self.server._extract_scenarios, []
-        def prune_then_cancel(campaigns):
-            real_prune(campaigns)
-            rec.cancelled = True
-        self.server._prune = prune_then_cancel
-        self.server._extract_scenarios = lambda *a: extracted.append(a) or real_extract(*a)
-        with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
-            self.server._tool_run(self.req(), rec)
-        self.assertEqual(extracted, [])
-        self.assertEqual(list(self.out.glob("*")), [])
+                def popen(argv, *a, **k):
+                    is_git = "git" in argv[:5]   # bare, or under `timeout -s KILL N`
+                    if rec.cancelled and is_git:
+                        late.append(argv)
+                    proc = real_popen(argv, *a, **k)
+                    if is_git and not hit and step in argv:
+                        hit.append(argv)
+                        rec.cancelled = True   # lands while this child runs
+                    return proc
 
-    def test_cancel_during_the_harness_clone_skips_its_checkout(self) -> None:
-        rec = self.server._InFlight()
-        real, after_cancel = self.server._git_run, []
-        def git_run(policy, argv, *a, **k):
-            if rec.cancelled:
-                after_cancel.append(argv)
-            done = real(policy, argv, *a, **k)
-            if argv[0] == "clone":
-                rec.cancelled = True
-            return done
-        self.server._git_run = git_run
-        with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
-            self.server._tool_run(self.req(), rec)
-        self.assertEqual(after_cancel, [])
+                real_prune = self.server._prune
+
+                def prune(campaigns):
+                    if rec.cancelled:
+                        late.append("prune")
+                    real_prune(campaigns)
+                    if step == "prune":   # the local step between the last check and archive
+                        hit.append("prune")
+                        rec.cancelled = True
+
+                self.server._prune = prune
+                try:
+                    with mock.patch.object(subprocess, "Popen", popen), \
+                            self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+                        self.server._tool_run(self.req(old_ref=old), rec)
+                finally:
+                    self.server._prune = real_prune
+                self.assertTrue(hit, f"setup never reached {step}")
+                self.assertEqual(late, [])
+                campaigns = policy["campaigns"]
+                self.assertEqual(list(campaigns.glob("*")) if campaigns.exists() else [], [])
+                self.policy = policy
+                self._assert_slots_free()
+
+    def test_setup_failure_up_to_the_launch_leaves_no_campaign(self) -> None:
+        from unittest import mock
+        real_popen = subprocess.Popen
+
+        def no_supervisor(*a):
+            raise RuntimeError("BROKEN safety boundary: not on policy path: setpriv")
+
+        def launch_fails(argv, *a, **k):
+            if str(argv[0]).endswith("setpriv"):
+                raise PermissionError(13, "Permission denied", argv[0])
+            return real_popen(argv, *a, **k)
+
+        for i, (name, patch, error) in enumerate((
+                ("_supervised", mock.patch.object(self.server, "_supervised", no_supervisor),
+                 RuntimeError),
+                ("launch", mock.patch.object(subprocess, "Popen", launch_fails), OSError))):
+            with self.subTest(fails=name):
+                self.raw["stateDir"] = f"{self.state.name}/broker-{i}"
+                self.policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
+                with patch, self.assertRaises(error):
+                    self.server._tool_run(self.req())
+                self.assertEqual(list(self.policy["campaigns"].glob("*")), [])
+                self._assert_slots_free()
+
+    def test_failed_scenario_extraction_frees_the_mirror_lock(self) -> None:
+        # An archive larger than a pipe blocks writing once tar stops reading; it
+        # inherits the mirror lock fd, so it must be reaped before setup fails.
+        import fcntl
+        from unittest import mock
+        git(self.repo, "switch", "-qc", "feat/big")
+        (self.repo / "tests/agent-e2e/demo/blob").write_bytes(os.urandom(1 << 20))
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "big")
+        git(self.repo, "push", "-q", "origin", "feat/big")
+        git(self.repo, "switch", "-q", "master")
+        real_run = subprocess.run
+
+        def tar_times_out(argv, *a, **k):
+            if argv[0] == "tar":
+                raise subprocess.TimeoutExpired(argv, k.get("timeout"))
+            return real_run(argv, *a, **k)
+
+        with mock.patch.object(subprocess, "run", tar_times_out), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            self.server._tool_run(self.req(new_ref="origin/feat/big"))
+        with open(self.policy["lock"], "w") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.fail("a git archive outlived setup and kept the mirror lock")
 
     def test_lock_fd_is_closed_when_flock_fails_otherwise(self) -> None:
         import errno, fcntl, types
@@ -618,9 +688,11 @@ class RunDirReadTests(Fixture):
         self.assertNotIn("CANARY-OUTSIDE-RUN-DIR", text)
 
     def test_endless_and_huge_run_files_are_read_bounded(self) -> None:
+        require_units(self)   # without the unit, check.sh never writes the huge file
         require_sandbox(self)
         ref = self.push_script("check.sh", 'truncate -s 3G "$1/final.txt"\n')
         text = self.isolated_run(self.req(new_ref=ref))
+        self.assertIn("harness exit 0", text)
         self.assertLess(len(text), self.raw["outputLimitChars"] + 1000)
         self.assertIn("agent-e2e campaign `demo`", text)
 
@@ -689,14 +761,14 @@ class UnitBindTests(Fixture):
             git(self.repo, "commit", "-qam", "reads swapped")
             git(self.repo, "push", "-q", "origin", "feat/reads-swapped")
             git(self.repo, "switch", "-q", "master")
-            launch = self.server._run_argv
+            launch = self.server._launch
 
             def swap_then_launch(*a, **kw):
                 needed.rename(needed.with_name(needed.name + "-moved"))
                 needed.symlink_to(secret)
                 return launch(*a, **kw)
 
-            self.server._run_argv = swap_then_launch
+            self.server._launch = swap_then_launch
             text = self.server._tool_run(self.req(new_ref="origin/feat/reads-swapped"))
             logs = [p.read_text() for p in self.out.glob("*/out/runs/demo/new/1/setup.log")]
             self.assertNotIn("SECRET-CANARY", text + "".join(logs))
