@@ -2070,34 +2070,15 @@ def test_report_discloses_research_agent_fallback() -> None:
     assert "automatically retries with Codex" in gaps
 
 
-# Names that still carry the retired repo's name but route nothing, compared
-# as whole tokens so a longer word (`-repository`, `-synced`) never rides on a
-# shorter exempt one: the sync unit and its nix file, the bind-mounted clone,
-# the probe skill, this suite's temp-home prefix in rendered paths, and the
-# check's own report line.
-RETIRED_REPO_TOKEN = re.compile(r"ai-client-config[A-Za-z0-9_.-]*")
-EXEMPT_TOKENS = frozenset({
-    "ai-client-config-codex-sync",
-    "ai-client-config-codex-sync.service",
-    "ai-client-config-sync",
-    "ai-client-config-sync.nix",
-    "ai-client-config-repo",
-    "ai-client-config-skill-probe",
-})
-TEMP_HOME_TOKEN = re.compile(r"ai-client-config-roundtrip-[A-Za-z0-9_]+")
-REPORT_LINE_TAIL = re.compile(r" check (?:OK|FAILED)\b")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from retired_repo_names import GENERATED_NAMES  # noqa: E402
+from retired_repo_names import retired_repo_mentions as _mentions  # noqa: E402
 
 
 def retired_repo_mentions(line: str) -> list[str]:
-    found = []
-    for match in RETIRED_REPO_TOKEN.finditer(line):
-        token = match.group().rstrip(".")
-        if token in EXEMPT_TOKENS or TEMP_HOME_TOKEN.fullmatch(token):
-            continue
-        if token == "ai-client-config" and REPORT_LINE_TAIL.match(line, match.end()):
-            continue
-        found.append(token)
-    return found
+    """Names of the retired repo in one line of generated output, beyond the
+    names generated output may carry (tests/retired_repo_names.py)."""
+    return _mentions(line, GENERATED_NAMES, generated=True)
 
 
 def test_retired_repo_exemptions_cover_only_the_names_they_claim() -> None:

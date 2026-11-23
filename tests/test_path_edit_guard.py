@@ -17,6 +17,9 @@ import sys
 
 import pytest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from retired_repo_names import retired_repo_mentions  # noqa: E402
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `runtime/` once the layout migration has landed, the repository root before it;
 # only the shipped subset moved, tests/ stays at the root.
@@ -96,9 +99,7 @@ def assert_codex_denied(payload):
     assert "codex/ in the config repo ~/Repos/claude-config" in reason
     assert "ai-client-config-codex-sync.service" in reason
     # The sync unit keeps the retired repo's name; nothing else may name it.
-    assert "ai-client-config" not in reason.replace(
-        "ai-client-config-codex-sync.service", ""
-    )
+    assert retired_repo_mentions(reason) == [], reason
     return reason
 
 

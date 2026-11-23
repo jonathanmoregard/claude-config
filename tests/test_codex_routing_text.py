@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-import re
 import sys
 
 REPO = Path(__file__).resolve().parents[1]
-RETIRED = re.compile(r"ai-client-config(?!-codex-sync)")
+sys.path.insert(0, str(REPO / "tests"))
+from retired_repo_names import retired_repo_mentions  # noqa: E402
 
 
 def load(name: str, path: Path):
@@ -70,7 +70,7 @@ def test_every_routing_copy_names_codex_in_claude_config() -> None:
     for name, text in found.items():
         flat = " ".join(text.split())
         assert ROUTES[name] in flat, f"{name}: routing phrase missing\n{text}"
-        assert not RETIRED.search(flat), f"{name}: names ai-client-config\n{text}"
+        assert retired_repo_mentions(flat) == [], f"{name}: names ai-client-config\n{text}"
 
 
 if __name__ == "__main__":
