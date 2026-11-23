@@ -121,12 +121,12 @@ def test_running_unit_holds_off_the_alarm_until_it_ends(tmp_path: Path) -> None:
         bash("~/.claude/scripts/wait-for unit build-x --user", bg=True),
     ], finished=False)
     (Path(env["STUB_DIR"]) / "units" / "build-x").write_text("3")
-    # A unit seen running counts as activity, so it is looked at again only
-    # after another full idle period: one poll, no stall within the timeout.
+    # A unit seen running counts as activity and is then polled every step;
+    # after it ends the agent gets a full idle period: no stall in the timeout.
     rc, out = run(env, "ddd4", "--idle", "60", "--timeout", "2")
     assert rc == 124, out
     polls = (Path(env["STUB_DIR"]) / "systemctl.log").read_text().split()
-    assert polls.count("build-x") == 1
+    assert polls.count("build-x") >= 1
     assert notified(env) == ""
 
 
@@ -154,8 +154,12 @@ def test_units_from_every_launcher_are_checked(tmp_path: Path) -> None:
 
 
 def bg_launch(transcript: Path, tool_id: str, task: str, cmd: str, *, done: bool,
-              age: int = 600) -> None:
-    """Append a background Bash launch, its launch result and maybe its completion."""
+              age: int = 600, resumed: bool = True) -> None:
+    """Append a background Bash launch, its launch result and maybe its completion.
+
+    A completion starts a new turn; `resumed` appends that turn's end, as a
+    real agent writes it. Without it the notification is the last row.
+    """
     rows = [
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id,
          "name": "Bash", "input": {"command": cmd, "run_in_background": True}}]}},
@@ -167,6 +171,9 @@ def bg_launch(transcript: Path, tool_id: str, task: str, cmd: str, *, done: bool
     if done:
         rows.append({"type": "user", "message": {"content":
                      f"<task-notification>\n<task-id>{task}</task-id>\n<status>completed</status>"}})
+        if resumed:
+            rows.append({"type": "assistant", "message": {"content": [{"type": "text", "text": "It finished."}],
+                         "stop_reason": "end_turn"}})
     body = transcript.read_text().removesuffix('{"partial')
     transcript.write_text(body + "".join(json.dumps(r) + "\n" for r in rows))
     old = time.time() - age

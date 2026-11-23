@@ -45,11 +45,14 @@ def test_f3_control_long_flag_holds_alarm(tmp_path: Path) -> None:
 
 def test_f4_idle_env_does_not_break_unit_mode(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    env["WAIT_FOR_AGENT_IDLE"] = "2h"
     (Path(env["STUB_DIR"]) / "units" / "x").write_text("0")
-    p = subprocess.run([str(WAIT_FOR), "unit", "x", "--user", "--timeout", "2"], env=env,
-                       capture_output=True, text=True, timeout=10)
-    assert p.returncode != 64, (p.returncode, p.stdout, p.stderr)
+    cmd = [str(WAIT_FOR), "unit", "x", "--user", "--timeout", "2"]
+    clean = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
+    stray = subprocess.run(cmd, env={**env, "WAIT_FOR_AGENT_IDLE": "2h"},
+                           capture_output=True, text=True, timeout=10)
+    # The stray value changes nothing: same exit and output as without it.
+    assert (stray.returncode, stray.stdout) == (clean.returncode, clean.stdout), (clean, stray)
+    assert stray.returncode != 64
 
 
 def test_f5_read_result_with_launch_text_is_not_a_pending_task(tmp_path: Path) -> None:

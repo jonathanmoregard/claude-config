@@ -32,7 +32,13 @@ dispatched = re.search(r"async_launched|Async agent launched|agentId", transcrip
 if not dispatched:
     print("no background Agent dispatch")
     sys.exit(2)
-armed = re.search(r"wait-for agent [A-Za-z0-9]+", commands) is not None
+# Armed on the agent it dispatched: the id in the launch result (or the
+# persisted subagent file's name), not any id-shaped word after `wait-for agent`.
+ids = set(re.findall(r"agentId\W{1,6}([A-Za-z0-9]{6,64})", transcript))
+ids |= {p.name.removeprefix("agent-").removesuffix(".jsonl")
+        for p in (run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")}
+armed = any(re.search(rf"wait-for agent {re.escape(i)}\b", commands) for i in ids)
+print(f"agent_ids={sorted(ids)}")
 stalled_seen = re.search(r"agent [A-Za-z0-9]+ stalled: no activity", transcript) is not None
 finished_seen = re.search(r"agent [A-Za-z0-9]+ finished", transcript) is not None
 fired = "stalled" in notify
