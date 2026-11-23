@@ -28,8 +28,10 @@
 #   wait-for job <slug> [--timeout <s>] -- <cmd> [args...]
 #                                          launch once as a retained user unit,
 #                                          or adopt its recorded run, then wait
-#   wait-for agent <agent-id> [--idle <s>] a background subagent finished (0),
-#                                          or stalled (5): unfinished, its
+#   wait-for agent <agent-id> [--idle <s>] a background subagent finished (0:
+#                                          turn ended, no background command
+#                                          of its own still pending), or
+#                                          stalled (5): unfinished, its
 #                                          transcript unchanged for --idle
 #                                          seconds (default $WAIT_FOR_AGENT_IDLE
 #                                          or 7200), and no user unit it
@@ -40,7 +42,10 @@
 #                                          and --idle + 3600)
 #
 # `agent` finds the subagent under ~/.claude/projects/*/*/subagents/: it has
-# finished once agent-<id>.meta.json says `"finished": true`. The units it
+# finished once agent-<id>.meta.json says `"finished": true` AND every
+# background command it launched has reported back (see agent_pending_tasks:
+# a turn can end while the agent waits on one, and it resumes when that
+# command exits). The units it
 # launched are read from its own transcript: `systemd-run --unit=`, `wait-for
 # job <slug>` and the jobs broker's start tool. While one of them is still
 # running the agent is waiting on real work, so it is not stalled however long
@@ -718,9 +723,44 @@ agent_units() {
     else empty end' 2>/dev/null | sort -u
 }
 
-# The agent's last background command, else its last tool call, on one line.
+# Background commands the agent launched that have not reported back, one
+# "<task-id><TAB><command>" per line. A launch is the tool result "Command
+# running in background with ID: <id>"; its end is a task notification naming
+# `<task-id><id></task-id>`, or the agent stopping that task itself. Measured on
+# the 2026-11-22 stall: the worker launched a wait loop in the background, ended
+# its turn ("I'll wait for that notification") and its meta.json read
+# `finished: true` while that loop was still pending, so `finished` alone means
+# "turn ended", not "done".
+agent_pending_tasks() {
+  jq -nrR '
+    [inputs | fromjson? | select(type == "object")] as $e
+    | [$e[] | select(.type == "assistant") | .message.content[]?
+       | select(type == "object" and .type == "tool_use")] as $uses
+    | ($uses | map(select(.id | type == "string")
+                   | {key: .id, value: (.input.command // .name // "" | tostring)})
+       | from_entries) as $cmd
+    | ($e | map(.message.content? // empty | tostring) | join("\n")) as $all
+    | ($uses | map(select(.name | test("^(TaskStop|KillShell|KillBash)$"))
+       | .input | tostring) | join("\n")) as $stops
+    | $e[] | select(.type == "user") | .message.content
+    | if type == "array" then .[] else empty end
+    | select(type == "object" and .type == "tool_result")
+    | . as $r
+    | (.content | if type == "array" then map(.text? // "") | join("") else tostring end)
+    | capture("Command running in background with ID: (?<id>[A-Za-z0-9]+)")?
+    | .id as $id
+    | select(($all | contains("<task-id>" + $id + "</task-id>")) | not)
+    | select(($stops | contains($id)) | not)
+    | "\($id)\t\($cmd[$r.tool_use_id] // "?" | gsub("\\s+"; " ") | .[0:160])"
+  ' "$1" 2>/dev/null
+}
+
+# The agent's last pending background command, else its last background
+# command, else its last tool call, on one line.
 agent_last_command() {
   local uses last
+  last=$(agent_pending_tasks "$1" | tail -n 1)
+  [ -n "$last" ] && { printf 'pending background `%s`\n' "${last#*$'\t'}"; return; }
   uses=$(agent_tool_uses "$1")
   last=$(jq -r 'select(.name == "Bash" and .input.run_in_background == true)
                 | .input.command // "" | tostring | gsub("\\s+"; " ") | .[0:160]' \
@@ -759,11 +799,14 @@ wait_agent() {
   [ "$idle" -gt 0 ] || usage
   [ -n "${HOME:-}" ] || { echo "wait-for: HOME is unavailable, cannot find agent $target"; exit 3; }
   local step=$(( idle < 120 ? (idle / 4 > 0 ? idle / 4 : 1) : 30 ))
-  local transcript="" meta="" missing=0 now quiet mt mm line
+  local transcript="" meta="" missing=0 now quiet mt mm line pending
   while :; do
     [ -n "$transcript" ] || transcript=$(agent_file .jsonl) || transcript=""
     [ -n "$meta" ] || meta=$(agent_file .meta.json) || meta=""
-    if [ -n "$meta" ] && [ "$(jq -r '.finished // false' "$meta" 2>/dev/null)" = true ]; then
+    # A transcript jq cannot read leaves pending unknown, which is not finished.
+    if [ -n "$meta" ] && [ "$(jq -r '.finished // false' "$meta" 2>/dev/null)" = true ] &&
+       [ -n "$transcript" ] && pending=$(agent_pending_tasks "$transcript") &&
+       [ -z "$pending" ]; then
       echo "agent $target finished"
       exit 0
     fi

@@ -140,6 +140,68 @@ def test_units_from_every_launcher_are_checked(tmp_path: Path) -> None:
     assert polled == {"quoted-u", "my-job", "claude-job-nixbuild"}
 
 
+def bg_launch(transcript: Path, tool_id: str, task: str, cmd: str, *, done: bool,
+              age: int = 600) -> None:
+    """Append a background Bash launch, its launch result and maybe its completion."""
+    rows = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id,
+         "name": "Bash", "input": {"command": cmd, "run_in_background": True}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id,
+         "content": f"Command running in background with ID: {task}. Output is being written to: /tmp/x/{task}.output"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "I'll wait for that notification."}],
+         "stop_reason": "end_turn"}},
+    ]
+    if done:
+        rows.append({"type": "user", "message": {"content":
+                     f"<task-notification>\n<task-id>{task}</task-id>\n<status>completed</status>"}})
+    body = transcript.read_text().removesuffix('{"partial')
+    transcript.write_text(body + "".join(json.dumps(r) + "\n" for r in rows))
+    old = time.time() - age
+    os.utime(transcript, (old, old))
+
+
+def test_turn_ended_on_a_pending_background_command_is_a_stall(tmp_path: Path) -> None:
+    # The 2026-11-22 shape: meta.json says finished, but the wait loop the
+    # worker launched in the background never reported back.
+    env = make_env(tmp_path)
+    t = write_agent(tmp_path, "ggg7", [bash("cargo build")], finished=True)
+    bg_launch(t, "toolu_1", "by457htew", 'until ! pgrep -f "cargo build" >/dev/null; do sleep 2; done',
+              done=False)
+    rc, out = run(env, "ggg7", "--idle", "60")
+    assert rc == 5, out
+    assert 'last: pending background `until ! pgrep -f "cargo build"' in out
+    assert "ggg7 stalled" in notified(env)
+
+
+def test_pending_background_command_that_is_recent_is_not_a_stall(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    t = write_agent(tmp_path, "hhh8", [], finished=True)
+    bg_launch(t, "toolu_2", "bq1", "./long.sh", done=False, age=0)
+    rc, _ = run(env, "hhh8", "--idle", "7200", "--timeout", "2")
+    assert rc == 124
+    assert notified(env) == ""
+
+
+def test_finished_once_every_background_command_reported(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    t = write_agent(tmp_path, "iii9", [], finished=True)
+    bg_launch(t, "toolu_3", "bq2", "./a.sh", done=True)
+    bg_launch(t, "toolu_4", "bq3", "./b.sh", done=True)
+    rc, out = run(env, "iii9", "--idle", "60")
+    assert rc == 0 and "finished" in out
+
+
+def test_background_command_the_agent_stopped_is_not_pending(tmp_path: Path) -> None:
+    env = make_env(tmp_path)
+    t = write_agent(tmp_path, "jjj10", [], finished=True)
+    bg_launch(t, "toolu_5", "bq4", "sleep infinity", done=False)
+    body = t.read_text()
+    t.write_text(body + json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_6", "name": "TaskStop", "input": {"task_id": "bq4"}}]}}) + "\n")
+    rc, out = run(env, "jjj10", "--idle", "60")
+    assert rc == 0, out
+
+
 def test_unknown_agent_and_bad_id(tmp_path: Path) -> None:
     env = make_env(tmp_path)
     rc, out = run(env, "fff6", "--idle", "1")
