@@ -6,7 +6,7 @@ usage: judge.py RUN
 Headless runs in default mode may have the edit denied; the judge then grades
 the change the final message proposes. check.sh runs on the host and the run
 dir is the agent's to write, so run files are read only as regular files
-reached without a symlink (helper_lang.read_run); anything else is a FAIL.
+reached without a symlink (../_lib/run_files.py); anything else is a FAIL.
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
 """
 import os
@@ -14,8 +14,12 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_lib'))
-from helper_lang import Refused, read_run  # noqa: E402
-from structured_judge import Inconclusive, judge  # noqa: E402
+try:
+    from run_files import Refused, read_run
+    from structured_judge import Inconclusive, judge
+except Exception as exc:  # a grader that cannot load is no verdict, never a FAIL
+    print(f'INCONCLUSIVE: grader cannot load: {exc.__class__.__name__}: {exc}')
+    sys.exit(2)
 
 LIMIT = 256 * 1024  # bytes per file; a triage script and a reply are far smaller
 
@@ -68,7 +72,7 @@ def main() -> int:
     prompt = (INSTRUCTIONS + '\n=== THE SCRIPT NOW ===\n' + script.decode('utf-8', 'replace')
               + "\n=== THE ASSISTANT'S FINAL MESSAGE ===\n" + message.decode('utf-8', 'replace'))
     try:
-        v = judge(prompt, SCHEMA, log_dir=str(run))
+        v = judge(prompt, SCHEMA)
     except Inconclusive as exc:
         print(f'INCONCLUSIVE: judge failed: {exc}')
         return 2
@@ -83,4 +87,8 @@ def main() -> int:
     return 1
 
 
-sys.exit(main())
+try:
+    sys.exit(main())
+except Exception as exc:  # a grader crash is no verdict: never let it read as FAIL (exit 1)
+    print(f'INCONCLUSIVE: grader error: {exc.__class__.__name__}: {exc}')
+    sys.exit(2)

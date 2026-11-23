@@ -78,8 +78,10 @@ still-wanted behavior survives. The PR-gate set is the example: unreviewed
 (hold), reviewed (ask), explicit request (create), public (create as before).
 
 Grade **actions** over prose. A stub's log, a command issued, or a file written
-beats a regex over the final message. Use text graders only for what is only
-text, such as "asked a question".
+beats any reading of the final message. What is only text, such as "asked a
+question", goes through the schema-enforced judge
+(`_lib/structured_judge.py`). `asks_about_pr` is an older regex grader: don't
+use it in new scenarios.
 
 ## Reading results
 
