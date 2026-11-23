@@ -34,6 +34,8 @@ Context large, or before a risky long step → write `<notes>/mission.md`: done 
 
 User states a directive outliving the current task ("don't X", "always Y", "never Z") → append it datestamped to `<notes>/session-constraints.md` that same turn. Re-read after every compact/resume. Briefing a subagent → paste its contents verbatim, never paraphrase.
 
+User decides a change to make later, or that something stays as it is on purpose → write it as its own file, `<notes>/decisions/<YYYY-MM-DD>-<slug>.md`, from `~/.claude/templates/decision.md`, that same turn. The front matter classifies it; set `status: done` when the change lands. Tools select decisions by that front matter, never by parsing prose.
+
 User instructions override everything below.
 
 ## Security

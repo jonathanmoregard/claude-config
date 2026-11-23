@@ -1,11 +1,11 @@
 ---
 name: assurance-sweep
-description: Use when a whole repository or long-lived branch needs a robustness pass beyond diff review — before a release or cutover, after a large merge or rewrite, when the same kind of defect keeps coming back, or on asks like "what more can we do to make this safe", "is anything implemented twice", "is the race coverage complete", "can this class of bug be ruled out", "can existing tests cover more", "is this how it's normally done". Not for close-out review of one diff (advice-refine-test-loop).
+description: Use when a whole repository or long-lived branch needs a robustness pass beyond diff review — before a release or cutover, after a large merge or rewrite, when the same kind of defect keeps coming back, or on asks like "what more can we do to make this safe", "is anything implemented twice", "is the race coverage complete", "can this class of bug be ruled out", "can existing tests cover more", "is this how it's normally done", "is the domain typed properly", "too many strings and integers", "parse don't validate across the repo", "does the core speak the domain". Not for close-out review of one diff (advice-refine-test-loop).
 ---
 
 # Assurance Sweep
 
-Six whole-repository lenses, one at a time, each read by one strongest-tier
+Seven whole-repository lenses, one at a time, each read by one strongest-tier
 read-only reviewer. A lens returns ranked proposals; you check them and hand
 them to the user. The sweep only proposes; it edits no source. Building what the
 user picks is ordinary work under the project's usual flow, and no part of
@@ -19,14 +19,24 @@ still lets through, and what the cheapest thing is that would stop it.
 1. The tree is settled: no agent is editing it and the project gate is green.
    A sweep of code in mid-rewrite hardens what is about to be deleted.
 2. Output goes to `<notes>/assurance-sweep/<YYYY-MM-DD>/`, never the repo.
-3. Read the user's recorded decisions. A recorded decision is never a finding.
+3. Read the user's recorded rules (`<notes>/session-constraints.md`) and
+   decisions (`<notes>/decisions/*.md`). A rule, or a decision to keep
+   something, is never a finding. A decision to change something that has
+   not landed is work still to do: the inventory lists it, and lenses report
+   its sites, except in code under "Leaving soon", which lenses skip.
 4. Quote the cost before starting: one strongest-tier whole-repository read
    per lens.
+5. Note the project's tier in the inventory: **production** (outside users,
+   their data, uptime) or **personal** (the owner's own tool or home setup).
+   On a personal project no lens proposes production machinery —
+   observability, alerting, restore rehearsals, leak checks, growth
+   measurement — and the Venues lens marks those methods `n/a`. Neat types,
+   clear structure and working tests still apply in full.
 
 ## Step 1 — Inventory
 
 You write `inventory.md`; you have the shell the reviewer lacks. Template
-and method: `references/inventory.md`. Four sections:
+and method: `references/inventory.md`. Five sections:
 
 1. **Mechanisms.** The jobs this application does at more than one call
    site, found from its own manifests, modules, scripts, tests and deployment
@@ -36,8 +46,18 @@ and method: `references/inventory.md`. Four sections:
    absent or not applicable, with the command that runs it.
 3. **Defect history.** `<notes>/review-ledger.tsv` first, then fix and revert
    commits and the issue tracker.
-4. **Leaving soon.** Code scheduled for deletion or replacement. Lenses skip
-   it.
+4. **Leaving soon.** Code scheduled for deletion, or for replacement by other
+   code. Lenses skip it. Code that stays and is planned to be re-typed,
+   renamed or restructured in place is not leaving: list it nowhere in this
+   section, so the lenses still read it.
+5. **Decided, not done.** The rows
+   `~/.claude/skills/assurance-sweep/scripts/pending-decisions.sh <notes>`
+   prints: decision files whose front matter says `kind: change`,
+   `status: pending`, selected by their front matter alone. Paste them as
+   printed. If the script exits non-zero, stop and report its message. Rows
+   marked `unlabelled` or `unparseable` count as pending work for this sweep;
+   never edit a decision file to label it: the report asks the user, in one
+   question, what each of those rows is.
 
 ## Step 2 — Run One Lens
 
@@ -45,13 +65,14 @@ and method: `references/inventory.md`. Four sections:
 |---|---|---|---|
 | 1 | Duplicates | Which job is done in more than one place, and what breaks when the copies diverge? | the mechanism list |
 | 2 | Norms | Which mechanism is unusual or heavier than the ordinary way? (advisory) | the mechanism list |
-| 3 | Defect classes | Which past defects have siblings still in the code, and what would rule the class out? | defect history |
-| 4 | Races | Which pairs of concurrent operations have no test that runs them together? | a way to run two operations at once in a test |
-| 5 | Extrapolation | Which existing test covers much more for a small edit? | property tests; a model or scenario test |
-| 6 | Venues | Which assurance method that would have caught past defects is unused or weaker than claimed? | defect history; the assurance table |
+| 3 | Domain model | Where does the core carry plain strings, numbers, sentinels or adapter vocabulary instead of domain types and domain words? | a type checker in the project gate |
+| 4 | Defect classes | Which past defects have siblings still in the code, and what would rule the class out? | defect history |
+| 5 | Races | Which pairs of concurrent operations have no test that runs them together? | a way to run two operations at once in a test |
+| 6 | Extrapolation | Which existing test covers much more for a small edit? | property tests; a model or scenario test |
+| 7 | Venues | Which assurance method that would have caught past defects is unused or weaker than claimed? | defect history; the assurance table |
 
 Run the lenses the user asked for; with no preference, in this order. Lenses
-1 and 2 can lead to code being deleted. If a later lens ran before their
+1 to 3 can lead to code being deleted or restructured. If a later lens ran before their
 proposals were acted on, say so: it may have read code that is about to go.
 
 1. Compose the prompt from `references/lenses.md`: the shared preamble, then
@@ -74,7 +95,9 @@ project: setting that baseline up is a separate task the user asks for.
 
 The same holds inside a lens that does run. Where a check needs a
 deterministic tool the project does not have, the reviewer names the missing
-tool category under "Not covered" and moves on.
+tool category under "Not covered" and moves on. The one exception is a
+guard a lens block names as its own, such as the Domain model guard: it is a
+test in the existing suite, not a new tool, and is proposed as an item.
 
 ## Step 3 — Check The Reply
 
@@ -118,7 +141,9 @@ Never per pull request, and never on a timer.
    Z". Without one the item is ADVISE at most.
 3. ADVISE items never gate a release. Norms and "heavier than needed" items
    are always ADVISE.
-4. A check, type or lint its caller can sidestep is SKIP, not RECOMMEND.
+4. A check, type or lint its caller can sidestep is SKIP, not RECOMMEND. A
+   type only a parser can build, kept so by the Domain model lens's guard, is
+   not sidestepped.
 5. A lens that returns nothing is a result. Write its file anyway.
 6. One lens run is one sample. Never call the result comprehensive: each
    lens read what its Coverage line says and no more.

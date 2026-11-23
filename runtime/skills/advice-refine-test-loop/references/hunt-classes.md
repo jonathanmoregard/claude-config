@@ -128,11 +128,16 @@ boundary where that parse belongs and the type it should produce.
 ### G3 — Primitive where a type belongs
 
 **When:** identifiers, keys, tokens, emails, URLs, durations, money, anything
-persisted. The newtype route needs G1's typed-and-checked code; the column
+persisted, bounded quantities (brightness, percentages), and any "none" or
+"unknown" value. The newtype route needs G1's typed-and-checked code; the column
 route applies in any language, since the schema does the enforcing.
 **Hunt:** Find a domain value carried as `String`, `i64`, `uuid`-as-text, or a
 raw map — in a signature, a struct field, or a database column — where the
 schema or a newtype could carry it. Flag the definition, not every call site.
+Also a bounded quantity carried as a plain number where a range type
+belongs (a handful of named steps is a closed set: a labelled sum type, not a
+range), and a sentinel (-1, '', 0, an invented default) standing for "none" where an
+explicit case belongs.
 
 ### G4 — Misuse resistance
 
