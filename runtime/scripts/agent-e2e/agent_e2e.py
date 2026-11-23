@@ -380,6 +380,30 @@ def _withhold(fd: int, why: str) -> None:
     _rewrite(fd, WITHHELD.format(why=why).encode())
 
 
+def _scan_form(name: str, text: str):
+    """What the scanner is given for a file, and how a redacted copy is written
+    back (None: as text). JSON is scanned as its decoded strings, the way the
+    hook's client scans a tool result: in the raw text a token right after an
+    escape (`\\nsk-ant-...`) has a letter before it, and the pinned rules,
+    anchored on a non-word character, miss it. A file that does not parse is
+    scanned as text."""
+    if name.endswith(".jsonl"):
+        lines = text.split("\n")
+        try:
+            value = [json.loads(line) if line.strip() else None for line in lines]
+        except (ValueError, RecursionError):
+            return text, None
+        return value, lambda v: "\n".join(json.dumps(x) if line.strip() else line
+                                          for x, line in zip(v, lines))
+    if name.endswith(".json"):
+        try:
+            value = json.loads(text)
+        except (ValueError, RecursionError):
+            return text, None
+        return value, lambda v: json.dumps(v, indent=2)
+    return text, None
+
+
 def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
     """Redact secrets in every regular file under PATH, in place. Returns the
     errors. Each file is opened once, read-only and O_NOFOLLOW, and any
@@ -404,40 +428,40 @@ def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
     else:
         why = None
     errors: list[str] = []
-    batch: list[tuple[int, pathlib.Path, str]] = []
+    batch: list[tuple] = []     # (fd, where, size, value scanned, how to write it back)
 
     def flush() -> None:
         if not batch:
             return
-        def scan(texts: list[str]) -> tuple[list[str] | None, str]:
+        def scan(values: list) -> tuple[list | None, str]:
             try:
                 if why is not None:
                     raise RuntimeError(why)
-                return client.redact_value(texts, cli=cli, timeout=REDACT_TIMEOUT), ""
+                return client.redact_value(values, cli=cli, timeout=REDACT_TIMEOUT), ""
             except (RuntimeError, OSError) as exc:
                 return None, str(exc)
             except Exception as exc:  # the client's ScanError, and anything it did not expect
                 return None, f"{type(exc).__name__}: {exc}"
 
-        redacted, failed = scan([text for _, _, text in batch])
+        redacted, failed = scan([value for _, _, _, value, _ in batch])
         if redacted is not None:
             results = [(r, "") for r in redacted]
         elif why is None and len(batch) > 1:
             # One file the scanner cannot take fails the whole call; scan the
             # batch again file by file, so only that file is withheld.
             results = []
-            for _, _, text in batch:
-                one, failed = scan([text])
+            for _, _, _, value, _ in batch:
+                one, failed = scan([value])
                 results.append((one[0] if one else None, failed))
         else:
             results = [(None, failed)] * len(batch)
-        for (fd, where, text), (result, failed) in zip(batch, results):
+        for (fd, where, _, value, dump), (result, failed) in zip(batch, results):
             try:
                 if result is None:
                     _withhold(fd, f"not scanned for secrets: {failed}")
                     errors.append(f"{where}: withheld, not scanned: {failed}")
-                elif result != text:
-                    _rewrite(fd, result.encode())
+                elif result != value:
+                    _rewrite(fd, (dump(result) if dump else result).encode())
             except OSError as exc:
                 errors.append(f"{where}: could not redact: {exc}")
             finally:
@@ -489,9 +513,10 @@ def redact_dir(path: pathlib.Path, *, required: bool) -> list[str]:
                     continue
                 # Bytes that are not UTF-8 reach the scanner as U+FFFD; the file
                 # is rewritten, and they with it, only when a secret was found.
-                batch.append((fd, where, b"".join(chunks).decode("utf-8", "replace")))
+                text = b"".join(chunks).decode("utf-8", "replace")
+                batch.append((fd, where, len(text), *_scan_form(name, text)))
                 if (len(batch) >= REDACT_BATCH_FILES
-                        or sum(len(t) for _, _, t in batch) > SCAN_FILE_BYTES):
+                        or sum(size for _, _, size, _, _ in batch) > SCAN_FILE_BYTES):
                     flush()
     except OSError as exc:
         errors.append(f"{path}: {exc}")
@@ -702,8 +727,11 @@ def run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
             errors = scrub_dir(run)
         except Exception as exc:
             errors = [f"{run}: scrub raised {exc!r}"]
-        if verdict is not None:
-            _take_redacted(run, verdict)
+            if verdict is not None:  # verdict.json was never scanned: keep only the grade
+                _keep_grade(verdict, "withheld: the scrub raised before it was scanned")
+        else:
+            if verdict is not None:
+                _take_redacted(run, verdict)
         if errors:
             print(f"scrub incomplete in {run}:\n  " + "\n  ".join(errors), file=sys.stderr)
             if verdict is not None:
@@ -730,10 +758,17 @@ def _take_redacted(run: pathlib.Path, verdict: dict) -> None:
     except (OSError, ValueError):
         on_disk = None
     if not isinstance(on_disk, dict) or on_disk.get("verdict") != verdict.get("verdict"):
-        on_disk = {k: verdict[k] for k in ("arm", "run", "config", "verdict") if k in verdict}
-        on_disk["why"] = "verdict.json withheld or unreadable after the scrub"
+        _keep_grade(verdict, "verdict.json withheld or unreadable after the scrub")
+        return
     verdict.clear()
     verdict.update(on_disk)
+
+
+def _keep_grade(verdict: dict, why: str) -> None:
+    """Strip VERDICT, in place, to fields that carry no run output."""
+    kept = {k: verdict[k] for k in ("arm", "run", "config", "verdict") if k in verdict}
+    verdict.clear()
+    verdict.update(kept, why=why)
 
 
 def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,

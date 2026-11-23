@@ -533,12 +533,21 @@ def _scrub_runs(policy: dict, runs: Path) -> str:
     if not os.path.lexists(runs):  # a link planted here is scrub's to refuse
         return ""
     try:
+        if stat.S_IMODE(os.lstat(runs).st_mode) == 0:  # locked by a scrub that died
+            _set_dir_mode(runs, 0o700)
         p = subprocess.run([sys.executable, "-I", str(SCRUBBER), "scrub", "--require-redaction",
                             str(runs)], stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, timeout=600,
+                           text=True, timeout=SCRUB_TIMEOUT,
                            env={"PATH": ":".join(policy["path"]), "LANG": "C.UTF-8"})
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"{TAG} scrub of {runs} failed: {exc!r}"
+        # Killed mid-walk, the scrub leaves files it never reached readable and
+        # unscanned. Lock RUNS until a later scrub gets through it.
+        try:
+            _set_dir_mode(runs, 0)
+            locked = "locked (mode 000) until a later scrub completes"
+        except OSError as lock_exc:
+            locked = f"and could not be locked: {lock_exc}"
+        return f"{TAG} scrub of {runs} failed: {exc!r}; {locked}"
     if p.returncode == 0:
         return ""
     lines = p.stderr.strip().splitlines()
@@ -549,6 +558,8 @@ def _scrub_runs(policy: dict, runs: Path) -> str:
 
 
 SCRUB_REPORT_LINES = 10
+SCRUB_TIMEOUT = 600
+LOGS = ("harness.out", "harness.err")   # in the campaign dir; the unit appends to them
 SCRUB_REPORT_CHARS = 4000    # the whole scrub section of one response
 SCRUBBED_MARK = "scrubbed"   # in the campaign dir, which no unit can write
 REPORTED_MARK = "scrub-reported"
@@ -567,6 +578,54 @@ def _unit_state(policy: dict, unit: str) -> str:
     return p.stdout.strip()
 
 
+def _set_dir_mode(path: Path, mode: int) -> None:
+    """chmod the directory PATH itself, never through a link at PATH. O_PATH
+    opens it whatever its mode; /proc/self/fd then names that very inode."""
+    fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.chmod(f"/proc/self/fd/{fd}", mode)
+    finally:
+        os.close(fd)
+
+
+def _redact_logs(policy: dict, campaign: Path) -> str:
+    """Redact the unit's harness.out and harness.err, which sit outside runs/
+    but inside the Read-allowed tree and carry each verdict's reason. Only once
+    the unit has stopped: it appends to them. A log that cannot be scanned is
+    withheld. Returns an error report, or ""; never raises."""
+    errors = []
+    for name in LOGS:
+        try:
+            fd = os.open(campaign / name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{campaign / name}: not scanned: {exc}")
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            text = os.pread(fd, size, 0).decode("utf-8", "replace") if size <= LOG_SCAN_BYTES else None
+            try:
+                if text is None:
+                    raise secret_redaction.ScanError(f"{size} bytes is past the scan limit")
+                clean = secret_redaction.redact_value(text, cli=_secret_redact(policy),
+                                                      timeout=REDACT_TIMEOUT)
+            except (secret_redaction.ScanError, RuntimeError) as exc:
+                clean = f"{TAG} withheld: not scanned for secrets: {exc}\n"
+                errors.append(f"{campaign / name}: withheld, not scanned: {exc}")
+            if clean != text:
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, clean.encode(), 0)
+        except OSError as exc:
+            errors.append(f"{campaign / name}: could not redact: {exc}")
+        finally:
+            os.close(fd)
+    return f"{TAG} logs of {campaign.name}:\n" + "\n".join(errors) if errors else ""
+
+
+LOG_SCAN_BYTES = 4 * 1024 * 1024
+
+
 def _mark(campaign: Path, name: str) -> str:
     """Create CAMPAIGN/NAME. Returns an error report, or ""; never raises: a
     missing mark only means the next sweep looks at the campaign again."""
@@ -582,7 +641,8 @@ def _scrub_stopped(policy: dict, campaign: Path) -> str:
     """Scrub CAMPAIGN, whose unit systemd has said is stopped, and mark it when
     clean. Left dirty, it is scrubbed again by every sweep, but only its first
     report is given in full: after that it costs each response one line."""
-    report = _scrub_runs(policy, campaign / "out" / "runs")
+    report = "\n".join(r for r in (_scrub_runs(policy, campaign / "out" / "runs"),
+                                    _redact_logs(policy, campaign)) if r)
     if not report:
         return _mark(campaign, SCRUBBED_MARK)
     if os.path.lexists(campaign / REPORTED_MARK):
@@ -666,6 +726,14 @@ def _run_argv(proc: subprocess.Popen, timeout_s: int, rec: Optional[_InFlight]):
         return 124, out or "", (err or "") + f"\n{TAG} harness exceeded {timeout_s}s; stopped"
 
 
+def _scrub_section(*reports: str) -> str:
+    """The scrub reports that lead a response, capped at SCRUB_REPORT_CHARS."""
+    section = "\n".join(r for r in reports if r)
+    if len(section) > SCRUB_REPORT_CHARS:
+        section = section[:SCRUB_REPORT_CHARS] + f"\n{TAG} scrub reports cut"
+    return section
+
+
 def _redact(body: str, cli: str) -> str:
     """BODY with every secret redacted. Raises secret_redaction.ScanError."""
     return secret_redaction.redact_value(body, cli=cli, timeout=REDACT_TIMEOUT)
@@ -693,7 +761,20 @@ def _prune(campaigns: Path) -> None:
     cutoff = time.time() - RETAIN_SEC
     for entry in os.scandir(campaigns):
         if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            _unlock_tree(Path(entry.path))
             shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _unlock_tree(root: Path) -> None:
+    """Give every directory under ROOT its owner bits back, so rmtree can empty
+    it: a run can leave a mode-000 directory the scrub never could, and its
+    campaign would otherwise outlive every prune. Links are never followed."""
+    for dirpath, dirnames, _ in os.walk(root):
+        for name in dirnames:
+            try:
+                _set_dir_mode(Path(dirpath) / name, 0o700)
+            except OSError:
+                continue  # a link, or gone: rmtree, which follows nothing, decides
 
 
 def _open_lock(path: Path) -> int:
@@ -803,9 +884,7 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     finally:
         os.close(lock)
     # First, so a response cut at outputLimitChars still carries it.
-    scrub_report = "\n".join(part for part in (scrubbed, swept) if part)
-    if len(scrub_report) > SCRUB_REPORT_CHARS:
-        scrub_report = scrub_report[:SCRUB_REPORT_CHARS] + f"\n{TAG} scrub reports cut"
+    scrub_report = _scrub_section(scrubbed, swept)
     header = (f"agent-e2e campaign `{req['scenario']}` model={req['model']} n={req['n']} "
               f"jobs={req['jobs']} budget=${req['budget']:g} timeout={req['timeout']}s\n"
               + (f"{scrub_report}\n" if scrub_report else "")

@@ -487,6 +487,38 @@ def _tree_with(tmp_path, text: str) -> pathlib.Path:
     return run
 
 
+def _escaped_shapes(tmp_path) -> pathlib.Path:
+    """A transcript and a verdict as json.dumps writes them: the token right
+    after a `\\n` / `\\t` escape, where a raw-text scan sees a letter before it."""
+    run = _tree_with(tmp_path, "\n".join(json.dumps(x) for x in (
+        {"type": "user", "content": [{"type": "tool_result", "content": f"cat t\n{TOKEN}\n"}]},
+        {"type": "result", "result": f"ok\t{TOKEN}"})) + "\n")
+    (run / "verdict.json").write_text(json.dumps({"verdict": "PASS", "why": f"saw\n{TOKEN}"},
+                                                 indent=2))
+    return run
+
+
+def test_a_token_after_a_json_escape_is_redacted(tmp_path):
+    run = _escaped_shapes(tmp_path)
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    assert _kept_with_token(tmp_path / "out") == []
+    lines = (run / "transcript.jsonl").read_text().splitlines()
+    assert [json.loads(line)["type"] for line in lines] == ["user", "result"]
+    assert json.loads((run / "verdict.json").read_text())["verdict"] == "PASS"
+
+
+@pytest.mark.skipif(shutil.which("secret-redact") is None
+                    or shutil.which("secret-redact").startswith(str(FAKE_REDACT)),
+                    reason="the real secret-redact (nixos-config) is not on PATH")
+def test_the_real_scanner_redacts_a_token_after_a_json_escape(tmp_path):
+    _escaped_shapes(tmp_path)
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"))
+    assert r.returncode == 0, r.stderr
+    assert _kept_with_token(tmp_path / "out") == []
+
+
 def test_required_redaction_withholds_what_it_cannot_scan(tmp_path):
     run = _tree_with(tmp_path, f"FAIL-THE-SCAN {TOKEN}\n")
     r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
@@ -592,7 +624,9 @@ def test_scrub_subcommand_reports_what_it_could_not_reach(tmp_path):
     try:
         r = harness("scrub", str(tmp_path / "out"))
         # fwalk names only the entry it could not open, under the scrubbed root.
-        assert r.returncode == 1 and "Permission denied: '1'" in r.stderr, r.stderr
+        # A report, not a crash: an uncaught PermissionError says the same words.
+        assert r.returncode == 1 and "Traceback" not in r.stderr, r.stderr
+        assert f"{tmp_path / 'out'}: [Errno 13] Permission denied: '1'" in r.stderr, r.stderr
     finally:
         locked.chmod(0o700)
 
@@ -618,13 +652,23 @@ def test_a_raising_scrub_does_not_cost_the_verdict(tmp_path, monkeypatch):
 
     def deep(path):
         raise RecursionError("maximum recursion depth exceeded")
+    run = tmp_path / "out/new/1"
+
+    def graded(*a):  # the grader echoed a token; the scrub never got to scan it
+        v = {"arm": "new", "run": 1, "verdict": "PASS", "why": f"saw {TOKEN}"}
+        (run / "verdict.json").write_text(json.dumps(v))
+        return v
     monkeypatch.setattr(mod, "scrub_dir", deep)
-    monkeypatch.setattr(mod, "_run_one", lambda *a: {"verdict": "PASS"})
-    (tmp_path / "out/new/1").mkdir(parents=True)
+    monkeypatch.setattr(mod, "_run_one", graded)
+    run.mkdir(parents=True)
     verdict = mod.run_one(tmp_path / "sc", "new", "HEAD", 1, tmp_path / "out", None)
     assert verdict["verdict"] == "PASS"
     assert "RecursionError" in verdict["scrub_errors"][0], verdict
-    assert "RecursionError" in (tmp_path / "out/new/1/scrub-errors.txt").read_text()
+    assert "RecursionError" in (run / "scrub-errors.txt").read_text()
+    # Unscanned, so nothing the run wrote is passed on: not to the summary,
+    # stdout, or the verdict.json the finally rewrites.
+    assert TOKEN not in json.dumps(verdict), verdict
+    assert TOKEN not in (run / "verdict.json").read_text()
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -224,8 +225,71 @@ class ScrubRunsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = self._run_tree(Path(tmp) / "decoy")
             (Path(tmp) / "runs").symlink_to(Path(tmp) / "decoy")
-            self.assertIn("incomplete", load_server()._scrub_runs(POLICY, Path(tmp) / "runs"))
+            report = load_server()._scrub_runs(POLICY, Path(tmp) / "runs")
+            # A refusal, not a crash: a scrubber traceback also exits 1.
+            self.assertNotIn("Traceback", report)
+            # O_DIRECTORY|O_NOFOLLOW on a link: ENOTDIR, not ELOOP.
+            self.assertIn(f"{Path(tmp) / 'runs'}: [Errno 20] Not a directory", report)
             self.assertTrue((home / ".claude.json").is_file())
+
+    def test_the_logs_outside_runs_are_redacted_once_the_unit_stopped(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            campaign = Path(tmp) / "c"
+            (campaign / "out/runs").mkdir(parents=True)
+            (campaign / "harness.out").write_text(f"new#1 PASS saw {TOKEN}\n")
+            (campaign / "harness.err").write_text("FAIL-THE-SCAN\n")
+            report = server._scrub_stopped(POLICY, campaign)
+            self.assertNotIn(TOKEN, (campaign / "harness.out").read_text())
+            self.assertIn("[REDACTED:anthropic-token:", (campaign / "harness.out").read_text())
+            self.assertTrue((campaign / "harness.err").read_text().startswith(
+                "[agent-e2e-broker] withheld: not scanned for secrets"))
+            self.assertIn("harness.err: withheld, not scanned", report)
+            self.assertFalse((campaign / "scrubbed").exists())
+
+    def test_a_scrub_that_dies_locks_runs_until_a_later_one_completes(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "runs")
+            hang = Path(tmp) / "hang.py"
+            hang.write_text("import time\ntime.sleep(30)\n")
+            server.SCRUBBER, server.SCRUB_TIMEOUT = hang, 1
+            report = server._scrub_runs(POLICY, Path(tmp) / "runs")
+            self.assertIn("locked (mode 000) until a later scrub completes", report)
+            self.assertEqual(stat.S_IMODE((Path(tmp) / "runs").stat().st_mode), 0)
+            server.SCRUBBER, server.SCRUB_TIMEOUT = load_server().SCRUBBER, 600
+            self.assertEqual(server._scrub_runs(POLICY, Path(tmp) / "runs"), "")
+            self.assertEqual(stat.S_IMODE((Path(tmp) / "runs").stat().st_mode), 0o700)
+            self.assertFalse((home / ".claude.json").exists())
+
+    def test_prune_removes_an_expired_campaign_the_scrub_could_not_clean(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-old")
+            locked = self._locked(home, 2)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("keep\n")
+            outside.chmod(0o500)
+            (home / "link").symlink_to(outside)
+            old = time.time() - server.RETAIN_SEC - 60
+            os.utime(Path(tmp) / "c-old", (old, old))
+            try:
+                server._prune(Path(tmp))
+            finally:
+                for d in locked:
+                    if d.exists():
+                        d.chmod(0o700)
+            self.assertFalse((Path(tmp) / "c-old").exists())
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o500, "followed a link")
+            outside.chmod(0o700)
+
+    def test_the_scrub_section_is_capped(self) -> None:
+        server = load_server()
+        section = server._scrub_section("a" * server.SCRUB_REPORT_CHARS, "b" * 100, "")
+        self.assertEqual(len(section), server.SCRUB_REPORT_CHARS + len("\n[agent-e2e-broker] scrub reports cut"))
+        self.assertTrue(section.endswith("scrub reports cut"))
+        self.assertEqual(server._scrub_section("", "x"), "x")
 
     def _campaign(self, root: Path, name: str, runs: bool = True) -> Path:
         campaign = root / name
@@ -468,6 +532,7 @@ class KilledCampaignTests(Fixture):
                 d.chmod(0o700)
         self.assertIn("harness = origin/master", text)
         self.assertIn("--- per run ---", text)
+        self.assertRegex(text, r"\n- new#1 PASS ")
         self.assertIn("more; `scrub", text)
 
 
