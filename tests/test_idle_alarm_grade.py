@@ -143,9 +143,24 @@ def test_description_text_cannot_fake_a_system_stop(tmp_path: Path) -> None:
     assert grade(tmp_path, events, "quiet") == 0
 
 
+def persisted(tmp: Path) -> None:
+    """The subagent transcript a persisted session writes."""
+    d = tmp / "home" / ".claude" / "projects" / "p" / "s" / "subagents"
+    d.mkdir(parents=True)
+    (d / f"agent-{AGENT}.jsonl").write_text("{}\n")
+
+
 def test_description_text_cannot_fake_exit_5(tmp_path: Path) -> None:
+    persisted(tmp_path)
     events = launched() + armed() + [exited("b1", 3, desc="Wait (exit code 5 = stalled)"), say()]
     assert grade(tmp_path, events, "stall", alarm=True) == 1
+
+
+def test_exit_3_without_a_persisted_transcript_is_inconclusive(tmp_path: Path) -> None:
+    events = launched() + armed() + [exited("b1", 3), say()]
+    assert grade(tmp_path, events, "stall") == 2
+    persisted(tmp_path)
+    assert grade(tmp_path, events, "stall") == 1
 
 
 def test_system_stop_is_not_the_parent_stopping_it(tmp_path: Path) -> None:
