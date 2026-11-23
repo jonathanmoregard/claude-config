@@ -6,9 +6,9 @@ Two events, one rule. When all of these hold:
      default 22:00-09:00, wrapping midnight);
   2. the Cinnamon lock screen is active (org.cinnamon.ScreenSaver.GetActive
      on the session bus);
-  3. the turn ends on a question to the user: the final message ends with `?`
-     or offers lettered options (Stop), or the session calls AskUserQuestion
-     (PreToolUse);
+  3. the turn ends on a question to the user: the final message ends with `?`,
+     its last paragraph asks a question, or it offers lettered options (Stop);
+     or the session calls AskUserQuestion (PreToolUse);
 the hook answers once with PROMPT: on Stop it blocks the stop, on
 AskUserQuestion it denies the call. The session goes ahead on its own
 recommendation, except for costly or hard-to-undo steps, which it leaves open.
@@ -59,6 +59,8 @@ HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 # "**A.**", "A -", "A —". Two distinct letters A-F are an offer of options.
 OPTION = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*|__)?\(?([A-F])(?:\)|\.|:|\*\*|__|\s+[-–—])", re.M)
 TRAILING = re.compile(r"[\s*_`>)\]\"'”’]+$")
+# A sentence that ends in "?": the mark followed by space, closing markup or the end.
+QUESTION = re.compile(r"\?(?:[*_`)\]\"'”’]*)(?:\s|$)")
 
 
 def minutes(value: object) -> int | None:
@@ -98,9 +100,20 @@ def screen_locked() -> bool:
 
 
 def ends_on_question(text: object) -> bool:
+    """The turn ends on a question: its last paragraph asks one, or it offers lettered options.
+
+    "Ends with `?`" alone misses the usual shape here. Measured in the first
+    e2e probe: "Which do you want: 1 or 2? If you pick 1, I'll also need to
+    know ..." asks in its last paragraph and ends on a full stop, and the
+    options were numbered, as the global CLAUDE.md requires of every list.
+    """
     if not isinstance(text, str) or not text.strip():
         return False
-    if TRAILING.sub("", text).endswith("?"):
+    body = TRAILING.sub("", text)
+    if body.endswith("?"):
+        return True
+    last = re.split(r"\n\s*\n", body.strip())[-1]
+    if QUESTION.search(last):
         return True
     return len(set(OPTION.findall(text))) >= 2
 

@@ -58,6 +58,19 @@ def test_statement_is_left_alone(tmp_path: Path) -> None:
     assert run(tmp_path, stop("A single item: A) only one option.")) is None
 
 
+def test_question_in_last_paragraph_with_numbered_options(tmp_path: Path) -> None:
+    # The shape the first e2e probe produced: numbered options, and the
+    # question followed by one more sentence in the same paragraph.
+    msg = ("1. **Transliterate**\n2. **Strip**\n\nI recommend 1.\n\n"
+           "Which do you want: 1 or 2? If you pick 1, I'll also need to know the fallback.")
+    assert run(tmp_path, stop(msg))
+
+
+def test_question_earlier_than_last_paragraph_is_not_the_ending(tmp_path: Path) -> None:
+    msg = "Why did it fail? The cache was stale.\n\nFixed it; tests pass."
+    assert run(tmp_path, stop(msg)) is None
+
+
 def test_trailing_markdown_after_question_mark(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Shall I go on with **step 2?**\n"))
 
