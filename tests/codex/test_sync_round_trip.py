@@ -2070,21 +2070,57 @@ def test_report_discloses_research_agent_fallback() -> None:
     assert "automatically retries with Codex" in gaps
 
 
-# Names that still carry the retired repo's name but route nothing: the sync
-# unit and its nix file, the bind-mounted clone, the probe skill, the check's
-# own report line, and this suite's temp-home prefix in rendered paths.
-RETIRED_REPO_NAMES = re.compile(
-    r"ai-client-config(?!-codex-sync|-sync|-repo|-roundtrip-|-skill-probe| check (?:OK|FAILED)\b)"
-)
+# Names that still carry the retired repo's name but route nothing, compared
+# as whole tokens so a longer word (`-repository`, `-synced`) never rides on a
+# shorter exempt one: the sync unit and its nix file, the bind-mounted clone,
+# the probe skill, this suite's temp-home prefix in rendered paths, and the
+# check's own report line.
+RETIRED_REPO_TOKEN = re.compile(r"ai-client-config[A-Za-z0-9_.-]*")
+EXEMPT_TOKENS = frozenset({
+    "ai-client-config-codex-sync",
+    "ai-client-config-codex-sync.service",
+    "ai-client-config-sync",
+    "ai-client-config-sync.nix",
+    "ai-client-config-repo",
+    "ai-client-config-skill-probe",
+})
+TEMP_HOME_TOKEN = re.compile(r"ai-client-config-roundtrip-[A-Za-z0-9_]+")
+REPORT_LINE_TAIL = re.compile(r" check (?:OK|FAILED)\b")
+
+
+def retired_repo_mentions(line: str) -> list[str]:
+    found = []
+    for match in RETIRED_REPO_TOKEN.finditer(line):
+        token = match.group().rstrip(".")
+        if token in EXEMPT_TOKENS or TEMP_HOME_TOKEN.fullmatch(token):
+            continue
+        if token == "ai-client-config" and REPORT_LINE_TAIL.match(line, match.end()):
+            continue
+        found.append(token)
+    return found
 
 
 def test_retired_repo_exemptions_cover_only_the_names_they_claim() -> None:
-    assert not RETIRED_REPO_NAMES.search("ai-client-config check OK")
-    assert not RETIRED_REPO_NAMES.search("ai-client-config check FAILED: 2 issues")
-    assert not RETIRED_REPO_NAMES.search("ai-client-config-codex-sync.service")
-    assert RETIRED_REPO_NAMES.search("route changes to the ai-client-config checkout")
-    assert RETIRED_REPO_NAMES.search("edit the ai-client-config repository")
-    assert RETIRED_REPO_NAMES.search("ai-client-config checks this")
+    exempt = [
+        "ai-client-config check OK",
+        "ai-client-config check FAILED: 2 issues",
+        "see ai-client-config-codex-sync.service.",
+        "ai-client-config-sync.nix",
+        "/tmp/ai-client-config-roundtrip-k3j_9x/home/.codex",
+    ]
+    routed = [
+        "route changes to the ai-client-config checkout",
+        "edit the ai-client-config repository",
+        "ai-client-config checks this",
+        "edit ai-client-config-repository",
+        "the ai-client-config-repos dir",
+        "ai-client-config-synced",
+        "ai-client-config-codex-syncer",
+        "ai-client-config-skill-probes",
+        "edit ai-client-config.",
+    ]
+    assert [line for line in exempt if retired_repo_mentions(line)] == []
+    assert [line for line in routed if not retired_repo_mentions(line)] == []
 
 
 def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None:
@@ -2104,7 +2140,7 @@ def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None
             except UnicodeDecodeError:
                 continue
             for number, line in enumerate(text.splitlines(), 1):
-                if RETIRED_REPO_NAMES.search(line):
+                if retired_repo_mentions(line):
                     stale.append(f"{path.relative_to(rt.home)}:{number}: {line.strip()}")
         assert stale == [], "\n".join(stale)
         agents = (rt.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
