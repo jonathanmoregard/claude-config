@@ -1,0 +1,45 @@
+# Per-client support map for imported Claude Code capabilities.
+#
+# status values:
+# - shared: render directly with light client wrappers
+# - codex-adapted: render a Codex-specific implementation
+# - claude-only: preserve in metadata, do not render to Codex
+# - reference-only: copy/link for inspection, not advertised as runnable
+# - unsupported: do not render; explain why in reports
+
+[defaults]
+skills = "shared"
+plugin_skills = "shared"
+agents = "codex-adapted"
+hooks = "codex-adapted"
+mcp = "shared"
+
+[skills.orchestrate]
+status = "codex-adapted"
+codex_adapter = "clients/codex/skills/orchestrate/SKILL.md"
+notes = "Codex uses codex-goal-loop instead of Claude ralph-loop."
+
+[skills.ralph-loop]
+status = "claude-only"
+notes = "Claude plugin stop-hook loop; Codex analogue is clients/codex/tools/codex-goal-loop."
+
+[mcp.research-agent]
+status = "shared"
+codex_warning = "normal/deep uses Claude first and automatically falls back to Codex on Claude usage-limit exhaustion."
+
+[agents]
+status = "codex-adapted"
+notes = "Claude agents render as native Codex role TOML. Read-only tool whitelists become a read-only sandbox; Claude model names and exact per-tool whitelists have no direct Codex equivalent."
+
+[hooks]
+status = "codex-adapted"
+unsupported_events = ["ConfigChange", "CwdChanged", "InstructionsLoaded", "PermissionDenied", "StopFailure"]
+notes = "Supported Claude hook events are rendered as active Codex hooks, subject to Codex native hook trust. Unsupported events remain in the source manifest and report."
+
+[settings.skillListingBudgetFraction]
+status = "degraded"
+source_value = 0.03
+codex_native_fraction = 0.02
+codex_version_verified = "0.146.0"
+strategy = "compact-trigger-descriptions"
+notes = "Codex 0.146.0 rejects budget overrides; preserve all enabled skills and compact only generated Codex wrapper descriptions."
