@@ -741,6 +741,73 @@ def test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot() -> None:
             shutil.rmtree(kept, ignore_errors=True)
 
 
+def rollback_with_a_refilled_parent(
+    signum: signal.Signals | None,
+) -> tuple[BaseException | None, BaseException]:
+    """Roll back a publish into a parent it created, which something refills
+    between the rollback's empty check and its rmdir; signum, if any, arrives
+    meanwhile. Asserts the signal mask is back, the output gone and the
+    parent named on stderr; returns what the rollback raised and the publish
+    failure."""
+
+    def stop(number: int, frame: object) -> None:
+        raise SystemExit(128 + number)
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "new" / "deeper" / "AGENTS.md"
+        real_rmdir = Path.rmdir
+
+        def refilled(self: Path) -> None:
+            if signum is not None:
+                os.kill(os.getpid(), signum)
+            (self / "refill").write_text("written meanwhile\n", encoding="utf-8")
+            real_rmdir(self)
+
+        failure = OSError("injected publication failure")
+        stderr = StringIO()
+        caught: BaseException | None = None
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        previous = {number: signal.signal(number, stop) for number in render_codex.STOP_SIGNALS}
+        try:
+            with patch.object(Path, "rmdir", refilled), redirect_stderr(stderr):
+                try:
+                    with render_codex.rollback_paths_on_error([target]):
+                        target.parent.mkdir(parents=True)
+                        target.write_text("published\n", encoding="utf-8")
+                        raise failure
+                except BaseException as exc:
+                    caught = exc
+            left_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        finally:
+            # Ignoring a signal drops it if still pending; then put back both.
+            for number in render_codex.STOP_SIGNALS:
+                signal.signal(number, signal.SIG_IGN)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+        assert left_mask == mask, left_mask
+        assert not target.exists(), target
+        assert str(target.parent) in stderr.getvalue(), stderr.getvalue()
+        return caught, failure
+
+
+def test_a_parent_the_rollback_cannot_remove_never_replaces_the_failure() -> None:
+    # The empty-parent cleanup ran unguarded after the restore: a parent
+    # refilled before its rmdir raised OSError over the publish failure
+    # (sync_codex's CheckFailed escaped as a traceback) and left the stop
+    # signals blocked for good. It is reported; the failure still ends the run.
+    caught, failure = rollback_with_a_refilled_parent(None)
+    assert caught is failure, repr(caught)
+
+
+def test_a_parent_the_rollback_cannot_remove_still_delivers_a_held_stop() -> None:
+    # A stop held off during the rollback is delivered once the restore has
+    # finished, a cleanup that cannot finish notwithstanding.
+    caught, _failure = rollback_with_a_refilled_parent(signal.SIGTERM)
+    assert isinstance(caught, SystemExit), repr(caught)
+    assert caught.code == 128 + signal.SIGTERM, caught.code
+
+
 def test_rollback_never_leaves_a_restored_path_missing() -> None:
     # A rollback removed every target before restoring any: a Codex session
     # starting meanwhile found no config.toml or hooks.json. Each one is
@@ -1380,6 +1447,8 @@ if __name__ == "__main__":
     test_interrupted_publication_rolls_back_like_a_failed_one()
     test_rollback_that_cannot_restore_keeps_its_snapshot_and_names_it()
     test_a_stop_signal_cannot_hide_a_failed_rollbacks_snapshot()
+    test_a_parent_the_rollback_cannot_remove_never_replaces_the_failure()
+    test_a_parent_the_rollback_cannot_remove_still_delivers_a_held_stop()
     test_rollback_never_leaves_a_restored_path_missing()
     test_rollback_leaves_no_snapshot_behind()
     test_a_no_op_publish_leaves_mcp_assets_in_place()

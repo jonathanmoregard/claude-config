@@ -2658,28 +2658,41 @@ def rollback_paths_on_error(paths: list[Path]) -> Iterator[None]:
         yield
     except BaseException as failure:
         held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        restored = False
         try:
-            # Restored in place, so a Codex session starting now never finds
-            # config.toml or hooks.json missing; then what the run added goes.
-            for path, (kind, saved) in snapshots.items():
-                restore_snapshot_entry(path, kind, saved)
-            for path in targets:
-                if path not in snapshots and (path.exists() or path.is_symlink()):
-                    remove_path(path)
-        except Exception as error:
-            release_stop_signals(held, deliver=False)
-            raise RuntimeError(
-                f"rollback failed: {type(error).__name__}: {error}; the pre-publish "
-                f"snapshot is kept at {snapshot_root} (snapshot.json maps it)"
-            ) from failure
-        shutil.rmtree(snapshot_root, ignore_errors=True)
-        # Parents the publish created, deepest first, once nothing is left in
-        # them; one that still holds something was never the publish's alone.
-        for parent in sorted(missing_parents, key=lambda item: len(item.parts), reverse=True):
-            if parent.is_dir() and not parent.is_symlink() and not any(parent.iterdir()):
-                parent.rmdir()
-        # A stop held off above is delivered here, the rollback complete.
-        release_stop_signals(held, deliver=True)
+            try:
+                # Restored in place, so a Codex session starting now never finds
+                # config.toml or hooks.json missing; then what the run added goes.
+                for path, (kind, saved) in snapshots.items():
+                    restore_snapshot_entry(path, kind, saved)
+                for path in targets:
+                    if path not in snapshots and (path.exists() or path.is_symlink()):
+                        remove_path(path)
+            except Exception as error:
+                raise RuntimeError(
+                    f"rollback failed: {type(error).__name__}: {error}; the pre-publish "
+                    f"snapshot is kept at {snapshot_root} (snapshot.json maps it)"
+                ) from failure
+            restored = True
+            shutil.rmtree(snapshot_root, ignore_errors=True)
+            # Parents the publish created, deepest first, once nothing is left
+            # in them; one that still holds something was never the publish's
+            # alone. Tidying only: one that cannot go is reported, never raised
+            # over the failure that started the rollback.
+            for parent in sorted(missing_parents, key=lambda item: len(item.parts), reverse=True):
+                try:
+                    if parent.is_dir() and not parent.is_symlink() and not any(parent.iterdir()):
+                        parent.rmdir()
+                except OSError as error:
+                    print(
+                        f"codex render rollback: left {parent}, which this run "
+                        f"created: {type(error).__name__}: {error}",
+                        file=sys.stderr,
+                    )
+        finally:
+            # A stop held off above is delivered here once the restore is
+            # complete, and dropped after one that failed (see above).
+            release_stop_signals(held, deliver=restored)
         raise
     shutil.rmtree(snapshot_root, ignore_errors=True)
 
