@@ -1633,6 +1633,73 @@ def test_a_direct_syncs_failed_rollback_names_one_snapshot_of_all_it_changed() -
         assert str(rt.config) in {entry["path"] for entry in entries}, entries
 
 
+# Runs sync_codex.main() parked until a line on stdin: in its check (argv 2
+# "check", after the publish) or before its publish (after the snapshot).
+PARKED_SYNC = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import check, render_codex, sync_codex
+def parking(name, real):
+    def parked(*args, **kwargs):
+        print(name + " PARKED", flush=True)
+        sys.stdin.readline()
+        return real(*args, **kwargs)
+    return parked
+if sys.argv[2] == "check":
+    check.main = parking("CHECK", check.main)
+else:
+    render_codex.publish = parking("PUBLISH", render_codex.publish)
+raise SystemExit(sync_codex.main())
+"""
+
+
+def test_overlapping_direct_syncs_leave_the_home_as_it_was() -> None:
+    # A published and parked in its failing check; B snapshotted that
+    # unchecked output; A restored; B published, failed and restored A's
+    # output. Both said the home was back as it was. One run at a time.
+    def start(rt: RoundTrip, where: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [sys.executable, "-B", "-c", PARKED_SYNC, str(rt.repo / "scripts"), where],
+            env={**os.environ, "HOME": str(rt.home)},
+            cwd=rt.home,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    def parks(sync: subprocess.Popen[str], marker: str) -> bool:
+        assert sync.stdout is not None
+        return any(line.strip() == marker for line in sync.stdout)
+
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        # The check fails on a profile outside the mirror, which no publish fixes.
+        (rt.codex / "p.config.toml").write_text('approval_policy = "on-request"\n')
+        before = snapshot(rt.home, ("",))
+        first = start(rt, "check")
+        second: subprocess.Popen[str] | None = None
+        try:
+            assert parks(first, "CHECK PARKED")
+            assert snapshot(rt.home, ("",)) != before
+            second = start(rt, "publish")
+            second_parked = parks(second, "PUBLISH PARKED")
+            first.communicate("\n", timeout=120)
+            second.communicate("\n" if second_parked else None, timeout=120)
+        finally:
+            for sync in (first, second):
+                if sync is not None and sync.poll() is None:
+                    sync.kill()
+                    sync.wait()
+        assert first.returncode == 1, first.returncode
+        assert second.returncode != 0, second.returncode
+        after = snapshot(rt.home, ("",))
+        changed = sorted(
+            key for key in before.keys() | after.keys() if before.get(key) != after.get(key)
+        )
+        assert changed == [], changed
+
+
 def test_frontmatter_invariant_covers_plugin_and_command_wrappers() -> None:
     # Codex reads skills from both roots, and commands render as skills too.
     with round_trip() as rt:
@@ -1869,6 +1936,7 @@ if __name__ == "__main__":
     test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
     test_a_signal_during_a_failed_checks_rollback_waits_for_the_restore()
     test_a_direct_syncs_failed_rollback_names_one_snapshot_of_all_it_changed()
+    test_overlapping_direct_syncs_leave_the_home_as_it_was()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
     test_sync_prunes_references_to_removed_agents_and_disabled_plugins()

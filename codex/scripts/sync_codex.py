@@ -9,13 +9,20 @@ role files), so it publishes first and checks the result: a failed check
 rolls every path the publish may change back to what was there before the
 run, config.toml included, as production's backup restore does. So does
 SIGTERM, SIGHUP or SIGINT before the check has passed.
+
+One direct run at a time per home: a second one that snapshotted the
+first's unchecked output would restore it after its own failed check.
 """
 from __future__ import annotations
 
+import fcntl
+import os
 import signal
+import sys
 from types import FrameType
 
 import check
+import common
 import import_claude
 import render_codex
 
@@ -25,19 +32,41 @@ class CheckFailed(Exception):
 
 
 STOP_SIGNALS = render_codex.STOP_SIGNALS
+# The home itself, locked as a directory: a lock file would be left behind
+# in a home whose first run failed, which the rollback leaves without ~/.codex.
+LOCK = common.HOME
+# EX_TEMPFAIL: another run holds the home; this one changed nothing.
+BUSY = 75
 
 
 def stop(signum: int, frame: FrameType | None) -> None:
     """A stop signal as an exception, so the rollback runs: by default
     SIGTERM and SIGHUP end the process without unwinding, and the unchecked
-    output would stay live. The rollback holds off any stop signal, its own
-    start aside, until it has restored; a repeat after that is ignored."""
+    output would stay live. The rollback ends the run with any stop only
+    once it has restored, one this raised as it started included; a repeat
+    after this is ignored."""
     for other in STOP_SIGNALS:
         signal.signal(other, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 
 def main() -> int:
+    lock = os.open(LOCK, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(
+                f"ai-client-config sync: another sync holds a lock on {LOCK}; nothing changed",
+                file=sys.stderr,
+            )
+            return BUSY
+        return sync()
+    finally:
+        os.close(lock)
+
+
+def sync() -> int:
     for signum in STOP_SIGNALS:
         # One the caller ignores (nohup) stays ignored.
         if signal.getsignal(signum) is not signal.SIG_IGN:
