@@ -29,6 +29,7 @@ from common import (
     CLAUDE,
     MANIFEST,
     PLUGIN_ROOT,
+    REPO,
     REPORT_DIR,
     load_json,
 )
@@ -737,6 +738,11 @@ def output_invariant_errors() -> list[str]:
     return errors
 
 
+# The remediation: import, render and this check, rolled back if it fails.
+# render_codex.py alone would publish unchecked.
+SYNC = REPO / "scripts" / "sync_codex.py"
+
+
 def render_plan_errors(manifest: dict[str, Any]) -> list[str]:
     try:
         plan = prepare_render_plan(manifest, load_support())
@@ -752,14 +758,11 @@ def collect_errors() -> list[str]:
         errors.append(f"{MANIFEST}: must be a non-empty object")
         manifest = None
     if manifest is None:
-        errors.append(f"{MANIFEST}: unusable; run scripts/import_claude.py")
+        errors.append(f"{MANIFEST}: unusable; run {SYNC}")
     else:
         settings = load_json(CLAUDE / "settings.json", {})
         if file_inventory(settings) != manifest.get("source_signature"):
-            errors.append(
-                "Claude source drift detected; run scripts/import_claude.py and "
-                "scripts/render_codex.py"
-            )
+            errors.append(f"Claude source drift detected; run {SYNC}")
         errors.extend(validate_plugin_skills(manifest))
         errors.extend(render_plan_errors(manifest))
     errors.extend(output_invariant_errors())

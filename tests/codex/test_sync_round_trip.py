@@ -1436,6 +1436,24 @@ def test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was() -> None:
         assert (rt.codex / "skills" / "new-skill" / "SKILL.md").is_file()
 
 
+def test_check_remediation_names_the_checked_sync() -> None:
+    # The check's advice is what a user runs next: it must name a script that
+    # exists, and the one that checks and rolls back, not the bare renderer,
+    # which publishes unchecked.
+    with round_trip() as rt:
+        sync = rt.repo / "scripts" / "sync_codex.py"
+        assert sync.is_file(), sync
+        (rt.home / ".claude" / "CLAUDE.md").write_text("changed\n", encoding="utf-8")
+        result = assert_check_fails(rt, "Claude source drift detected")
+        drift = next(line for line in result.stdout.splitlines() if "source drift" in line)
+        assert drift.endswith(f"run {sync}"), drift
+
+        rt.manifest.unlink()
+        result = assert_check_fails(rt, "unusable")
+        unusable = next(line for line in result.stdout.splitlines() if "unusable" in line)
+        assert unusable.endswith(f"run {sync}"), unusable
+
+
 # Runs sync_codex.main() with the check parked until a signal arrives: the
 # publish is live and unchecked when the parent sends it.
 PARKED_CHECK_SYNC = """
@@ -1720,6 +1738,7 @@ if __name__ == "__main__":
     test_agent_role_files_cannot_loosen_the_session()
     test_profile_config_files_cannot_loosen_the_session()
     test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
+    test_check_remediation_names_the_checked_sync()
     test_a_direct_sync_stopped_during_its_check_leaves_the_home_as_it_was()
     test_frontmatter_invariant_covers_plugin_and_command_wrappers()
     test_sync_converges_after_claude_agents_are_removed_or_renamed()
