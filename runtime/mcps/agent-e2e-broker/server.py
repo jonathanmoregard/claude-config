@@ -71,11 +71,12 @@ _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outpu
                   "maxCampaigns", "maxQueueSec")
 SLOT_POLL_SEC = 2.0
 # Worst case of the setup steps' own subprocess timeouts, in order: mirror init
-# 60, fetch 300, three refs resolved at up to 3 x 60 each, three scenario
+# 60, fetch 300, three refs resolved at up to 2 x 60 each, three scenario
 # cat-files at 60, harness cat-file 60 + clone 120 + checkout 120, scenario
-# archive: tar 120 then archive wait 120. The client timeout in
+# archive: tar 120 then archive wait 120. _prune's local rmtree is not bounded
+# and is assumed small (a week of campaign dirs). The client timeout in
 # mcp-servers.json must cover maxQueueSec + this + the longest run.
-SETUP_BOUND_SEC = 60 + 300 + 3 * 3 * 60 + 3 * 60 + 60 + 120 + 120 + 120 + 120
+SETUP_BOUND_SEC = 60 + 300 + 3 * 2 * 60 + 3 * 60 + 60 + 120 + 120 + 120 + 120
 _ARGS = frozenset({"scenario", "old_ref", "new_ref", "model", "n", "jobs",
                    "budget_usd", "timeout_sec"})
 _SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -223,9 +224,22 @@ def _remote_protocol(policy: dict) -> str:
 
 def _git_run(policy: dict, argv: list, timeout: int = 60, protocol: str = "file"
              ) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *_GIT_OVERRIDES, *argv], capture_output=True, text=True,
-                          timeout=timeout, env=_git_env(policy, protocol),
-                          stdin=subprocess.DEVNULL)
+    # Own process group, killed whole on timeout: a fetch's remote helper and
+    # index-pack must not outlive the mirror lock that covers them.
+    argv = ["git", *_GIT_OVERRIDES, *argv]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=_git_env(policy, protocol), stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _git(policy: dict, *argv: str, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -578,7 +592,12 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                           f"the agent-e2e mirror lock stayed busy past the "
                           f"{policy['maxQueueSec']}s queue limit; try again later")
         try:
+            def check_cancel() -> None:
+                if rec is not None and rec.cancelled:
+                    raise RuntimeError("cancelled during campaign setup")
+            check_cancel()
             _update_mirror(policy)
+            check_cancel()
             master = _resolve(policy, "origin/master")
             old = _resolve(policy, req["old_ref"])
             new = _resolve(policy, req["new_ref"])
@@ -597,9 +616,9 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
                 os.close(os.open(campaign / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                                  | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
             _extract_scenarios(policy, new, campaign / "scenarios")
+            check_cancel()
             harness = _checkout_harness(policy, master, campaign / "harness")
-            if rec is not None and rec.cancelled:
-                raise RuntimeError("cancelled during campaign setup")
+            check_cancel()
         except BaseException:
             if campaign is not None:
                 shutil.rmtree(campaign / "harness", ignore_errors=True)

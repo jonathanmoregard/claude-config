@@ -336,6 +336,33 @@ class RunTests(Fixture):
         with self._hold(self.policy["slots"]):
             pass  # every slot was given back
 
+    def test_cancel_during_fetch_skips_the_rest_of_setup(self) -> None:
+        rec = self.server._InFlight()
+        real, calls = self.server._update_mirror, []
+        def fetch_then_cancel(policy):
+            real(policy)
+            rec.cancelled = True
+        self.server._update_mirror = fetch_then_cancel
+        real_checkout = self.server._checkout_harness
+        self.server._checkout_harness = lambda *a, **k: calls.append(1) or real_checkout(*a, **k)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+                self.server._tool_run(self.req(), rec)
+        finally:
+            self.server._update_mirror = real
+            self.server._checkout_harness = real_checkout
+        self.assertEqual(calls, [])
+
+    def test_timed_out_git_takes_its_children_with_it(self) -> None:
+        import subprocess as sp
+        marker = Path(self.tmp.name) / "child-alive"
+        self.policy["mirror"].parent.mkdir(mode=0o700, exist_ok=True)
+        alias = f"!sh -c 'sleep 3; touch {marker}' & sleep 30"
+        with self.assertRaises(sp.TimeoutExpired):
+            self.server._git_run(self.policy, ["-c", f"alias.stall={alias}", "stall"], timeout=1)
+        time.sleep(3.5)
+        self.assertFalse(marker.exists(), "git's child outlived the timeout")
+
     def test_runs_while_another_campaign_holds_a_slot(self) -> None:
         with self._hold(self.policy["slots"][:1]):
             text = self.server._tool_run(self.req())
