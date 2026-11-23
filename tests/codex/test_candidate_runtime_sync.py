@@ -37,7 +37,14 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from roundtrip_support import RoundTrip, copy_repo, describe, render_codex, snapshot  # noqa: E402
+from roundtrip_support import (  # noqa: E402
+    MANAGED_ROOTS,
+    RoundTrip,
+    copy_repo,
+    describe,
+    render_codex,
+    snapshot,
+)
 
 import check  # noqa: E402  (roundtrip_support put codex/scripts on sys.path)
 
@@ -155,6 +162,7 @@ def guard_first_edit_guard_hook(settings: dict[str, object]) -> None:
 def test_a_candidate_hook_disabled_under_codex_fails_the_sync() -> None:
     with tempfile.TemporaryDirectory(prefix="claude-config-candidate-") as td:
         rt = stage_candidate(Path(td), guard_first_edit_guard_hook)
+        assert snapshot(rt.home) == {}, "the staged HOME already holds Codex output"
         result = rt.sync()
         assert result.returncode == 1, describe(result)
         assert "ai-client-config check FAILED" in result.stdout, describe(result)
@@ -175,6 +183,13 @@ def test_a_candidate_hook_disabled_under_codex_fails_the_sync() -> None:
             check.HOOK_DISABLE_GUARD in path.read_text(encoding="utf-8")
             for path in hooks_root.rglob("*.sh")
         ), f"a guarded wrapper survived the rollback\n{describe(result)}"
+        # Not only the wrappers: the HOME had no Codex output before the run,
+        # so the rollback leaves none of it (config.toml, hooks.json, skills,
+        # the plugin), nor the directories the publish created for it.
+        left = sorted(snapshot(rt.home))
+        assert left == [], f"the rollback left {len(left)} published paths: {left[:10]}"
+        roots = [name for name in MANAGED_ROOTS if (rt.home / name).exists()]
+        assert roots == [], f"the rollback left {roots} in the HOME"
 
 
 if __name__ == "__main__":
