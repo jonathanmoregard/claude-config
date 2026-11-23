@@ -89,8 +89,24 @@ def reserve(files: int, info: int, name: str, original: Path) -> str:
     raise AssertionError
 
 
+def entry_name(arg: str) -> str:
+    return os.path.basename(arg.rstrip("/"))
+
+
+def target(arg: str) -> Path:
+    """The parent resolved as the filesystem does, so a link before '..' is followed
+    first (abspath collapses link/.. as text); the last component is kept as given,
+    so a final link is itself what moves. Strict: a parent that cannot be walked
+    (absent, not a directory, a link loop) is an error, never collapsed as text."""
+    head = os.path.dirname(arg.rstrip("/"))
+    return Path(head or ".").resolve(strict=True) / entry_name(arg)
+
+
 def move(arg: str, home: Path) -> None:
-    path = Path(os.path.abspath(arg))
+    try:
+        path = target(arg)
+    except (OSError, RuntimeError):  # RuntimeError: a link loop before Python 3.13
+        fail(f"{arg}: no such file or directory")
     if not os.path.lexists(path):
         fail(f"{arg}: no such file or directory")
     root = root_of(path, home)
@@ -165,6 +181,10 @@ def main(args: list[str]) -> None:
     for arg in args:
         if arg.startswith("-"):
             print(f"trash: options are not accepted: {arg}", file=sys.stderr)
+            sys.exit(64)
+        # "" would be the working directory, "." or ".." a directory above the one named.
+        if entry_name(arg) in ("", ".", ".."):
+            print(f"trash: refusing to trash {arg!r}: it names no single entry", file=sys.stderr)
             sys.exit(64)
     home = HOME
     for arg in args:

@@ -1060,7 +1060,7 @@ def sandboxed_job(tmp_path: Path, slug: str, script: str, **kwargs):
 def slug():
     name = f"sandboxed-job-{os.getpid()}-{time.monotonic_ns()}"
     yield name
-    for suffix in ("log", "lock"):
+    for suffix in ("log", "lock", "status"):
         Path(f"/tmp/{name}.{suffix}").unlink(missing_ok=True)
 
 
@@ -1193,9 +1193,35 @@ def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug
     assert "already ran" in out, out
     assert counter.read_text() == "x\n"
 
-    Path(f"/tmp/{slug}.log").write_text("bad\nMARKER_FAILED rc=7\n")
+    Path(f"/tmp/{slug}.status").write_text("MARKER_FAILED rc=7\n")
     rc, out, _ = sandboxed_job(tmp_path, slug, script)
     assert rc == 1 and "status=7" in out, out
+    assert counter.read_text() == "x\n"
+
+
+def test_a_timed_out_job_whose_output_ends_in_the_marker_is_run_again(
+    tmp_path: Path, slug: str
+) -> None:
+    # The job's own last line was MARKER_OK when the deadline killed it; read
+    # from the log, the retry adopted that as success (reproduced at 84c00e9).
+    counter = tmp_path / "count"
+    rc, out, _ = sandboxed_job(
+        tmp_path, slug,
+        f"echo x >>{counter}; echo MARKER_OK; exec python3 -c \"import time; time.sleep(30)\"",
+        timeout="3")
+    assert rc == 124, out
+    rc, out, _ = sandboxed_job(tmp_path, slug, f"echo x >>{counter}")
+    assert rc == 0 and "already ran" not in out, out
+    assert counter.read_text() == "x\nx\n"
+
+
+def test_a_log_ending_in_the_marker_without_a_status_is_not_adopted(
+    tmp_path: Path, slug: str
+) -> None:
+    counter = tmp_path / "count"
+    Path(f"/tmp/{slug}.log").write_text("MARKER_OK\n")
+    rc, out, _ = sandboxed_job(tmp_path, slug, f"echo x >>{counter}")
+    assert rc == 0 and "already ran" not in out, out
     assert counter.read_text() == "x\n"
 
 

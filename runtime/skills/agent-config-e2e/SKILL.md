@@ -37,9 +37,11 @@ push the branch, then call the MCP tool `mcp__agent_e2e_broker__run`:
 
 It runs origin/master's harness outside the Bash sandbox, with the scenario
 from `new_ref`, and returns the summary table, every verdict and the
-transcripts' directory. It blocks until done, one campaign at a time; `model`
-is haiku or sonnet and `n` at most 2 per call, so call it again for more
-samples and add the counts.
+transcripts' directory. It blocks until done. A few campaigns run at once; when
+every slot is busy the call waits up to 30 minutes for one before it errors.
+`model` is haiku or sonnet and `n` at most 2 per call, so call it again for
+more samples and add the counts. Calls in one message run one after another; for
+parallel campaigns use separate sessions or subagents, since each call blocks its caller.
 
 Run the harness directly only when the broker cannot serve: a change to the
 harness itself, an unpushed ref, or a larger batch. It cannot run inside the

@@ -91,7 +91,14 @@ DEV_ONLY = (
 # instruction files -- stays out of the namespace entirely. A gitlink cannot be
 # moved under `runtime/` without rewriting `.gitmodules` for no gain, and it
 # must not be: the projection has to be per-subpath.
-ROOT_ONLY = (".gitignore", ".gitmodules", "vendor")
+#
+# `codex/` is the Claude-to-Codex renderer. It is production code, so not a dev
+# tree, but nothing under `~/.claude` runs it: the Codex sync is meant to run
+# it from a checkout of this repository (once nixos-config points the sync
+# here; until then it runs ai-client-config's copy), and Codex reads only what
+# it renders. Its own root is `codex/`, so its `REPO / "scripts"` joins are not
+# stale root joins.
+ROOT_ONLY = (".gitignore", ".gitmodules", "vendor", "codex")
 
 # Not a link, unlike every other projected entry: Claude Code REPLACES this
 # file on `/model`, so a link would be swapped back for a regular file on the

@@ -1075,6 +1075,20 @@ def is_binary_blob(top: str, tip: str, path: str) -> bool:
     return blob is not None and "\0" in blob[:8000]
 
 
+def paths_at_tip(top: str, tip: str) -> set[str] | None:
+    """Every file path at TIP, or None when git cannot say. One listing,
+    matched literally by the caller: no pathspec is parsed (a file named
+    ':x' once passed for deleted), and names are decoded exactly as numstat
+    decodes them, so a non-UTF-8 name still matches itself. Full entries,
+    not --name-only: git() strips its output, which ate the leading space of
+    a first-listed ' x.sh'; an entry opens with its mode, which strip cannot
+    touch, and the name follows the tab untouched."""
+    out = git(top, "ls-tree", "-r", "-z", "--full-tree", tip)
+    if out is None:
+        return None
+    return {entry.split("\t", 1)[1] for entry in out.split("\0") if "\t" in entry}
+
+
 def _shown(paths: list[str]) -> str:
     return ", ".join(paths[:15]) + (" …" if len(paths) > 15 else "")
 
@@ -1111,9 +1125,16 @@ def evidence_problem(records: list[dict], info: dict, branch: str, tip: str,
     # read; the branch's passing verdict and drift still apply. Binary is judged
     # by content at the tip, not numstat's "-", which .gitattributes (-diff,
     # binary) can set on any text file.
+    # A file the branch deletes has nothing left at the tip for a Read to open,
+    # so no review could ever cover it. It is held only by the branch's
+    # passing verdict and the drift limit; nothing checks that the review
+    # looked at the deletion itself.
+    # A listing git could not produce excuses nothing.
     trusted = sorted((r for r in mine if not r.get("suspect")), key=lambda r: r.get("ts", 0))
+    present = paths_at_tip(info["top"], tip)
     readable = sorted(p for p, n in changes
-                      if n is not None or not is_binary_blob(info["top"], tip, p))
+                      if (present is None or p in present)
+                      and (n is not None or not is_binary_blob(info["top"], tip, p)))
     unread, blocked, changed = [], [], []
     for path in readable:
         last = None

@@ -286,6 +286,68 @@ def test_trash_refuses(home: Path, args: tuple[str, ...], status: int) -> None:
     assert sorted(str(p) for p in home.rglob("*")) == before
 
 
+@pytest.mark.parametrize("arg", ["", ".", "..", "f/..", "/"],
+                         ids=["empty", "dot", "dotdot", "trailing-dotdot", "slash"])
+def test_trash_refuses_an_operand_that_names_no_entry(home: Path, arg: str) -> None:
+    # "" once went through abspath to the working directory and moved all of it
+    # (reproduced at 84c00e9); rm refuses "." and ".." for the same reason.
+    project = home / "worktrees" / "project"
+    (project / "f").mkdir()
+    (project / "keep").write_text("x")
+    before = sorted(str(p) for p in home.rglob("*"))
+    proc = run_trash(home, str(project / "keep"), arg, cwd=project / "f")
+    assert proc.returncode == 64, proc.stderr
+    assert sorted(str(p) for p in home.rglob("*")) == before
+
+
+def test_trash_follows_a_link_before_its_dotdot(home: Path) -> None:
+    # link -> sub/deep, so link/../item is sub/item. Collapsed as text first it
+    # was ./item, an unrelated file (reproduced at 84c00e9).
+    project = home / "worktrees" / "project"
+    (project / "sub" / "deep").mkdir(parents=True)
+    (project / "sub" / "item").write_text("meant")
+    (project / "item").write_text("unrelated")
+    (project / "link").symlink_to("sub/deep")
+    proc = run_trash(home, "link/../item", cwd=project)
+    assert proc.returncode == 0, proc.stderr
+    assert (project / "item").read_text() == "unrelated"
+    assert not (project / "sub" / "item").exists()
+    assert (home / "worktrees" / ".trash" / "files" / "item").read_text() == "meant"
+    assert origin(home / "worktrees" / ".trash" / "info" / "item.trashinfo") == \
+        os.fsencode(project / "sub" / "item")
+
+
+@pytest.mark.parametrize("arg", ["missing/../item", "file/../item", "loop/../item"],
+                         ids=["absent", "not-a-dir", "link-loop"])
+def test_trash_refuses_a_path_whose_parent_cannot_be_walked(home: Path, arg: str) -> None:
+    # A non-strict resolve collapsed missing/.. as text and moved ./item
+    # (reproduced at 3c3f162); the kernel would refuse that path.
+    project = home / "worktrees" / "project"
+    (project / "item").write_text("x")
+    (project / "file").write_text("y")
+    (project / "loop").symlink_to("loop")
+    before = sorted(str(p) for p in home.rglob("*"))
+    proc = run_trash(home, arg, cwd=project)
+    assert proc.returncode == 1, proc.stderr
+    assert (project / "item").read_text() == "x"
+    assert sorted(str(p) for p in home.rglob("*")) == before
+
+
+def test_trash_moves_a_final_link_itself_and_takes_a_trailing_slash(home: Path) -> None:
+    project = home / "worktrees" / "project"
+    (project / "sub").mkdir()
+    (project / "sub" / "kept").write_text("x")
+    (project / "dirlink").symlink_to("sub")
+    (project / "d").mkdir()
+    proc = run_trash(home, "dirlink", "d/", cwd=project)
+    assert proc.returncode == 0, proc.stderr
+    files = home / "worktrees" / ".trash" / "files"
+    assert os.readlink(files / "dirlink") == "sub"
+    assert (files / "d").is_dir()
+    assert (project / "sub" / "kept").read_text() == "x"
+    assert sorted(os.listdir(project)) == ["sub"]
+
+
 def test_trash_refuses_what_is_already_in_the_trash(home: Path) -> None:
     project = home / "worktrees" / "project"
     (project / "f").write_text("x")

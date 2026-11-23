@@ -97,6 +97,7 @@
       "Read(//home/jonathan/.claude/scripts/**)",
       "Read(//home/jonathan/.claude/runtime/**)",
       "Read(//home/jonathan/.claude/proposals/**)",
+      "Read(//home/jonathan/.local/state/agent-e2e-broker/**)",
       "Read(//home/jonathan/.local/state/claude-proposals/**)",
       "Read(//home/jonathan/.local/state/claude-tasks/**)",
       "Read(//home/jonathan/.local/state/klaffat/e2e-artifacts/**)",
@@ -324,6 +325,7 @@
       "Read(~/.claude/.credentials.json)",
       "Read(//home/jonathan/.claude/.credentials.json)",
       "Read(//home/jonathan/.claude/.claude.json)",
+      "Read(//home/jonathan/.local/state/agent-e2e-broker/**/home/**)",
       "Read(//home/jonathan/.claude/session-env/**)",
       "Read(//home/jonathan/.claude/automation-review/**)",
       "Read(//home/jonathan/.codex/auth.json)",
@@ -434,6 +436,11 @@
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/native-agent-route-observer.py",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/agent-idle-alarm.py",
+            "timeout": 5
           }
         ]
       },
@@ -518,6 +525,16 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -774,6 +791,15 @@
       }
     ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 45
+          }
+        ]
+      },
       {
         "hooks": [
           {
