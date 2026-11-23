@@ -9,6 +9,7 @@ cover turns this suite red.
 """
 from __future__ import annotations
 
+import fcntl
 from itertools import product
 import json
 import os
@@ -1769,6 +1770,29 @@ def test_a_second_direct_sync_changes_nothing_while_one_holds_the_home() -> None
         assert (rt.codex / "AGENTS.md").read_text(encoding="utf-8") != "hand edit\n"
 
 
+def test_a_direct_sync_changes_nothing_while_the_production_publish_holds_codex() -> None:
+    # The production publish (ai-client-config-sync.nix) runs with
+    # ProtectHome=tmpfs: its $HOME is a tmpfs directory, not the home a
+    # direct run locked, so the two could copy and prune into the live home
+    # at once. ~/.codex is bound into it, the same inode on both sides: the
+    # publish holds a flock on it (sync_codex.LOCKS), and a direct run waits
+    # its turn, exiting EX_TEMPFAIL having changed nothing.
+    with round_trip() as rt:
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        before = snapshot(rt.home, ("",))
+        publish = os.open(rt.codex, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(publish, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = rt.sync()
+        finally:
+            os.close(publish)
+        assert result.returncode == 75, describe(result)
+        assert f"another sync holds a lock on {rt.codex}" in result.stderr, describe(result)
+        assert snapshot(rt.home, ("",)) == before
+        rt.sync_ok()
+        assert (rt.codex / "AGENTS.md").read_text(encoding="utf-8") != "hand edit\n"
+
+
 def test_check_remediation_names_the_checked_sync() -> None:
     # The check's advice is what a user runs next: it must name a script that
     # exists, and the one that checks before it publishes, not the bare
@@ -2092,6 +2116,7 @@ if __name__ == "__main__":
     test_a_direct_sync_keeps_the_home_modes_the_production_publish_keeps()
     test_a_direct_sync_stopped_before_it_publishes_leaves_the_home_as_it_was()
     test_a_second_direct_sync_changes_nothing_while_one_holds_the_home()
+    test_a_direct_sync_changes_nothing_while_the_production_publish_holds_codex()
     test_check_remediation_names_the_checked_sync()
     test_the_renderer_alone_publishes_nothing_and_names_the_checked_sync()
     test_the_renderer_imported_outside_a_stage_publishes_nothing()

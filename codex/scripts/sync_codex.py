@@ -24,8 +24,9 @@ mount namespace whose HOME is a staged home, and rsyncs the managed paths
 into the live home only after it exits 0; there, this run's copy lands in
 that staged home.
 
-One direct run at a time per home: two copies at once could interleave into
-a mix of files neither run checked, while both report success.
+One publisher at a time per home, direct run or production publish: two
+copies at once could interleave into a mix of files neither run checked,
+while both report success. Each holds a flock on ~/.codex (LOCKS).
 """
 from __future__ import annotations
 
@@ -44,10 +45,16 @@ import render_codex
 from common import AGENTS_HOME, CODEX, PLUGIN_ROOT
 
 
-# The home itself, locked as a directory: a lock file would be left behind
-# in a home that held nothing before a failed run.
-LOCK = common.HOME
-# EX_TEMPFAIL: another run holds the home; this one changed nothing.
+# Locked (flock, exclusive, as directories: a lock file would be left
+# behind in a home that held nothing before a failed run) for the whole
+# run, in this order. The home: one direct run at a time, ~/.codex or not.
+# ~/.codex, when it exists: the lock the production publish takes too, on
+# "$HOME/.codex", around its backup, rsync and restore. Not the home: that
+# publish runs under ProtectHome=tmpfs, where $HOME is another inode on a
+# tmpfs, while ~/.codex is bound in, the same inode as here. It cannot run
+# before ~/.codex exists (its BindPaths needs it).
+LOCKS = (common.HOME, CODEX)
+# EX_TEMPFAIL: another run holds a lock; this one changed nothing.
 BUSY = 75
 # What the render merges, carried into the stage as the production wrapper
 # carries it into its staged home.
@@ -70,19 +77,24 @@ ENTRY_POINTS = (
 
 
 def main() -> int:
-    lock = os.open(LOCK, os.O_RDONLY | os.O_DIRECTORY)
+    held: list[int] = []
     try:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(
-                f"ai-client-config sync: another sync holds a lock on {LOCK}; nothing changed",
-                file=sys.stderr,
-            )
-            return BUSY
+        for path in LOCKS:
+            if not path.is_dir():
+                continue
+            held.append(os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+            try:
+                fcntl.flock(held[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(
+                    f"ai-client-config sync: another sync holds a lock on {path}; nothing changed",
+                    file=sys.stderr,
+                )
+                return BUSY
         return sync()
     finally:
-        os.close(lock)
+        for fd in held:
+            os.close(fd)
 
 
 def sync() -> int:
