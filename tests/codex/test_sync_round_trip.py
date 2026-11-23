@@ -667,6 +667,58 @@ def test_sync_prunes_what_a_killed_run_left_beside_a_managed_path() -> None:
             assert not path.exists(), path
 
 
+# Runs sync_codex.main() and SIGKILLs it inside replace_entry, the
+# replacement built in its holder, as the publish rewrites a hook file.
+KILLED_IN_HOOK_REPLACE_SYNC = """
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import common, render_codex, sync_codex
+real = common.replace_entry
+def replace_entry(dst, build):
+    if render_codex.HOOK_WRAPPER_ROOT not in dst.parents:
+        return real(dst, build)
+    def killed(entry):
+        build(entry)
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real(dst, killed)
+common.replace_entry = replace_entry
+raise SystemExit(sync_codex.main())
+"""
+
+
+def test_sync_prunes_what_a_killed_run_left_inside_the_hook_generations() -> None:
+    # The hook generations are never pruned, so the holder a run killed
+    # inside replace_entry left there (.<name>.swap-*) outlived every later
+    # sync, and no check reported it.
+    with round_trip() as rt:
+        root = rt.codex / "hooks" / "claude-mirror"
+        wrapper = next(p for p in sorted(root.glob("stop-*.sh")) if "-fanout-" not in p.name)
+        wrapper.write_text("#!/usr/bin/env bash\necho tampered\n", encoding="utf-8")
+        scratch = rt.home.parent / "tmp-killed"
+        scratch.mkdir()
+        killed = subprocess.run(
+            [sys.executable, "-B", "-c", KILLED_IN_HOOK_REPLACE_SYNC, str(rt.repo / "scripts")],
+            env={**os.environ, "HOME": str(rt.home), "TMPDIR": str(scratch)},
+            cwd=rt.home,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert killed.returncode == -signal.SIGKILL, describe(killed)
+        left = [path for path in root.iterdir() if ".swap-" in path.name]
+        assert len(left) == 1, describe(killed)
+
+        result = assert_check_fails(rt)
+        errors = {line for line in result.stdout.splitlines() if line.startswith("- ")}
+        assert errors == {
+            f"- {wrapper}: differs from the render plan",
+            f"- {left[0]}: not in the render plan",
+        }, describe(result)
+        rt.sync_ok()
+        assert not left[0].exists()
+        assert rt.check().returncode == 0
+
+
 def hook_generation_files(rt) -> dict[Path, tuple[bytes, int]]:
     """Each hook generation file by bytes and mode: a repair that rewrote a
     wrapper's bytes but left it unexecutable is no repair."""
@@ -1932,6 +1984,7 @@ if __name__ == "__main__":
     test_sync_prunes_a_nested_role_file_under_the_imported_role_root()
     test_mirror_prunes_every_unplanned_path_inside_the_managed_paths_only()
     test_sync_prunes_what_a_killed_run_left_beside_a_managed_path()
+    test_sync_prunes_what_a_killed_run_left_inside_the_hook_generations()
     test_sync_repairs_a_modified_content_addressed_hook_file()
     test_sync_repairs_generator_owned_hook_paths_of_the_wrong_type()
     test_paths_of_the_wrong_type_are_replaced_only_by_a_sync_that_passes()

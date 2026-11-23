@@ -115,8 +115,9 @@ def publish_stage(stage: Path) -> None:
     """Make the home's managed paths what they are in stage: files by bytes
     and mode, links by target, directories by mode. What
     render_codex.never_pruned_paths names is never pruned: the hook
-    generations live sessions may run are only added to, and Codex's bundled
-    skills, which no stage holds, are left alone."""
+    generations live sessions may run are only added to (what a killed run
+    left among them aside, render_codex.left_in_hook_generations), and
+    Codex's bundled skills, which no stage holds, are left alone."""
     refuse_hook_collisions(stage)
     for root in render_codex.managed_paths():
         copy_into_home(root, stage, skip=ENTRY_POINTS)
@@ -126,6 +127,8 @@ def publish_stage(stage: Path) -> None:
         prune_home(root, stage)
         for leftover in render_codex.beside_managed_path(root):
             common.remove_path(leftover)
+    for leftover in render_codex.left_in_hook_generations():
+        common.remove_path(leftover)
 
 
 def refuse_hook_collisions(stage: Path) -> None:

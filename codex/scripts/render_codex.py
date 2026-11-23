@@ -2314,6 +2314,30 @@ def unplanned_paths(plan: RenderPlan) -> list[Path]:
     for root in managed_paths():
         visit(root)
         found.extend(beside_managed_path(root))
+    found.extend(left_in_hook_generations())
+    return found
+
+
+# The name a run killed inside replace_entry (.<name>.swap-*) or write_file
+# (.<name>.tmp-*) leaves its holder or temporary file under: the prefix,
+# then tempfile's eight random characters.
+KILLED_RUN_LEFTOVER = re.compile(r"\..+\.(?:swap|tmp)-[a-z0-9_]{8}")
+
+
+def left_in_hook_generations() -> list[Path]:
+    """What a run killed inside replace_entry or write_file left among the
+    hook generations: never pruned, yet the sync writes into them, so the
+    walk in unplanned_paths and the publish's prune never reach it there. A
+    generation's name never starts with a dot."""
+    root = located(HOOK_WRAPPER_ROOT)
+    found: list[Path] = []
+    if not root.is_dir() or root.is_symlink():
+        return found
+    for dir_name, dir_names, file_names in os.walk(root):
+        for name in [*dir_names, *file_names]:
+            if KILLED_RUN_LEFTOVER.fullmatch(name):
+                found.append(HOOK_WRAPPER_ROOT / Path(dir_name).relative_to(root) / name)
+        dir_names[:] = [name for name in dir_names if not KILLED_RUN_LEFTOVER.fullmatch(name)]
     return found
 
 
