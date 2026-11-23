@@ -18,14 +18,18 @@ HOOK = RUNTIME / "hooks" / "night-proceed.py"
 PYTHON = shutil.which("python3") or "python3"
 
 FAKE_CLAUDE = """#!/bin/sh
-# Records each classifier call (args, stdin) and answers with $FAKE_REPLY.
+# Records each classifier call (args, stdin) and answers like `--output-format
+# json --json-schema`: {"structured_output": {"verdict": $FAKE_REPLY}}, or
+# $FAKE_RAW verbatim when set.
 n=$(ls "$FAKE_DIR"/call.* 2>/dev/null | wc -l)
 printf '%s\\n' "$@" > "$FAKE_DIR/call.$n"
 cat > "$FAKE_DIR/stdin.$n"
 pwd > "$FAKE_DIR/cwd.$n"
-printf '%s\\n' "${FAKE_REPLY-QUESTION}"
+if [ -n "${FAKE_RAW+x}" ]; then printf '%s\\n' "$FAKE_RAW"
+else printf '{"type":"result","structured_output":{"verdict":"%s"}}\\n' "${FAKE_REPLY-QUESTION}"; fi
 exit "${FAKE_RC:-0}"
 """
+VERDICT_QUESTION = '{"type":"result","structured_output":{"verdict":"QUESTION"}}'
 
 
 def fake_bin(tmp: Path) -> Path:
@@ -81,7 +85,10 @@ def test_night_locked_question_blocks_the_stop(tmp_path: Path) -> None:
     out = run(tmp_path, stop(AB))
     assert out == {"decision": "block", "reason": out["reason"]}
     assert out["reason"].startswith("The user is likely asleep")
-    assert "force pushes" in out["reason"] and "break a directive the user gave" in out["reason"]
+    assert "force pushes" in out["reason"] and "break a directive the user explicitly gave" in out["reason"]
+    # User review: tracked deletions are recoverable, removing a dependency is cheap.
+    assert "deleting untracked files" in out["reason"]
+    assert "dependencies" not in out["reason"] and "deletions" not in out["reason"]
 
 
 def test_classifier_is_sonnet_without_tools_hooks_or_session(tmp_path: Path) -> None:
@@ -91,6 +98,11 @@ def test_classifier_is_sonnet_without_tools_hooks_or_session(tmp_path: Path) -> 
     assert args[args.index("--tools") + 1] == ""
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     assert json.loads(args[args.index("--settings") + 1]) == {"disableAllHooks": True}
+    # The verdict comes back through the schema-forced structured output.
+    assert args[args.index("--output-format") + 1] == "json"
+    schema = json.loads(args[args.index("--json-schema") + 1])
+    assert schema["properties"]["verdict"]["enum"] == ["QUESTION", "DONE"]
+    assert schema["required"] == ["verdict"]
     sent = (tmp_path / "claude-calls" / "stdin.0").read_text()
     assert sent.startswith("<message>\n") and AB in sent and sent.rstrip().endswith("</message>")
 
@@ -103,12 +115,18 @@ def test_long_message_sends_its_end(tmp_path: Path) -> None:
 
 def test_classifier_done_or_failing_means_no_reply(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Done 1. Tests pass."), reply="DONE") is None
-    assert run(tmp_path, stop("Done 2?"), reply="QUESTION, probably") is None
+    assert run(tmp_path, stop("Done 2?"), reply="question") is None
     assert run(tmp_path, stop("Done 3?"), reply="") is None
     assert run(tmp_path, stop("Done 4?"), extra={"FAKE_RC": "1"}) is None
     assert run(tmp_path, stop("Done 5?"), extra={"PATH": "/nonexistent"}) is None
-    # Trailing punctuation or markup around the one word is still the word.
-    assert run(tmp_path, stop("Q 6?"), reply="**Question.**")
+    # Only the structured verdict counts: free text, bad JSON, or a result
+    # without structured_output (schema not honoured) is no reply.
+    assert run(tmp_path, stop("Done 6?"), extra={"FAKE_RAW": "QUESTION"}) is None
+    assert run(tmp_path, stop("Done 7?"), extra={"FAKE_RAW": "{not json"}) is None
+    assert run(tmp_path, stop("Done 8?"),
+               extra={"FAKE_RAW": '{"type":"result","result":"QUESTION"}'}) is None
+    assert run(tmp_path, stop("Done 9?"), extra={"FAKE_RAW": "[1]"}) is None
+    assert run(tmp_path, stop("Q 10?"), extra={"FAKE_RAW": VERDICT_QUESTION})
 
 
 def test_no_classifier_call_outside_the_window(tmp_path: Path) -> None:
@@ -214,7 +232,7 @@ with open("{state}/s1.lock", "a") as f:
         got = "held"
     pathlib.Path("{state}/s1.json").write_text(json.dumps(["turn:p1"]))
 pathlib.Path("{tmp_path}/lock-state").write_text(got)
-print("QUESTION")
+print({VERDICT_QUESTION!r})
 """)
     (bindir / "claude").chmod(0o755)
     assert run(tmp_path, stop(AB, prompt_id="p1"),
@@ -247,7 +265,7 @@ def test_hanging_classifier_fails_open(tmp_path: Path, monkeypatch, capsys) -> N
     # Answers QUESTION, but only after 30 s: without the timeout this denies.
     (bindir / "claude").write_text(
         f'#!/bin/sh\ntouch "{tmp_path}/classifier-ran"\n'
-        f'exec {PYTHON} -c "import time; time.sleep(30); print(\'QUESTION\')"\n')
+        f'exec {PYTHON} -c "import time; time.sleep(30); print({VERDICT_QUESTION!r})"\n')
     (bindir / "claude").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     mod = load_hook(tmp_path, monkeypatch)
