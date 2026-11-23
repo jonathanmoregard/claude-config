@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -262,6 +263,412 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
     sc = _scenario(tmp_path, "exit 0")  # a check that would PASS anything
     _, _, verdicts = _run(tmp_path, sc, claude)
     assert verdicts[0]["verdict"] == "INCONCLUSIVE"
+
+
+_SECRETS = (".claude.json", ".claude.json.backup", ".claude/backups/.claude.json.backup.1",
+            ".ssh/id_x", ".codex/auth.json", ".claude/.credentials.json")
+# Plants every secret in $HOME. The credentials entry is a link to the REAL
+# file, so it is removed first: writing through it would overwrite the real one.
+# A token refresh leaves it a regular file, which is what this plants.
+_PLANT = "\n".join(
+    ['rm -f "$HOME/.claude/.credentials.json"']
+    + [f'mkdir -p "$(dirname "$HOME/{rel}")"; echo s > "$HOME/{rel}"' for rel in _SECRETS]
+    + ['ln -s / "$HOME/.local-root"', 'ln -s /etc/hostname "$HOME/.claude/out-link"'])
+
+
+def _ok(body: str = "") -> str:
+    return body + f"\ncat <<'EOF'\n{stream('ok', [])}\nEOF\n"
+
+
+def _assert_scrubbed(run: pathlib.Path):
+    """No link and no account material anywhere under RUN."""
+    bad = []
+    for p in run.rglob("*"):
+        rel = str(p.relative_to(run))
+        if p.is_symlink() or p.name.startswith((".claude.json", ".credentials.json")):
+            bad.append(rel)
+        elif p.is_dir() and (p.name in (".ssh", ".codex")
+                             or (p.name == "backups" and p.parent.name == ".claude")):
+            bad.append(rel)
+    assert not bad, f"retained after the run: {bad}"
+
+
+def _decoy(path: pathlib.Path) -> dict[pathlib.Path, str]:
+    """Files outside every run dir that a scrub or write following links would hit."""
+    files = [path / ".ssh/id", path / ".claude/backups/b", path / ".claude.json",
+             path / "backups/b", path / ".credentials.json", path / "plugins/p", path / "f"]
+    for f in files:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("keep\n")
+    (path / "lnk").symlink_to("/etc/hostname")
+    return {f: "keep\n" for f in files}
+
+
+def _assert_decoy_intact(decoy: dict[pathlib.Path, str]):
+    changed = [str(p) for p, text in decoy.items()
+               if not p.is_file() or p.read_text() != text]
+    assert not changed, f"touched outside the run dir: {changed}"
+    assert next(iter(decoy)).parents[1].joinpath("lnk").is_symlink()
+
+
+def test_retained_run_is_scrubbed_after_check_but_state_survives(tmp_path):
+    # A retained run dir is read by reviewers under a broad Read allow, and its
+    # staged HOME carries links into the real HOME plus account files the CLI
+    # writes there. check.sh must still see them; nothing after it may.
+    _require_sandbox()
+    claude = fake_claude(tmp_path, _ok(
+        _PLANT + '\nmkdir -p "$HOME/.local/state/n"; echo row > "$HOME/.local/state/n/ledger.tsv"'))
+    checks = " && ".join(f'test -f "$1/home/{rel}"' for rel in _SECRETS)
+    r, out, verdicts = _run(tmp_path, _scenario(tmp_path, checks), claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
+    run = out / "sc/new/1"
+    _assert_scrubbed(run)
+    assert (run / "home/.local/state/n/ledger.tsv").read_text() == "row\n"
+    assert (run / "home/.claude/CLAUDE.md").is_file()
+    assert (run / "transcript.jsonl").is_file()
+
+
+def test_run_is_scrubbed_when_setup_fails(tmp_path):
+    claude = fake_claude(tmp_path, "exit 0\n")
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "setup.sh").write_text(f"#!/usr/bin/env bash\n{_PLANT}\nexit 1\n")
+    _, out, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE"
+    _assert_scrubbed(out / "sc/new/1")
+
+
+def test_secrets_outside_home_are_scrubbed_too(tmp_path):
+    _require_sandbox()
+    # A nested harness's runs, the work tree, a HOME the run moved: all are
+    # inside the run dir and none is its home/.
+    claude = fake_claude(tmp_path, _ok(
+        'mkdir -p "$E2E_RUN/nested-e2e/sc/old/1/home/.claude/backups" "$E2E_WORK/x/.ssh"\n'
+        'echo s > "$E2E_RUN/nested-e2e/sc/old/1/home/.claude.json"\n'
+        'echo s > "$E2E_RUN/nested-e2e/sc/old/1/home/.claude/backups/b"\n'
+        'echo s > "$E2E_WORK/x/.ssh/id"\n'
+        'ln -s /etc/hostname "$E2E_WORK/x/l"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    assert verdicts[0]["verdict"] == "PASS"
+    _assert_scrubbed(out / "sc/new/1")
+
+
+@pytest.mark.parametrize("swap", [
+    'cd /; mv "$HOME" "$E2E_RUN/h2"; ln -s {decoy} "$E2E_RUN/home"',
+    'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"',
+    'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"',
+    'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"',
+])
+def test_scrub_and_writes_never_follow_a_link_the_run_planted(tmp_path, swap):
+    _require_sandbox()
+    # The harness acts outside the sandbox on a tree the run could rewrite: a
+    # planted link must not aim its deletes or its result writes.
+    decoy = _decoy(tmp_path / "decoy")
+    claude = fake_claude(tmp_path, _ok(_PLANT + "\n" + swap.format(decoy=tmp_path / "decoy")))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    assert verdicts[0]["verdict"] == "PASS"
+    _assert_decoy_intact(decoy)
+    _assert_scrubbed(out / "sc/new/1")
+    assert (out / "sc/new/1/final.txt").read_text() == "ok"
+
+
+def test_a_failed_scrub_item_keeps_the_verdict_and_the_rest_of_the_scrub(tmp_path):
+    _require_sandbox()
+    claude = fake_claude(tmp_path, _ok(
+        _PLANT + '\nmkdir -p "$HOME/.ssh/locked"; touch "$HOME/.ssh/locked/f"; '
+        'chmod 000 "$HOME/.ssh/locked"\n'
+        'for i in $(seq 20); do mkdir -p "$HOME/.ssh/k_$i"; touch "$HOME/.ssh/k_$i/key"; done\n'
+        'mkdir -p "$HOME/d"; touch "$HOME/d/f"; chmod 400 "$HOME/d"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    run = out / "sc/new/1"
+    try:
+        assert verdicts[0]["verdict"] == "PASS"
+        errors = verdicts[0]["scrub_errors"]
+        assert any(".ssh" in e for e in errors) and any("/d" in e for e in errors), errors
+        assert json.loads((run / "verdict.json").read_text())["scrub_errors"] == errors
+        assert (run / "scrub-errors.txt").read_text().splitlines() == errors
+        for rel in (".claude.json", ".claude/.credentials.json", ".codex", ".ssh/id_x"):
+            assert not (run / "home" / rel).exists(), rel
+        assert not list((run / "home/.ssh").glob("k_*")), "siblings of a locked entry kept"
+        assert not [p for p in (run / "home/.claude").rglob("*") if p.is_symlink()]
+    finally:
+        for rel in (".ssh/locked", "d"):
+            if (run / "home" / rel).exists():
+                (run / "home" / rel).chmod(0o700)
+
+
+def test_a_failed_scrub_record_does_not_cost_the_verdict(tmp_path):
+    _require_sandbox()
+    claude = fake_claude(tmp_path, _ok(
+        _PLANT + '\nmkdir "$E2E_RUN/scrub-errors.txt"\n'
+        'mkdir -p "$HOME/.ssh/locked"; chmod 000 "$HOME/.ssh/locked"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    run = out / "sc/new/1"
+    try:
+        assert verdicts[0]["verdict"] == "PASS", verdicts[0]
+        assert json.loads((run / "verdict.json").read_text())["scrub_errors"]
+    finally:
+        if (run / "home/.ssh/locked").exists():
+            (run / "home/.ssh/locked").chmod(0o700)
+
+
+def test_a_non_utf8_name_in_scrub_errors_does_not_cost_the_verdict(tmp_path):
+    _require_sandbox()
+    # A name in bytes that are not UTF-8 reaches the error text as surrogates;
+    # writing that out must not raise in run_one's finally.
+    claude = fake_claude(tmp_path, _ok(
+        _PLANT + '\nbad="$HOME/.ssh/$(printf \'\\377\')"; mkdir -p "$bad/x"; chmod 000 "$bad"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    run = out / "sc/new/1"
+    bad = run / "home/.ssh" / os.fsdecode(b"\xff")
+    try:
+        assert verdicts[0]["verdict"] == "PASS", verdicts[0]
+        assert verdicts[0]["scrub_errors"]
+        assert b"\xff" in (run / "scrub-errors.txt").read_bytes()
+        assert json.loads((run / "verdict.json").read_text())["scrub_errors"]
+    finally:
+        if bad.exists():
+            bad.chmod(0o700)
+
+
+# The fake `secret-redact` (tests/stubs/secret-redact-fake): the real one is a
+# nixos-config package no CI runner has. It finds `sk-ant-` tokens only.
+FAKE_REDACT = ROOT / "tests/stubs/secret-redact-fake"
+TOKEN = "sk-ant-oat01-" + "Q" * 40
+
+
+def _redact_env(*first: pathlib.Path) -> dict:
+    return {**os.environ, "PATH": ":".join([*map(str, first), os.environ["PATH"]])}
+
+
+def _no_redact_env(tmp_path) -> dict:
+    """PATH without any secret-redact, real or fake: only what the tests run."""
+    bindir = tmp_path / "bin-no-redact"
+    bindir.mkdir()
+    for tool in ("bash", "git", "bwrap", "python3"):
+        if found := shutil.which(tool):
+            (bindir / tool).symlink_to(found)
+    return {**os.environ, "PATH": str(bindir)}
+
+
+def _kept_with_token(run: pathlib.Path) -> list[str]:
+    return [str(p.relative_to(run)) for p in run.rglob("*")
+            if p.is_file() and not p.is_symlink() and TOKEN.encode() in p.read_bytes()]
+
+
+def test_a_printed_token_is_redacted_in_every_kept_file(tmp_path):
+    _require_sandbox()
+    # The agent prints its credential (as by `cat` on the staged link) and
+    # copies it into work/ and its HOME's state; the grader echoes it into
+    # the verdict. Every kept file is Read-allowed under the broker.
+    claude = fake_claude(tmp_path, (
+        f'echo "{TOKEN}" > "$E2E_WORK/notes.txt"\n'
+        f'mkdir -p "$HOME/.local/state/n"; echo "{TOKEN}" > "$HOME/.local/state/n/row"\n'
+        f"cat <<'EOF'\n{stream('the token is ' + TOKEN, ['cat ~/.claude/.credentials.json'])}\nEOF\n"))
+    sc = _scenario(tmp_path, f'echo "saw {TOKEN}"; exit 0')
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude), env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    run = out / "sc/new/1"
+    assert _kept_with_token(out) == [], _kept_with_token(out)
+    assert "[REDACTED:anthropic-token:" in (run / "transcript.jsonl").read_text()
+    assert "[REDACTED:anthropic-token:" in (run / "work/notes.txt").read_text()
+    verdict = json.loads((run / "verdict.json").read_text())
+    assert verdict["verdict"] == "PASS" and "[REDACTED:" in verdict["why"], verdict
+    assert TOKEN not in r.stdout, "the verdict line on stdout kept the token"
+    assert "scrub_errors" not in verdict
+
+
+def _tree_with(tmp_path, text: str) -> pathlib.Path:
+    run = tmp_path / "out/sc/new/1"
+    (run / "work").mkdir(parents=True)
+    (run / "transcript.jsonl").write_text(text)
+    (run / "work/clean.txt").write_text("nothing here\n")
+    return run
+
+
+def _escaped_shapes(tmp_path) -> pathlib.Path:
+    """A transcript and a verdict as json.dumps writes them: the token right
+    after a `\\n` / `\\t` escape, where a raw-text scan sees a letter before it."""
+    run = _tree_with(tmp_path, "\n".join(json.dumps(x) for x in (
+        {"type": "user", "content": [{"type": "tool_result", "content": f"cat t\n{TOKEN}\n"}]},
+        {"type": "result", "result": f"ok\t{TOKEN}"})) + "\n")
+    (run / "verdict.json").write_text(json.dumps({"verdict": "PASS", "why": f"saw\n{TOKEN}"},
+                                                 indent=2))
+    return run
+
+
+def test_a_token_after_a_json_escape_is_redacted(tmp_path):
+    run = _escaped_shapes(tmp_path)
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    assert _kept_with_token(tmp_path / "out") == []
+    lines = (run / "transcript.jsonl").read_text().splitlines()
+    assert [json.loads(line)["type"] for line in lines] == ["user", "result"]
+    assert json.loads((run / "verdict.json").read_text())["verdict"] == "PASS"
+
+
+@pytest.mark.skipif(shutil.which("secret-redact") is None
+                    or shutil.which("secret-redact").startswith(str(FAKE_REDACT)),
+                    reason="the real secret-redact (nixos-config) is not on PATH")
+def test_the_real_scanner_redacts_a_token_after_a_json_escape(tmp_path):
+    _escaped_shapes(tmp_path)
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"))
+    assert r.returncode == 0, r.stderr
+    assert _kept_with_token(tmp_path / "out") == []
+
+
+def test_required_redaction_withholds_what_it_cannot_scan(tmp_path):
+    run = _tree_with(tmp_path, f"FAIL-THE-SCAN {TOKEN}\n")
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 1 and "withheld, not scanned" in r.stderr, r.stderr
+    assert (run / "transcript.jsonl").read_text().startswith("[withheld by the agent-e2e scrub")
+    assert _kept_with_token(tmp_path / "out") == []
+    # Only the file the scanner failed on: its batch is rescanned file by file.
+    assert (run / "work/clean.txt").read_text() == "nothing here\n"
+    assert r.stderr.count("withheld, not scanned") == 1, r.stderr
+
+
+def test_required_redaction_without_a_scanner_withholds_everything(tmp_path):
+    run = _tree_with(tmp_path, f"{TOKEN}\n")
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_no_redact_env(tmp_path))
+    assert r.returncode == 1 and "secret-redact is not on PATH" in r.stderr, r.stderr
+    for name in ("transcript.jsonl", "work/clean.txt"):
+        assert (run / name).read_text().startswith("[withheld by the agent-e2e scrub"), name
+
+
+def test_without_a_scanner_a_direct_scrub_warns_and_keeps_files(tmp_path):
+    # A CI runner: no secret-redact can be installed, and nothing there gives
+    # a reviewer Read on the runs, so the files stay and the run says so.
+    run = _tree_with(tmp_path, "plain\n")
+    r = harness("scrub", str(tmp_path / "out"), env=_no_redact_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "not redacted: secret-redact is not on PATH" in r.stderr
+    assert (run / "transcript.jsonl").read_text() == "plain\n"
+
+
+def test_read_only_files_are_scanned_and_keep_their_mode(tmp_path):
+    # Git objects are 0444: a real run with a repo in work/ has hundreds.
+    run = _tree_with(tmp_path, "plain\n")
+    (run / "work/ro-secret").write_text(f"{TOKEN}\n")
+    (run / "work/ro-clean").write_text("nothing\n")
+    for name in ("ro-secret", "ro-clean"):
+        (run / "work" / name).chmod(0o444)
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    assert "[REDACTED:anthropic-token:" in (run / "work/ro-secret").read_text()
+    assert (run / "work/ro-clean").read_text() == "nothing\n"
+    for name in ("ro-secret", "ro-clean"):
+        assert stat.S_IMODE((run / "work" / name).stat().st_mode) == 0o444, name
+
+
+def test_redaction_never_writes_through_a_hard_link(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text(f"{TOKEN}\n")
+    run = _tree_with(tmp_path, "plain\n")
+    os.link(outside, run / "work/linked.txt")
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"),
+                env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 0, r.stderr
+    assert outside.read_text() == f"{TOKEN}\n"
+    assert not (run / "work/linked.txt").exists()
+
+
+def test_a_file_past_the_scan_limit_is_withheld(tmp_path):
+    run = _tree_with(tmp_path, "x" * (4 * 1024 * 1024 + 1))
+    r = harness("scrub", str(tmp_path / "out"), env=_redact_env(FAKE_REDACT))
+    assert r.returncode == 1 and "past the" in r.stderr, r.stderr
+    assert (run / "transcript.jsonl").read_text().startswith("[withheld by the agent-e2e scrub")
+    assert (run / "work/clean.txt").read_text() == "nothing here\n"
+
+
+@pytest.mark.skipif(shutil.which("secret-redact") is None
+                    or shutil.which("secret-redact").startswith(str(FAKE_REDACT)),
+                    reason="the real secret-redact (nixos-config) is not on PATH")
+def test_the_real_scanner_redacts_an_oauth_token(tmp_path):
+    real = "sk-ant-oat01-" + "A" * 80
+    run = _tree_with(tmp_path, f'{{"type":"user","content":"{real}"}}\n')
+    r = harness("scrub", "--require-redaction", str(tmp_path / "out"))
+    assert r.returncode == 0, r.stderr
+    assert real not in (run / "transcript.jsonl").read_text()
+    assert "[REDACTED:" in (run / "transcript.jsonl").read_text()
+
+
+def test_scrub_subcommand_cleans_runs_a_killed_harness_left(tmp_path):
+    # A SIGKILLed harness never reaches run_one's finally; the broker runs
+    # `scrub` over the output dir after every campaign instead.
+    runs = [tmp_path / "out/sc/old/1", tmp_path / "out/sc/final/2"]
+    for run in runs:
+        (run / "home/.claude/backups").mkdir(parents=True)
+        (run / "home/.claude.json").write_text("s\n")
+        (run / "home/.claude/backups/b").write_text("s\n")
+        (run / "home/.claude/.credentials.json").symlink_to("/etc/hostname")
+        (run / "home/notes.md").write_text("keep\n")
+        (run / "final.txt").write_text("keep\n")
+    r = harness("scrub", str(tmp_path / "out"))
+    assert r.returncode == 0, r.stderr
+    for run in runs:
+        assert sorted(str(p.relative_to(run)) for p in run.rglob("*")) == [
+            "final.txt", "home", "home/.claude", "home/notes.md"]
+
+
+def test_scrub_subcommand_reports_what_it_could_not_reach(tmp_path):
+    locked = tmp_path / "out/sc/old/1"
+    (locked / "home").mkdir(parents=True)
+    (locked / "home/.claude.json").write_text("s\n")
+    locked.chmod(0o000)
+    try:
+        r = harness("scrub", str(tmp_path / "out"))
+        # fwalk names only the entry it could not open, under the scrubbed root.
+        # A report, not a crash: an uncaught PermissionError says the same words.
+        assert r.returncode == 1 and "Traceback" not in r.stderr, r.stderr
+        assert f"{tmp_path / 'out'}: [Errno 13] Permission denied: '1'" in r.stderr, r.stderr
+    finally:
+        locked.chmod(0o700)
+
+
+def test_scrub_subcommand_refuses_a_link_for_its_root(tmp_path):
+    decoy = _decoy(tmp_path / "decoy")
+    (tmp_path / "out").symlink_to(tmp_path / "decoy")
+    r = harness("scrub", str(tmp_path / "out"))
+    # A refusal, not a crash: an uncaught raise also exits 1.
+    assert r.returncode == 1, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.stderr.startswith(f"{tmp_path / 'out'}: "), r.stderr
+    _assert_decoy_intact(decoy)
+
+
+def test_a_raising_scrub_does_not_cost_the_verdict(tmp_path, monkeypatch):
+    # Before the iterative fwalk/rmtree, a deep dir chain raised
+    # RecursionError from inside the scrub (reproduced on 3.11).
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_e2e_inproc", HARNESS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def deep(path):
+        raise RecursionError("maximum recursion depth exceeded")
+    run = tmp_path / "out/new/1"
+
+    def graded(*a):  # the grader echoed a token; the scrub never got to scan it
+        v = {"arm": "new", "run": 1, "verdict": "PASS", "why": f"saw {TOKEN}"}
+        (run / "verdict.json").write_text(json.dumps(v))
+        return v
+    monkeypatch.setattr(mod, "scrub_dir", deep)
+    monkeypatch.setattr(mod, "_run_one", graded)
+    run.mkdir(parents=True)
+    verdict = mod.run_one(tmp_path / "sc", "new", "HEAD", 1, tmp_path / "out", None)
+    assert verdict["verdict"] == "PASS"
+    assert "RecursionError" in verdict["scrub_errors"][0], verdict
+    assert "RecursionError" in (run / "scrub-errors.txt").read_text()
+    # Unscanned, so nothing the run wrote is passed on: not to the summary,
+    # stdout, or the verdict.json the finally rewrites.
+    assert TOKEN not in json.dumps(verdict), verdict
+    assert TOKEN not in (run / "verdict.json").read_text()
 
 
 def test_finished_runs_are_not_re_spent(tmp_path):
