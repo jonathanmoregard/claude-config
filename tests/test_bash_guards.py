@@ -499,7 +499,6 @@ section("settings.json: the permission surface the switchover creates")
 
 _ALLOW = SETTINGS.get("permissions", {}).get("allow", [])
 _DENY_ALL = SETTINGS.get("permissions", {}).get("deny", [])
-_SANDBOX = SETTINGS.get("sandbox", {})
 # The bare allow stays even with the sandbox on: autoAllowBashIfSandboxed covers
 # sandboxed commands only, and without it compound and excluded commands prompt
 # (measured in agent e2e, 5/26 runs).
@@ -522,11 +521,11 @@ check(
 check(
     # A7 / W11, arm (b). Absence here is not neutral: it silently converts
     # every Bash call in every unattended run into a permission prompt.
-    "arm (b) is in force: `Bash` runs without a prompt, bare or sandboxed",
+    "arm (b) is in force: the bare `Bash` allow is present",
     _BASH_REACHABLE,
-    "permissions.allow must carry `Bash`, or the sandbox must be on with "
-    "autoAllowBashIfSandboxed; see the block comment above for why the other "
-    "two arms were rejected",
+    "permissions.allow must carry `Bash` even with the sandbox on: "
+    "autoAllowBashIfSandboxed covers sandboxed commands only; see the block "
+    "comment above for why the other two arms were rejected",
 )
 check(
     "`ask` stays empty — the switchover adds no new prompt surface",
@@ -2379,7 +2378,7 @@ with open(os.path.join(_LEDGER, "run-evaluate.sh"), encoding="utf-8") as fh:
 # but until then they are load-bearing.
 _perms = SETTINGS.get("permissions", {})
 check(
-    "precondition: settings.json lets Bash run (bare or sandboxed) and does not deny it",
+    "precondition: settings.json carries the bare Bash allow and does not deny it",
     _BASH_REACHABLE and "Bash" not in _perms.get("deny", []),
     f"allow_has_bash={'Bash' in _perms.get('allow', [])} "
     f"deny_has_bash={'Bash' in _perms.get('deny', [])}",

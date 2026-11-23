@@ -49,8 +49,8 @@ def test_flake_eval_blocked_by_the_gitmodules_placeholder_names_the_fix(tmp_path
     proc, records = run_hook(tmp_path, failed(err, command="nix build .#x"))
     assert proc.returncode == 2
     assert "empty .gitmodules" in proc.stderr
-    # The sandbox ignore file hides that name, so a plain git add fails.
-    assert "git add -f .gitmodules" in proc.stderr
+    # Inside, the path is a read-only placeholder: the fix must run outside.
+    assert "dangerouslyDisableSandbox" in proc.stderr
     assert [r["hint"] for r in records] == ["gitmodules"]
 
 

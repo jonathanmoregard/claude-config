@@ -292,6 +292,9 @@ cp "$FH" "$ROOT/fetch-head.master"
 printf '%s\t\tbranch '"'"'other'"'"' of %s\n' "$(head_of "$PRIMARY" origin/master)" "$ROOT/origin" >"$FH"
 expect_refused "sandboxed helper refuses a fresh fetch that was not of master" 'mcp__git_broker__git' \
   env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-other
+printf '%s\t\tbranch '"'"'master'"'"' of %s\n' "$(head_of "$PRIMARY" origin/master~1)" "$ROOT/origin" >"$FH"
+expect_refused "sandboxed helper refuses a master fetch that origin/master has since moved past" 'mcp__git_broker__git' \
+  env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-oldsha
 cp "$ROOT/fetch-head.master" "$FH"
 touch "$FH"
 expect_ok "sandboxed helper accepts a fresh broker fetch" \

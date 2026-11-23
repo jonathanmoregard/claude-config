@@ -99,7 +99,10 @@ LINKS = {
 SCRUB = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "GIT_ASKPASS",
          "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
          "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL",
-         "DBUS_SESSION_BUS_ADDRESS")
+         "DBUS_SESSION_BUS_ADDRESS",
+         # Set by sandbox-soak.json for the session that launched the run; a
+         # nested claude is not sandboxed and must not inherit the marker.
+         "CLAUDE_SANDBOX_SOAK")
 # Copied, never linked: config a hook needs to run at all, in a directory the
 # hook also WRITES (dcg records allow-once and pending exceptions beside its
 # config), so a sandbox run must not reach the real one. Without dcg's config

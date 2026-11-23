@@ -243,6 +243,22 @@ EOF
     assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
 
 
+def test_nested_agent_does_not_inherit_the_soak_marker(tmp_path):
+    # A soak session sets CLAUDE_SANDBOX_SOAK; the run's own claude is not
+    # sandboxed, and the marker would make its sandbox-aid hints lie.
+    _require_sandbox()
+    claude = fake_claude(tmp_path, f"""
+test -z "${{CLAUDE_SANDBOX_SOAK:-}}" || exit 3
+cat <<'EOF'
+{stream("done", ["true"])}
+EOF
+""")
+    sc = _scenario(tmp_path, "true")
+    r, _, verdicts = _run(tmp_path, sc, claude,
+                          env={**os.environ, "CLAUDE_SANDBOX_SOAK": "1"})
+    assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
+
+
 def test_check_failure_is_fail(tmp_path):
     _require_sandbox()
     claude = fake_claude(tmp_path, f"cat <<'EOF'\n{stream('done', [])}\nEOF\n")

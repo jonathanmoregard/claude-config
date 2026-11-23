@@ -50,9 +50,10 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         "gitmodules",
         re.compile(r"\.gitmodules' is locked: Permission denied"),
         "The sandbox mounts a placeholder over a missing .gitmodules, which "
-        "nix's git fetcher cannot open. Commit an empty .gitmodules at the "
-        "repo root with `git add -f .gitmodules` (the sandbox's git ignore "
-        "hides that name, so a plain add fails).",
+        "nix's git fetcher cannot open, and that read-only placeholder cannot "
+        "be replaced from inside. Outside the sandbox (dangerouslyDisableSandbox), "
+        "commit an empty .gitmodules at the repo root: "
+        "`touch .gitmodules && git add .gitmodules && git commit -m 'chore: empty .gitmodules'`.",
     ),
     (
         "read-only",
