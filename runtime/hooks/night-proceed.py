@@ -29,12 +29,14 @@ clock.
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PROMPT = (
@@ -45,7 +47,8 @@ PROMPT = (
     "deletions, force pushes, hard resets, dropped tables, removing "
     "dependencies, CI changes, merges, opening a pull request in a PR-gated "
     "repo, new credentials, anything billed beyond the subscription, heavy runs "
-    "above about $10, uploading sensitive content, or expanding scope. For "
+    "above about $10, uploading sensitive content, expanding scope, or anything "
+    "that would break a directive the user gave. For "
     "those, leave the question open, carry on with every part of the task that "
     "does not depend on it, and end with one clear list of what awaits the user."
 )
@@ -61,6 +64,12 @@ OPTION = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*|__)?\(?([A-F])(?:\)|\.|:|\*\*|__|\
 TRAILING = re.compile(r"[\s*_`>)\]\"'”’]+$")
 # A sentence that ends in "?": the mark followed by space, closing markup or the end.
 QUESTION = re.compile(r"\?(?:[*_`)\]\"'”’]*)(?:\s|$)")
+# A closing line that asks for a pick or recommends one. Options, or a question
+# one paragraph up, are an offer only when the ending says this; a report that
+# lists what it considered and says what it chose is not a question.
+CHOICE = re.compile(r"\b(which|pick|choose|prefer|recommend|let me know|your call|say the word)", re.I)
+# The last paragraph, plus the one before it when the last is such a line.
+ENDING_PARAGRAPHS = 2
 
 
 def minutes(value: object) -> int | None:
@@ -100,45 +109,69 @@ def screen_locked() -> bool:
 
 
 def ends_on_question(text: object) -> bool:
-    """The turn ends on a question: its last paragraph asks one, or it offers lettered options.
+    """The turn ends on a question to the user.
 
-    "Ends with `?`" alone misses the usual shape here. Measured in the first
-    e2e probe: "Which do you want: 1 or 2? If you pick 1, I'll also need to
-    know ..." asks in its last paragraph and ends on a full stop, and the
-    options were numbered, as the global CLAUDE.md requires of every list.
+    The ending is the last two paragraphs. It asks when it contains a
+    sentence ending in "?", or when it offers two or more lettered options and
+    asks for a pick. "Ends with `?`" alone misses the usual shapes here,
+    measured in the first e2e probe: "Which do you want: 1 or 2? If you pick
+    1, I'll also need to know ..." ends on a full stop, a closing
+    recommendation can follow the question, and options are numbered, as the
+    global CLAUDE.md requires of every list.
     """
     if not isinstance(text, str) or not text.strip():
         return False
     body = TRAILING.sub("", text)
     if body.endswith("?"):
         return True
-    last = re.split(r"\n\s*\n", body.strip())[-1]
+    paragraphs = re.split(r"\n\s*\n", body.strip())
+    last = paragraphs[-1]
     if QUESTION.search(last):
         return True
-    return len(set(OPTION.findall(text))) >= 2
+    ending = "\n\n".join(paragraphs[-ENDING_PARAGRAPHS:])
+    # The paragraph before counts only when the last one is a recommendation
+    # or asks for a pick; "Why did it fail? ...\n\nFixed it." is a report.
+    if CHOICE.search(last) is None:
+        return False
+    return QUESTION.search(ending) is not None or len(set(OPTION.findall(ending))) >= 2
 
 
 def first_time(session: str, key: str) -> bool:
-    """Record `key` for this session; False when it was answered before."""
+    """Record `key` for this session; False when it was answered before.
+
+    Hooks for one session can run concurrently (two AskUserQuestion calls), so
+    the read-modify-write holds an exclusive lock on a per-session lock file,
+    and the new state is written to a private temp file and renamed in.
+    """
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    path = STATE_DIR / f"{session}.json"
-    try:
-        seen = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(seen, list):
-            seen = []
-    except (OSError, ValueError):
-        seen = []
-    if digest in seen:
-        return False
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps((seen + [digest])[-50:]), encoding="utf-8")
-    tmp.replace(path)
+    path = STATE_DIR / f"{session}.json"
+    with open(STATE_DIR / f"{session}.lock", "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            seen = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(seen, list):
+                seen = []
+        except (OSError, ValueError):
+            seen = []
+        if digest in seen:
+            return False
+        fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=f".{session}.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump((seen + [digest])[-50:], out)
+        os.replace(tmp, path)
     return True
 
 
 def decide(payload: object) -> dict | None:
     if os.environ.get("CLAUDE_NIGHT_PROCEED") == "0":
+        return None
+    # Headless SDK sessions (`claude -p`, the SDKs: entrypoint sdk-*) have no
+    # user to wait for and their scripts expect today's behaviour. Interactive
+    # sessions, the editor extensions included, are what this is for. The lock
+    # seam marks an e2e run, which is headless by construction.
+    entry = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli")
+    if entry.startswith("sdk") and "CLAUDE_NIGHT_PROCEED_TEST_LOCK" not in os.environ:
         return None
     if not isinstance(payload, dict) or payload.get("agent_id"):
         return None

@@ -55,7 +55,8 @@ def test_lettered_options_without_question_mark(tmp_path: Path) -> None:
 
 def test_statement_is_left_alone(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Done. Tests pass and the PR is open.")) is None
-    assert run(tmp_path, stop("A single item: A) only one option.")) is None
+    assert run(tmp_path, stop("Note:\nA) only one option.\n\nI recommend it.")) is None
+    assert run(tmp_path, stop("Considered:\nA) cache\nB) none\n\nWent with A. Done, tests pass.")) is None
 
 
 def test_question_in_last_paragraph_with_numbered_options(tmp_path: Path) -> None:
@@ -115,8 +116,26 @@ def test_subagents_other_tools_and_garbage(tmp_path: Path) -> None:
     assert run(tmp_path, None, raw="not json") is None
 
 
-def test_real_lock_query_fails_open_or_answers(tmp_path: Path) -> None:
-    # No seam: the hook asks the real desktop. Unlocked or unreachable both
-    # mean "present"; this test machine's screen is not locked while it runs.
-    assert run(tmp_path, stop(AB), lock=None) is None
-    assert run(tmp_path, stop("x?"), lock=None, extra={"PATH": "/nonexistent"}) is None
+def fake_gdbus(tmp: Path, reply: str, rc: int = 0) -> str:
+    """A PATH whose gdbus prints `reply` and exits `rc`, ahead of the real PATH."""
+    bindir = tmp / f"gdbus-{abs(hash((reply, rc)))}"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "gdbus"
+    stub.write_text(f"#!/bin/sh\nprintf '%s\\n' '{reply}'\nexit {rc}\n")
+    stub.chmod(0o755)
+    return f"{bindir}:{os.environ['PATH']}"
+
+
+def test_desktop_lock_query_without_seam(tmp_path: Path) -> None:
+    # The real query path, with gdbus faked: locked blocks, everything else
+    # (unlocked, a bus error, no gdbus at all) means present.
+    assert run(tmp_path, stop("Lock 1?"), lock=None, extra={"PATH": fake_gdbus(tmp_path, "(true,)")})
+    assert run(tmp_path, stop("Lock 2?"), lock=None, extra={"PATH": fake_gdbus(tmp_path, "(false,)")}) is None
+    assert run(tmp_path, stop("Lock 3?"), lock=None,
+               extra={"PATH": fake_gdbus(tmp_path, "Error: no bus", rc=1)}) is None
+    assert run(tmp_path, stop("Lock 4?"), lock=None, extra={"PATH": "/nonexistent"}) is None
+
+
+def test_question_before_a_closing_recommendation(tmp_path: Path) -> None:
+    assert run(tmp_path, stop("1. X\n2. Y\n\nWhich one?\n\nI recommend 1."))
+    assert run(tmp_path, stop("A) keep\nB) drop\n\nI recommend A."))
