@@ -136,14 +136,16 @@ def grade(run: pathlib.Path, mode: str) -> tuple[int, str]:
                f"alarm_seen={seen} parent_killed={sorted(parent_kills)} "
                f"system_stopped={sorted(system_stopped)} live={live} other_exits={broken}")
     armed = bool(waiters)
-    if broken == [3] and not any((run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")):
+    # The alarm fired: some waiter exited 5. Neither lenient verdict below
+    # applies once it has, as before when notify.log stood for this.
+    fired = any(code == 5 for _, _, code in exits)
+    if broken == [3] and not fired and not any((run / "home").glob(".claude/projects/*/*/subagents/agent-*.jsonl")):
         # No subagent transcript was ever written: the harness did not persist
         # the session, so wait-for could only say "no transcript". Not a verdict.
         return 2, summary + " (no subagent transcript persisted)"
     if mode == "stall":
         if armed and seen:
             return 0, summary
-        fired = any(code == 5 for _, _, code in exits)
         if armed and not fired and system_stopped and not broken and not parent_kills:
             # Claude Code stopped the waiter before it could fire: a resource
             # result of the headless run, not a verdict.

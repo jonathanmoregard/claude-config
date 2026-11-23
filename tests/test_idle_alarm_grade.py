@@ -248,3 +248,12 @@ def test_rearmed_waiter_exit_5_without_a_parent_turn_fails(tmp_path: Path) -> No
     events = launched() + armed() + time_limit() + armed(task="b2", tool="t2") \
         + [exited("b2", 5, tool="t2")]
     assert grade(tmp_path, events, "stall") == 1
+
+
+def test_exit_5_then_exit_3_without_a_persisted_transcript_fails(tmp_path: Path) -> None:
+    # The alarm fired (exit 5) with no parent turn; a later re-arm saw no
+    # transcript (exit 3). The fired alarm outranks "nothing persisted".
+    events = launched() + armed() + armed(task="b2", tool="t2") \
+        + [exited("b1", 5), exited("b2", 3, tool="t2")]
+    assert grade(tmp_path, events, "stall") == 1
+    assert grade(tmp_path, events, "quiet") == 1
