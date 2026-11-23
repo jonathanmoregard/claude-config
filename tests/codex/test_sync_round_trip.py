@@ -1593,16 +1593,19 @@ raise SystemExit(sync_codex.main())
 def test_a_direct_sync_stopped_before_it_publishes_leaves_the_home_as_it_was() -> None:
     # SIGTERM (systemd stop, timeout), SIGHUP (a closed terminal), SIGINT
     # (Ctrl-C) or SIGKILL during the check: the render wrote only to its
-    # stage, so whatever ends the run there, the home is as it was.
+    # stage, so whatever ends the run there, the home is as it was. Only
+    # SIGINT unwinds, removing the stage; the others leave it in TMPDIR.
     with round_trip() as rt:
         (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
         (rt.codex / "hooks.json").unlink()
         rt.edit_config(lambda config: config.pop("features"))
         before = snapshot(rt.home, ("",))
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGKILL):
+            scratch = rt.home.parent / f"tmp-{signum.name}"
+            scratch.mkdir()
             sync = subprocess.Popen(
                 [sys.executable, "-B", "-c", PARKED_CHECK_SYNC, str(rt.repo / "scripts")],
-                env={**os.environ, "HOME": str(rt.home)},
+                env={**os.environ, "HOME": str(rt.home), "TMPDIR": str(scratch)},
                 cwd=rt.home,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -1620,6 +1623,8 @@ def test_a_direct_sync_stopped_before_it_publishes_leaves_the_home_as_it_was() -
             output.append(sync.communicate(timeout=60)[0])
             context = f"{signum.name} rc={sync.returncode}\n{''.join(output)}"
             assert sync.returncode != 0, context
+            left = [path.name.startswith("codex-sync-stage-") for path in scratch.iterdir()]
+            assert left == ([] if signum == signal.SIGINT else [True]), (left, context)
             for state in (parked, snapshot(rt.home, ("",))):
                 changed = sorted(
                     key for key in before.keys() | state.keys() if before.get(key) != state.get(key)
