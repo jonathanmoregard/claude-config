@@ -744,7 +744,7 @@
           {
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
-            "timeout": 10
+            "timeout": 45
           }
         ]
       },

@@ -1,23 +1,18 @@
-"""Reproducers for review findings on night-proceed."""
+"""Reproducers for review findings on night-proceed.
+
+The round-1 detector reproducers (N3a/N3b/N7a) tested regex shapes; the regex
+is gone (model classifier, decisions 2026-11-23), and its plumbing is covered in
+test_night_proceed.py.
+"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 from pathlib import Path
 
-from test_night_proceed import HOOK, PYTHON, ask, fake_gdbus, run, stop
-
-
-def test_n3a_report_listing_considered_options_is_not_a_question(tmp_path: Path) -> None:
-    msg = "Considered:\nA) cache\nB) none\n\nWent with A. Done, tests pass."
-    assert run(tmp_path, stop(msg)) is None
-
-
-def test_n3b_numbered_options_question_then_recommendation_blocks(tmp_path: Path) -> None:
-    msg = "1. X\n2. Y\n\nWhich one?\n\nI recommend 1."
-    out = run(tmp_path, stop(msg))
-    assert out and out["decision"] == "block"
+from test_night_proceed import HOOK, PYTHON, ask, fake_gdbus, run
 
 
 def test_n4_headless_sdk_session_is_not_blocked(tmp_path: Path) -> None:
@@ -29,15 +24,11 @@ def test_n4_headless_sdk_session_is_not_blocked(tmp_path: Path) -> None:
                extra={"CLAUDE_CODE_ENTRYPOINT": "cli", "PATH": fake_gdbus(tmp_path, "(true,)")})
 
 
-def test_n4_hook_source_reads_entrypoint() -> None:
-    assert "CLAUDE_CODE_ENTRYPOINT" in HOOK.read_text(encoding="utf-8")
-
-
 def test_n6_concurrent_asks_same_session_share_tmp(tmp_path: Path) -> None:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_NIGHT_PROCEED")}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_NIGHT_PROCEED") and k != "CLAUDE_CODE_ENTRYPOINT"}
     env.update(HOME=str(tmp_path), CLAUDE_NIGHT_PROCEED_TEST_NOW="02:00",
                CLAUDE_NIGHT_PROCEED_TEST_LOCK="locked")
-    import hashlib
     problems: list[str] = []
     for rnd in range(30):
         sid = f"sess{rnd}"
@@ -62,7 +53,3 @@ def test_n6_concurrent_asks_same_session_share_tmp(tmp_path: Path) -> None:
             if hashlib.sha256(key.encode()).hexdigest() not in seen:
                 problems.append(f"round {rnd}: digest lost for {q!r}")
     assert not problems, problems
-
-
-def test_n7a_single_line_start_option_is_not_a_block(tmp_path: Path) -> None:
-    assert run(tmp_path, stop("Note:\nA) only one option.")) is None

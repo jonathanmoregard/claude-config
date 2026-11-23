@@ -12,11 +12,41 @@ RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
 HOOK = RUNTIME / "hooks" / "night-proceed.py"
 PYTHON = shutil.which("python3") or "python3"
 
+FAKE_CLAUDE = """#!/bin/sh
+# Records each classifier call (args, stdin) and answers with $FAKE_REPLY.
+n=$(ls "$FAKE_DIR"/call.* 2>/dev/null | wc -l)
+printf '%s\\n' "$@" > "$FAKE_DIR/call.$n"
+cat > "$FAKE_DIR/stdin.$n"
+printf '%s\\n' "${FAKE_REPLY-QUESTION}"
+exit "${FAKE_RC:-0}"
+"""
+
+
+def fake_bin(tmp: Path) -> Path:
+    """A bin dir with the fake `claude`; calls land in tmp/claude-calls."""
+    bindir = tmp / "fakebin"
+    if not bindir.exists():
+        bindir.mkdir()
+        (tmp / "claude-calls").mkdir()
+        stub = bindir / "claude"
+        stub.write_text(FAKE_CLAUDE)
+        stub.chmod(0o755)
+    return bindir
+
+
+def calls(tmp: Path) -> list[list[str]]:
+    d = tmp / "claude-calls"
+    return [d.joinpath(f"call.{i}").read_text().splitlines()
+            for i in range(len(list(d.glob("call.*"))))] if d.exists() else []
+
 
 def run(tmp: Path, payload: object, *, now: str | None = "02:00", lock: str | None = "locked",
-        extra: dict[str, str] | None = None, raw: str | None = None) -> dict | None:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_NIGHT_PROCEED")}
-    env["HOME"] = str(tmp)
+        reply: str = "QUESTION", extra: dict[str, str] | None = None,
+        raw: str | None = None) -> dict | None:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_NIGHT_PROCEED") and k != "CLAUDE_CODE_ENTRYPOINT"}
+    env.update(HOME=str(tmp), CLAUDE_CODE_ENTRYPOINT="cli", FAKE_DIR=str(tmp / "claude-calls"),
+               FAKE_REPLY=reply, PATH=f"{fake_bin(tmp)}:{os.environ['PATH']}")
     if now is not None:
         env["CLAUDE_NIGHT_PROCEED_TEST_NOW"] = now
     if lock is not None:
@@ -33,9 +63,9 @@ def stop(msg: str, **kw: object) -> dict:
     return {"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": msg, **kw}
 
 
-def ask(question: str) -> dict:
+def ask(question: str, **kw: object) -> dict:
     return {"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "AskUserQuestion",
-            "tool_input": {"questions": [{"question": question}]}}
+            "tool_input": {"questions": [{"question": question}]}, **kw}
 
 
 AB = "Two ways to do it:\n\nA) keep the cache (recommended)\nB) drop it\n\nWhich one?"
@@ -43,45 +73,48 @@ AB = "Two ways to do it:\n\nA) keep the cache (recommended)\nB) drop it\n\nWhich
 
 def test_night_locked_question_blocks_the_stop(tmp_path: Path) -> None:
     out = run(tmp_path, stop(AB))
-    assert out and out["decision"] == "block"
+    assert out == {"decision": "block", "reason": out["reason"]}
     assert out["reason"].startswith("The user is likely asleep")
-    assert "force pushes" in out["reason"]
+    assert "force pushes" in out["reason"] and "break a directive the user gave" in out["reason"]
 
 
-def test_lettered_options_without_question_mark(tmp_path: Path) -> None:
-    msg = "Options:\n- **A.** rename the field\n- **B.** add an alias\n\nI recommend A."
-    assert run(tmp_path, stop(msg))
+def test_classifier_is_sonnet_without_tools_hooks_or_session(tmp_path: Path) -> None:
+    run(tmp_path, stop(AB))
+    (args,) = calls(tmp_path)
+    assert args[:3] == ["-p", "--model", "sonnet"]
+    assert args[args.index("--tools") + 1] == ""
+    assert "--strict-mcp-config" in args and "--no-session-persistence" in args
+    assert json.loads(args[args.index("--settings") + 1]) == {"disableAllHooks": True}
+    sent = (tmp_path / "claude-calls" / "stdin.0").read_text()
+    assert sent.startswith("<message>\n") and AB in sent and sent.rstrip().endswith("</message>")
 
 
-def test_statement_is_left_alone(tmp_path: Path) -> None:
-    assert run(tmp_path, stop("Done. Tests pass and the PR is open.")) is None
-    assert run(tmp_path, stop("Note:\nA) only one option.\n\nI recommend it.")) is None
-    assert run(tmp_path, stop("Considered:\nA) cache\nB) none\n\nWent with A. Done, tests pass.")) is None
+def test_long_message_sends_its_end(tmp_path: Path) -> None:
+    run(tmp_path, stop("x" * 20000 + "\n\nShall I go on?"))
+    sent = (tmp_path / "claude-calls" / "stdin.0").read_text()
+    assert "Shall I go on?" in sent and len(sent) < 7000
 
 
-def test_question_in_last_paragraph_with_numbered_options(tmp_path: Path) -> None:
-    # The shape the first e2e probe produced: numbered options, and the
-    # question followed by one more sentence in the same paragraph.
-    msg = ("1. **Transliterate**\n2. **Strip**\n\nI recommend 1.\n\n"
-           "Which do you want: 1 or 2? If you pick 1, I'll also need to know the fallback.")
-    assert run(tmp_path, stop(msg))
+def test_classifier_done_or_failing_means_no_reply(tmp_path: Path) -> None:
+    assert run(tmp_path, stop("Done 1. Tests pass."), reply="DONE") is None
+    assert run(tmp_path, stop("Done 2?"), reply="QUESTION, probably") is None
+    assert run(tmp_path, stop("Done 3?"), reply="") is None
+    assert run(tmp_path, stop("Done 4?"), extra={"FAKE_RC": "1"}) is None
+    assert run(tmp_path, stop("Done 5?"), extra={"PATH": "/nonexistent"}) is None
+    # Trailing punctuation or markup around the one word is still the word.
+    assert run(tmp_path, stop("Q 6?"), reply="**Question.**")
 
 
-def test_question_earlier_than_last_paragraph_is_not_the_ending(tmp_path: Path) -> None:
-    msg = "Why did it fail? The cache was stale.\n\nFixed it; tests pass."
-    assert run(tmp_path, stop(msg)) is None
-
-
-def test_trailing_markdown_after_question_mark(tmp_path: Path) -> None:
-    assert run(tmp_path, stop("Shall I go on with **step 2?**\n"))
-
-
-def test_day_unlocked_unreadable_and_off_switch(tmp_path: Path) -> None:
+def test_no_classifier_call_outside_the_window(tmp_path: Path) -> None:
     assert run(tmp_path, stop(AB), now="14:00") is None
     assert run(tmp_path, stop(AB), now="09:00") is None
     assert run(tmp_path, stop(AB), lock="unlocked") is None
     assert run(tmp_path, stop(AB), lock="unreadable") is None
     assert run(tmp_path, stop(AB), extra={"CLAUDE_NIGHT_PROCEED": "0"}) is None
+    assert run(tmp_path, stop(AB, stop_hook_active=True)) is None
+    assert run(tmp_path, stop(AB, agent_id="a1")) is None
+    assert run(tmp_path, stop("   ")) is None
+    assert calls(tmp_path) == []
 
 
 def test_window_edges(tmp_path: Path) -> None:
@@ -91,39 +124,45 @@ def test_window_edges(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Edge 4?"), now="21:59") is None
 
 
-def test_same_question_twice_is_let_through(tmp_path: Path) -> None:
+def test_same_question_twice_is_let_through_without_a_second_call(tmp_path: Path) -> None:
     assert run(tmp_path, stop(AB))
     assert run(tmp_path, stop(AB)) is None
+    assert len(calls(tmp_path)) == 1
     assert run(tmp_path, stop("A different question?"))
 
 
-def test_stop_hook_active_stands_down(tmp_path: Path) -> None:
-    assert run(tmp_path, stop(AB, stop_hook_active=True)) is None
-
-
-def test_ask_user_question_denied_once(tmp_path: Path) -> None:
+def test_ask_user_question_denied_once_without_classifier(tmp_path: Path) -> None:
     out = run(tmp_path, ask("Which cache policy?"))
     spec = out["hookSpecificOutput"]
     assert spec["hookEventName"] == "PreToolUse" and spec["permissionDecision"] == "deny"
     assert spec["permissionDecisionReason"].startswith("The user is likely asleep")
     assert run(tmp_path, ask("Which cache policy?")) is None
+    assert calls(tmp_path) == []
 
 
-def test_subagents_other_tools_and_garbage(tmp_path: Path) -> None:
-    assert run(tmp_path, stop(AB, agent_id="a1")) is None
+def test_one_reply_per_turn_across_ask_and_stop(tmp_path: Path) -> None:
+    # Denied ask, then the session ends that turn on the same question as text:
+    # it already had PROMPT this turn, so the stop is let through.
+    assert run(tmp_path, ask("Which license?", prompt_id="p1"))
+    assert run(tmp_path, stop("Which license?", prompt_id="p1")) is None
+    # A later turn asking again is a new turn.
+    assert run(tmp_path, stop("Which license, MIT or Apache?", prompt_id="p2"))
+
+
+def test_other_tools_and_garbage(tmp_path: Path) -> None:
     assert run(tmp_path, {**ask("x?"), "tool_name": "Bash"}) is None
     assert run(tmp_path, stop(AB, session_id="../etc")) is None
     assert run(tmp_path, None, raw="not json") is None
 
 
 def fake_gdbus(tmp: Path, reply: str, rc: int = 0) -> str:
-    """A PATH whose gdbus prints `reply` and exits `rc`, ahead of the real PATH."""
+    """A PATH whose gdbus prints `reply` and exits `rc`, ahead of the fake claude."""
     bindir = tmp / f"gdbus-{abs(hash((reply, rc)))}"
     bindir.mkdir(exist_ok=True)
     stub = bindir / "gdbus"
     stub.write_text(f"#!/bin/sh\nprintf '%s\\n' '{reply}'\nexit {rc}\n")
     stub.chmod(0o755)
-    return f"{bindir}:{os.environ['PATH']}"
+    return f"{bindir}:{fake_bin(tmp)}:{os.environ['PATH']}"
 
 
 def test_desktop_lock_query_without_seam(tmp_path: Path) -> None:
@@ -133,16 +172,4 @@ def test_desktop_lock_query_without_seam(tmp_path: Path) -> None:
     assert run(tmp_path, stop("Lock 2?"), lock=None, extra={"PATH": fake_gdbus(tmp_path, "(false,)")}) is None
     assert run(tmp_path, stop("Lock 3?"), lock=None,
                extra={"PATH": fake_gdbus(tmp_path, "Error: no bus", rc=1)}) is None
-    assert run(tmp_path, stop("Lock 4?"), lock=None, extra={"PATH": "/nonexistent"}) is None
-
-
-def test_question_then_options_then_a_closing_wait(tmp_path: Path) -> None:
-    # The final of the asked-twice e2e probe, verbatim: the hook missed it.
-    msg = ("Which license header should `text_utils.py` get?\n\n1. MIT\n2. Apache-2.0\n\n"
-           "I haven't changed anything and won't until you answer.")
-    assert run(tmp_path, stop(msg))
-
-
-def test_question_before_a_closing_recommendation(tmp_path: Path) -> None:
-    assert run(tmp_path, stop("1. X\n2. Y\n\nWhich one?\n\nI recommend 1."))
-    assert run(tmp_path, stop("A) keep\nB) drop\n\nI recommend A."))
+    assert run(tmp_path, stop("Lock 4?"), lock=None, extra={"PATH": f"{fake_bin(tmp_path)}"}) is None
