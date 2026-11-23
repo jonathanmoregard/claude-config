@@ -202,9 +202,10 @@ def copy_file_into_home(path: Path, staged: Path) -> None:
 
     def build(entry: Path) -> None:
         # open(2) puts a new file's mode under the umask, as rsync does.
-        fd = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL, staged_mode & 0o777)
-        with staged.open("rb") as source, os.fdopen(fd, "wb") as target:
-            shutil.copyfileobj(source, target)
+        with staged.open("rb") as source:
+            fd = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL, staged_mode & 0o777)
+            with os.fdopen(fd, "wb") as target:
+                shutil.copyfileobj(source, target)
         if kept is not None:
             entry.chmod(kept)
 
