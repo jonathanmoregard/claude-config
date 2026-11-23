@@ -500,9 +500,10 @@ section("settings.json: the permission surface the switchover creates")
 _ALLOW = SETTINGS.get("permissions", {}).get("allow", [])
 _DENY_ALL = SETTINGS.get("permissions", {}).get("deny", [])
 _SANDBOX = SETTINGS.get("sandbox", {})
-# Sandboxed Bash is auto-allowed once the sandbox is on, which replaces the bare allow.
-_BASH_REACHABLE = "Bash" in _ALLOW or (
-    _SANDBOX.get("enabled") is True and _SANDBOX.get("autoAllowBashIfSandboxed") is True)
+# The bare allow stays even with the sandbox on: autoAllowBashIfSandboxed covers
+# sandboxed commands only, and without it compound and excluded commands prompt
+# (measured in agent e2e, 5/26 runs).
+_BASH_REACHABLE = "Bash" in _ALLOW
 
 check(
     # L1. Until this is gone the guards are unreachable: the CLI refuses the

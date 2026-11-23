@@ -287,7 +287,13 @@ expect_refused "helper refuses an existing path" 'already exists' env HOME="$ROO
 touch -d '-1 hour' "$(git -C "$PRIMARY" rev-parse --path-format=absolute --git-path FETCH_HEAD)"
 expect_refused "sandboxed helper refuses a stale fetch and names the broker" 'mcp__git_broker__git' \
   env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-stale
-touch "$(git -C "$PRIMARY" rev-parse --path-format=absolute --git-path FETCH_HEAD)"
+FH="$(git -C "$PRIMARY" rev-parse --path-format=absolute --git-path FETCH_HEAD)"
+cp "$FH" "$ROOT/fetch-head.master"
+printf '%s\t\tbranch '"'"'other'"'"' of %s\n' "$(head_of "$PRIMARY" origin/master)" "$ROOT/origin" >"$FH"
+expect_refused "sandboxed helper refuses a fresh fetch that was not of master" 'mcp__git_broker__git' \
+  env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-other
+cp "$ROOT/fetch-head.master" "$FH"
+touch "$FH"
 expect_ok "sandboxed helper accepts a fresh broker fetch" \
   env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-fresh
 expect_ok "plain git worktree add -b from the primary works" \

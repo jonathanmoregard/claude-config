@@ -236,9 +236,7 @@ for _basename, _event in (
         )
 check(
     "the candidate carries the real permission surface",
-    ("Bash" in CAND["permissions"]["allow"]
-     or (CAND["sandbox"].get("enabled") is True
-         and CAND["sandbox"].get("autoAllowBashIfSandboxed") is True))
+    "Bash" in CAND["permissions"]["allow"]
     and "Bash" not in CAND["permissions"]["deny"]
     and len([r for r in CAND["permissions"]["deny"] if r.startswith("Bash(")]) > 40,
     f"allow={[a for a in CAND['permissions']['allow'] if 'Bash' in a]} "

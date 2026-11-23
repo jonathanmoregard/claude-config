@@ -1,4 +1,7 @@
 {
+  "env": {
+    "CLAUDE_SANDBOX_SOAK": "1"
+  },
   "sandbox": {
     "enabled": true
   }

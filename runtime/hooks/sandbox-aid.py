@@ -51,7 +51,8 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         re.compile(r"\.gitmodules' is locked: Permission denied"),
         "The sandbox mounts a placeholder over a missing .gitmodules, which "
         "nix's git fetcher cannot open. Commit an empty .gitmodules at the "
-        "repo root.",
+        "repo root with `git add -f .gitmodules` (the sandbox's git ignore "
+        "hides that name, so a plain add fails).",
     ),
     (
         "read-only",
@@ -63,6 +64,10 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
 
 
 def sandbox_enabled() -> bool:
+    # A soak session turns the sandbox on with --settings sandbox-soak.json,
+    # which settings.json cannot show; that file's env block sets this marker.
+    if os.environ.get("CLAUDE_SANDBOX_SOAK") == "1":
+        return True
     try:
         return json.loads(SETTINGS.read_text(encoding="utf-8"))["sandbox"]["enabled"] is True
     except Exception:
