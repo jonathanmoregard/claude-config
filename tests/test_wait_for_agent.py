@@ -18,6 +18,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 RUNTIME = REPO / "runtime" if (REPO / "runtime").is_dir() else REPO
 WAIT_FOR = RUNTIME / "scripts" / "wait-for"
+# Run through bash -p, as the script's own shebang does: that NixOS path is
+# absent on CI runners.
+BASH_P = [shutil.which("bash") or "bash", "-p"]
 HOOK = RUNTIME / "hooks" / "agent-idle-alarm.py"
 
 SYSTEMCTL_ACTIVATING = """#!/usr/bin/env bash
@@ -61,7 +64,7 @@ def write_agent(tmp: Path, agent: str, *, age: int = 600, meta_age: int | None =
 
 
 def run(env: dict[str, str], *args: str) -> tuple[int, str]:
-    p = subprocess.run([str(WAIT_FOR), "agent", *args], env=env,
+    p = subprocess.run([*BASH_P, str(WAIT_FOR), "agent", *args], env=env,
                        capture_output=True, text=True, timeout=60)
     return p.returncode, p.stdout
 
@@ -127,7 +130,7 @@ def test_deleted_transcript_is_exit_3(tmp_path: Path) -> None:
     t = write_agent(tmp_path, "hhh9", age=0)
     # --idle 30, not 2: mtimes are whole seconds, so a short limit can call the
     # fresh transcript stalled before the unlink lands (sleep is stubbed).
-    p = subprocess.Popen([str(WAIT_FOR), "agent", "hhh9", "--idle", "30", "--timeout", "8"],
+    p = subprocess.Popen([*BASH_P, str(WAIT_FOR), "agent", "hhh9", "--idle", "30", "--timeout", "8"],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     time.sleep(0.7)
     t.unlink()
@@ -212,7 +215,7 @@ def test_invalid_idle_is_a_usage_error_in_agent_mode_only(tmp_path: Path) -> Non
     assert rc == 64
     (Path(env["STUB_DIR"]) / "bin" / "systemctl").write_text(SYSTEMCTL_ACTIVATING)
     (Path(env["STUB_DIR"]) / "bin" / "systemctl").chmod(0o755)
-    cmd = [str(WAIT_FOR), "unit", "x", "--user", "--timeout", "2"]
+    cmd = [*BASH_P, str(WAIT_FOR), "unit", "x", "--user", "--timeout", "2"]
     clean = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
     stray = subprocess.run(cmd, env={**env, "WAIT_FOR_AGENT_IDLE": "2h"},
                            capture_output=True, text=True, timeout=10)
@@ -222,7 +225,7 @@ def test_invalid_idle_is_a_usage_error_in_agent_mode_only(tmp_path: Path) -> Non
 
 def test_idle_is_agent_only(tmp_path: Path) -> None:
     env = make_env(tmp_path)
-    p = subprocess.run([str(WAIT_FOR), "unit", "x", "--idle", "5"], env=env,
+    p = subprocess.run([*BASH_P, str(WAIT_FOR), "unit", "x", "--idle", "5"], env=env,
                        capture_output=True, text=True, timeout=10)
     assert p.returncode == 64
 
@@ -242,7 +245,7 @@ def test_non_agent_mode_leading_zero_timeout_is_eight_seconds(tmp_path: Path) ->
                                               "/run/current-system/sw/bin:"))
     wait_for.chmod(0o755)
     started = time.time()
-    p = subprocess.run([str(wait_for), "unit", "x", "--user", "--timeout", "08"], env=env,
+    p = subprocess.run([*BASH_P, str(wait_for), "unit", "x", "--user", "--timeout", "08"], env=env,
                        capture_output=True, text=True, timeout=40)
     took = time.time() - started
     assert "value too great" not in p.stderr, (p.returncode, p.stdout, p.stderr)
