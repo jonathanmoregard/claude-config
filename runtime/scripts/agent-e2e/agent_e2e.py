@@ -43,7 +43,10 @@ COST
 FIDELITY
     The staged HOME carries the candidate CLAUDE.md, settings.json (hooks,
     permissions, defaultMode), skills, agents and commands, so hooks referencing
-    $HOME/.claude run the candidate's scripts. Credentials, the plugin cache and
+    $HOME/.claude run the candidate's scripts. The one change to the staged
+    settings: an absolute-path deny covering the staged HOME itself (meant for
+    reviewers of run dirs) is dropped, and named in the run's provenance.
+    Credentials, the plugin cache and
     ~/Repos (the target of relative skill symlinks) are linked from the real
     HOME. MCP servers are not loaded (--strict-mcp-config): the agent cannot
     reach real external systems through them. A scenario that needs an MCP
@@ -57,6 +60,7 @@ from __future__ import annotations
 import argparse
 import errno
 import concurrent.futures as cf
+import fnmatch
 import hashlib
 import json
 import os
@@ -232,9 +236,63 @@ def config_id(src: str) -> str | None:
     return sh(["git", "-C", str(REPO), "rev-parse", src]).stdout.strip()
 
 
+_PATH_RULE = re.compile(r"(Read|Edit|Write|MultiEdit|NotebookEdit)\((//.+)\)")
+
+
+def _glob_covers(pattern: str, path: str) -> bool:
+    """Whether permission glob PATTERN (gitignore style: `*` within one
+    segment, a `**` segment across any number) matches absolute PATH."""
+    pat, parts = pattern.strip("/").split("/"), path.strip("/").split("/")
+
+    def match(i: int, j: int) -> bool:
+        if i == len(pat):
+            return j == len(parts)
+        if pat[i] == "**":
+            return any(match(i + 1, k) for k in range(j, len(parts) + 1))
+        return (j < len(parts) and fnmatch.fnmatchcase(parts[j], pat[i])
+                and match(i + 1, j + 1))
+    return match(0, 0)
+
+
+def drop_own_home_denies(home: pathlib.Path) -> list[str]:
+    """Remove, from the staged HOME's settings.json only, every absolute
+    path deny that covers the staged HOME itself, and return them.
+
+    The real settings deny Read of every staged HOME under the e2e state tree
+    so a reviewer cannot read account material in a run dir. Staged, the same
+    rule names the agent under test's own HOME and denies it its skills'
+    references and its notes. Only a `Tool(//glob)` rule whose glob matches a
+    plain child of HOME goes; rules for one named file, `~/` rules (the same
+    meaning in a real session) and every other key stay. The scrub after the
+    run still removes the account material either way. A settings.json that is
+    a link is replaced by a file, never written through."""
+    settings = home / ".claude/settings.json"
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        deny = data["permissions"]["deny"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    if not isinstance(deny, list):
+        return []
+    probes = {str(home.absolute() / "x"), str(home.resolve() / "x")}
+    dropped = [r for r in deny if isinstance(r, str) and (m := _PATH_RULE.fullmatch(r))
+               and any(_glob_covers(m.group(2), p) for p in probes)]
+    if not dropped:
+        return []
+    data["permissions"]["deny"] = [r for r in deny if r not in dropped]
+    settings.unlink()
+    fd = os.open(settings, _WRITE_NOFOLLOW | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return dropped
+
+
 def stage(src: str, home: pathlib.Path) -> str:
     """Build a sandbox HOME whose ~/.claude is config SRC."""
     provenance = copy_config(src, home / ".claude")
+    dropped = drop_own_home_denies(home)
+    if dropped:
+        provenance += "; own-HOME deny dropped: " + ", ".join(dropped)
     for rel, target in LINKS.items():
         link = home / rel
         if link.exists() or link.is_symlink():

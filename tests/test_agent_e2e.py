@@ -129,6 +129,61 @@ def test_stage_names_a_submodule_it_could_not_stage(tmp_path):
     assert "vendor/sub" in r.stdout and "not initialised" in r.stdout
 
 
+def test_stage_drops_only_the_deny_that_covers_the_staged_home(tmp_path):
+    """A reviewer-facing deny of every staged HOME (`.../**/home/**`) rides
+    along in the candidate's settings, and in the staged copy it would deny
+    the agent under test its own HOME: its skills' references, its notes.
+    Only that rule goes, only in the staged copy, and the run says so."""
+    own_home = f"Read(/{tmp_path}/**/home/**)"
+    # `**` matches zero segments too: this one names HOME's parent exactly.
+    own_home_exact = f"Edit(/{tmp_path}/out/runs/s/new/1/**/home/**)"
+    kept = ["Read(//home/jonathan/.local/state/agent-e2e-broker/**/home/**)",
+            f"Read(/{tmp_path}/**/home/.claude.json)",
+            f"Read(/{tmp_path}/*/home/**)",  # `*` is one segment; HOME is deeper
+            "Read(~/.ssh/**)", "Bash(rm -rf /*)"]
+    settings = {"env": {"A": "1"},
+                # arftl-allow: permission-widened (a fixture under tmp_path; widens nothing)
+                "permissions": {"allow": [f"Read(/{tmp_path}/**)"],
+                                "deny": [kept[0], own_home, *kept[1:], own_home_exact],
+                                "defaultMode": "default"},
+                "hooks": {"Stop": []}}
+    # The real ~/.claude/settings.json is a link into the config repo: the
+    # staged copy keeps that link, and writing through it would edit the repo.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    real = repo / "settings.json"
+    real.write_text(json.dumps(settings, indent=2) + "\n")
+    before = real.read_bytes()
+    src = tmp_path / "cfg"
+    src.mkdir()
+    (src / "settings.json").symlink_to(real)
+    home = tmp_path / "out/runs/s/new/1/home"
+    r = harness("stage", "--config", str(src), "--home", str(home))
+    assert r.returncode == 0, r.stderr
+    assert real.read_bytes() == before
+    staged = home / ".claude/settings.json"
+    assert not staged.is_symlink()
+    got = json.loads(staged.read_text())
+    assert got["permissions"]["deny"] == kept
+    assert list(got) == list(settings)
+    assert {k: v for k, v in got.items() if k != "permissions"} == \
+        {k: v for k, v in settings.items() if k != "permissions"}
+    assert got["permissions"]["allow"] == settings["permissions"]["allow"]
+    assert own_home in r.stdout and own_home_exact in r.stdout
+
+
+def test_stage_leaves_settings_alone_when_no_deny_covers_the_home(tmp_path):
+    src = tmp_path / "cfg"
+    src.mkdir()
+    # arftl-allow: permission-widened (a deny-only fixture for a staged copy)
+    text = '{"permissions": {"deny": ["Read(//elsewhere/**/home/**)"]}}\n'
+    (src / "settings.json").write_text(text)
+    home = tmp_path / "home"
+    r = harness("stage", "--config", str(src), "--home", str(home))
+    assert r.returncode == 0, r.stderr
+    assert (home / ".claude/settings.json").read_text() == text
+
+
 def _scenario(tmp_path, check_body: str) -> pathlib.Path:
     sc = tmp_path / "sc"
     sc.mkdir()
