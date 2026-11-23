@@ -259,9 +259,20 @@ HOME_SECRETS = (*LINKS, ".claude/backups", ".ssh", ".codex")
 _DIR_NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
+def _lstat_at(dir_fd: int, name: str) -> os.stat_result | None:
+    """lstat NAME in DIR_FD; None when it is absent (nothing to scrub)."""
+    try:
+        return os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+
+
 def _remove_at(dir_fd: int, name: str) -> None:
-    """Remove NAME in DIR_FD; a link is removed itself, never followed."""
-    if stat.S_ISDIR(os.lstat(name, dir_fd=dir_fd).st_mode):
+    """Remove NAME in DIR_FD if present; a link is removed itself, never followed."""
+    st = _lstat_at(dir_fd, name)
+    if st is None:
+        return
+    if stat.S_ISDIR(st.st_mode):
         shutil.rmtree(name, dir_fd=dir_fd)
     else:
         os.unlink(name, dir_fd=dir_fd)
@@ -317,8 +328,6 @@ def scrub_home(home: pathlib.Path) -> list[str]:
                     continue
                 try:
                     _remove_at(fd, name)
-                except FileNotFoundError:
-                    pass
                 except OSError as exc:
                     errors.append(f"{home / rel}: {exc}")
                 finally:
@@ -327,13 +336,13 @@ def scrub_home(home: pathlib.Path) -> list[str]:
                     dir_fd=home_fd, follow_symlinks=False,
                     onerror=lambda exc: errors.append(f"{home}: {exc}")):
                 for name in [*dirnames, *filenames]:
+                    st = _lstat_at(dfd, name)
+                    if st is None or not stat.S_ISLNK(st.st_mode):
+                        continue
                     try:
-                        if stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode):
-                            os.unlink(name, dir_fd=dfd)
-                            if name in dirnames:
-                                dirnames.remove(name)
-                    except FileNotFoundError:
-                        pass
+                        os.unlink(name, dir_fd=dfd)
+                        if name in dirnames:
+                            dirnames.remove(name)
                     except OSError as exc:
                         errors.append(f"{home / dirpath / name}: {exc}")
         finally:
