@@ -195,6 +195,7 @@ def _build_candidate(path: str) -> dict:
     # to the three guards and repointed at this worktree, so the probe cannot
     # exercise the installed copy by accident.
     # arftl-allow: permission-widened — verbatim copy into a scratch file.
+    # arftl-allow: permission-widened (a test candidate copying the real block)
     cand = {"permissions": SETTINGS["permissions"], "hooks": hooks,
             "sandbox": SETTINGS.get("sandbox", {})}
     with open(path, "w", encoding="utf-8") as fh:

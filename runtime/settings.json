@@ -1050,7 +1050,7 @@
     }
   },
   "sandbox": {
-    "enabled": true,
+    "enabled": false,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
@@ -1086,7 +1086,10 @@
         "/home/jonathan/worktrees",
         "/home/jonathan/.local/state/ai-router",
         "/home/jonathan/.local/state/claude-tasks",
-        "~/.cache/claude-sandbox"
+        "~/.cache/claude-sandbox",
+        "~/.cache/nix",
+        "~/.cache/uv",
+        "~/.cargo"
       ],
       "denyWrite": [
         "/home/jonathan/.local/state/ai-router/jobs",

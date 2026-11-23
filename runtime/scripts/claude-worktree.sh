@@ -73,9 +73,17 @@ if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
   die "branch already exists: $branch — pick another slug"
 fi
 
-printf 'claude-worktree: fetching origin/master…\n' >&2
-git -C "$repo" fetch --quiet origin master \
-  || die "fetch failed — cannot branch off a stale origin/master"
+if [ "${SANDBOX_RUNTIME:-}" = 1 ]; then
+  # The sandbox has no git credentials; the fetch goes through git_broker.
+  fetch_head=$(git -C "$repo" rev-parse --path-format=absolute --git-path FETCH_HEAD)
+  age=$(( $(date +%s) - $(stat -c %Y "$fetch_head" 2>/dev/null || echo 0) ))
+  [ "$age" -le 900 ] \
+    || die "origin/master was last fetched ${age}s ago. In the sandbox, fetch it first with mcp__git_broker__git (repo_path $repo, operation fetch), then rerun"
+else
+  printf 'claude-worktree: fetching origin/master…\n' >&2
+  git -C "$repo" fetch --quiet origin master \
+    || die "fetch failed — cannot branch off a stale origin/master"
+fi
 
 mkdir -p "$WORKTREE_ROOT"
 git -C "$repo" worktree add -b "$branch" "$dest" origin/master

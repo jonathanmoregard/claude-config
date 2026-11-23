@@ -284,6 +284,12 @@ else
   bad "helper branches off freshly fetched origin/master" "branch=$(branch_of "$LINKED")"
 fi
 expect_refused "helper refuses an existing path" 'already exists' env HOME="$ROOT/bare-home" "$PRIMARY/scripts/claude-worktree.sh" policy-test
+touch -d '-1 hour' "$(git -C "$PRIMARY" rev-parse --path-format=absolute --git-path FETCH_HEAD)"
+expect_refused "sandboxed helper refuses a stale fetch and names the broker" 'mcp__git_broker__git' \
+  env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-stale
+touch "$(git -C "$PRIMARY" rev-parse --path-format=absolute --git-path FETCH_HEAD)"
+expect_ok "sandboxed helper accepts a fresh broker fetch" \
+  env HOME="$ROOT/bare-home" SANDBOX_RUNTIME=1 "$PRIMARY/scripts/claude-worktree.sh" sandbox-fresh
 expect_ok "plain git worktree add -b from the primary works" \
   git -C "$PRIMARY" worktree add -q -b feat/plain "$WT_ROOT/plain" origin/master
 printf 'linked\n' >> "$LINKED/tracked.txt"

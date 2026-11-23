@@ -57,8 +57,7 @@ HINTS: list[tuple[str, re.Pattern[str], str]] = [
         "read-only",
         re.compile(r"Read-only file system", re.I),
         "The shell is sandboxed: it can write under ~/Repos, ~/worktrees, "
-        "/tmp, ~/.local/state/claude-tasks and its own cache "
-        "~/.cache/claude-sandbox only.",
+        "/tmp, ~/.local/state/claude-tasks and the caches only.",
     ),
 ]
 
