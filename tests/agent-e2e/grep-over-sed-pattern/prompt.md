@@ -1,0 +1,1 @@
+In session.jsonl, pull out every entry that mentions task qz81kd — for each one I want its type, timestamp and the first 300 chars of message.content. Then tell me if any task-notification for it ever showed up.
