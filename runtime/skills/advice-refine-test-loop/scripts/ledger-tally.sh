@@ -36,6 +36,9 @@ BEGIN {
   while ((getline line < decided) > 0) {            # fp_reason decision date
     split(line, d, "\t")
     if (d[2] == "accepted" || d[2] == "rejected") done[d[1]] = 1
+    else if (d[1] != "fp_reason" && line != "")
+      printf "ledger-tally: %s: unknown decision \x27%s\x27 for \x27%s\x27, ignored\n",
+        decided, d[2], d[1] > "/dev/stderr"
   }
 }
 FNR == 1 && $1 == "date" { next }                   # header row
