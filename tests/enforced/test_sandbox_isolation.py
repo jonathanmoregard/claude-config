@@ -80,7 +80,7 @@ def attack(tmp_path: pathlib.Path, script: str) -> subprocess.CompletedProcess:
         d.mkdir()
     argv = harness().sandboxed(
         ["sh", "-c", f"{script}; echo {RAN}"], claude=shutil.which("sh"),
-        run=run, shared=shared, work=work)
+        run=run, runs=tmp_path, shared=shared, work=work)
     # Scrubbed from the child exactly as the harness scrubs its own list --
     # otherwise the child reads the probe out of its own environ and the test
     # reports a breakout that never happened.

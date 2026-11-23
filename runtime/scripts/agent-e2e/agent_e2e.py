@@ -45,15 +45,14 @@ FIDELITY
     permissions, defaultMode), skills, agents and commands, so hooks referencing
     $HOME/.claude run the candidate's scripts. The one change to the staged
     settings: an absolute-path deny covering the staged HOME itself (meant for
-    reviewers of run dirs) is replaced by denies of just the account material
-    (.claude.json, .credentials.json, .ssh, .codex) of every run under it, and
-    both are named in the run's provenance. Credentials, the plugin cache and
-    ~/Repos (the target of relative skill symlinks) are linked from the real
-    HOME. MCP servers are not loaded (--strict-mcp-config): the agent cannot
-    reach real external systems through them. A scenario that needs an MCP
-    tool has setup.sh write RUN/mcp.json naming a local STUB server; that file,
-    and only that file, is passed as --mcp-config. Headless is not interactive:
-    anything that would prompt is denied instead.
+    reviewers of run dirs) is dropped and named in the run's provenance; the
+    sandbox, not a deny, keeps a run out of the others. Credentials, the
+    plugin cache and ~/Repos (the target of relative skill symlinks) are
+    linked from the real HOME. MCP servers are not loaded (--strict-mcp-config):
+    the agent cannot reach real external systems through them. A scenario that
+    needs an MCP tool has setup.sh write RUN/mcp.json naming a local STUB
+    server; that file, and only that file, is passed as --mcp-config. Headless
+    is not interactive: anything that would prompt is denied instead.
 """
 
 from __future__ import annotations
@@ -245,8 +244,9 @@ def _glob_covers(pattern: str, path: str) -> bool:
     rules (Claude Code's documented syntax for path rules): `*` within one
     segment, a `**` segment across any number, and a pattern that matches a
     directory covers everything under it, so matching PATH or any ancestor
-    of it is enough."""
-    pat, parts = pattern.strip("/").split("/"), path.strip("/").split("/")
+    of it is enough. An empty PATTERN is `/`, which covers every PATH."""
+    pat = pattern.strip("/").split("/") if pattern.strip("/") else []
+    parts = path.strip("/").split("/")
 
     def match(i: int, j: int) -> bool:
         if i == len(pat):
@@ -258,71 +258,74 @@ def _glob_covers(pattern: str, path: str) -> bool:
     return match(0, 0)
 
 
-def _account_denies(tool: str, glob: str) -> list[str]:
-    """TOOL denies of the account material the scrub removes, by the same
-    names, at any depth under the directory part of GLOB."""
-    segs = glob.rstrip("/").split("/")
-    while segs[-1] in ("*", "**"):
-        segs.pop()
-    under = "/".join(segs) + "/**/"  # `//` stays: `//**` gives `//**/`
-    return ([f"{tool}({under}{name}*)" for name in SECRET_FILE_PREFIXES]
-            + [f"{tool}({under}{name}/**)" for name in SECRET_DIRS])
+def _names_home(glob: str, homes: set[str]) -> bool:
+    """Whether GLOB, less one trailing `/**`, `/*` or `/`, names one of HOMES
+    or an ancestor of it, by whole segments. Never a literal prefix of GLOB:
+    `//**/.env` starts with `/` and still covers nothing of HOME's own.
+
+    Segments are matched by fnmatch, whose `*`, `?` and `**` agree with
+    gitignore's. Where the two read a segment differently -- a `\\` escape,
+    a `[...]` class (`[^o]` is a negation only to gitignore) -- the rule is
+    kept, so a divergence can only keep a rule that should have gone, never
+    drop one that should have stayed: the first the agent trips over, the
+    second nobody sees."""
+    for tail in ("/**", "/*", "/"):
+        if glob.endswith(tail):
+            glob = glob[:-len(tail)]
+            break
+    if "\\" in glob or "[" in glob:
+        return False
+    return any(_glob_covers(glob, h) for h in homes)
 
 
-def drop_own_home_denies(home: pathlib.Path) -> tuple[list[str], list[str]]:
-    """In the staged HOME's settings.json only, replace every absolute path
-    deny that covers the staged HOME itself by denies of the account
-    material under the same tree. Returns (dropped, added).
+def drop_own_home_denies(home: pathlib.Path) -> list[str]:
+    """In the staged HOME's settings.json only, drop every absolute path deny
+    that covers the staged HOME itself. Returns what was dropped.
 
     The real settings deny Read of every staged HOME under the e2e state tree
     so a reviewer cannot read account material in a run dir. Staged, the same
     rule names the agent under test's own HOME and denies it its skills'
-    references and its notes. Only a `Tool(//glob)` rule whose glob covers a
-    plain child of HOME goes; rules for one named file, `~/` rules (the same
-    meaning in a real session) and every other key stay. The rule also covered
-    every other run's HOME (other arms, samples, campaigns), so in its place
-    the same tool stays denied the .claude.json, .credentials.json, .ssh and
-    .codex of every run under the same prefix, its own included: the CLI reads
-    its own login files directly, never through a tool. The scrub after the
-    run still removes the account material either way. A settings.json that is
-    a link is replaced by a file, never written through."""
+    references and its notes. Only a `Tool(//glob)` rule that names HOME or an
+    ancestor goes (`_names_home`); rules for one named file, `~/` rules (the
+    same meaning in a real session) and every other key stay.
+
+    Nothing stands in for it. The rest of what it covered, every other run's
+    HOME, is hidden by the sandbox (`sandboxed()` mounts a tmpfs over all runs
+    but this one), which holds for every tool and shell command alike, where a
+    Read deny reaches a shell command only if Claude Code parses it as a read
+    of that path (a plain `cat` it does, measured). What a sibling's HOME
+    holds is this run's own account anyway: sandboxed() binds the real
+    .credentials.json and every staged HOME links to it. A settings.json that
+    is a link is replaced by a file, never written through."""
     settings = home / ".claude/settings.json"
     try:
         data = json.loads(settings.read_text(encoding="utf-8"))
         deny = data["permissions"]["deny"]
     except (OSError, ValueError, KeyError, TypeError):
-        return [], []
+        return []
     if not isinstance(deny, list):
-        return [], []
-    probes = {str(home.absolute() / "x"), str(home.resolve() / "x")}
-    dropped, added, kept = [], [], []
+        return []
+    homes = {str(home.absolute()), str(home.resolve())}
+    dropped, kept = [], []
     for rule in deny:
         m = isinstance(rule, str) and _PATH_RULE.fullmatch(rule)
-        if not (m and any(_glob_covers(m.group(2), p) for p in probes)):
-            kept.append(rule)
-            continue
-        dropped.append(rule)
-        new = [r for r in _account_denies(m.group(1), m.group(2))
-               if r not in deny and r not in added]
-        added += new
-        kept += new
+        (dropped if m and _names_home(m.group(2), homes) else kept).append(rule)
     if not dropped:
-        return [], []
+        return []
     data["permissions"]["deny"] = kept
     settings.unlink()
     fd = os.open(settings, _WRITE_NOFOLLOW | os.O_EXCL, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    return dropped, added
+    return dropped
 
 
 def stage(src: str, home: pathlib.Path) -> str:
     """Build a sandbox HOME whose ~/.claude is config SRC."""
     provenance = copy_config(src, home / ".claude")
-    dropped, added = drop_own_home_denies(home)
+    dropped = drop_own_home_denies(home)
     if dropped:
-        provenance += ("; own-HOME deny dropped: " + ", ".join(dropped)
-                       + "; replaced by: " + ", ".join(added))
+        provenance += "; own-HOME deny dropped: " + ", ".join(dropped)
     for rel, target in LINKS.items():
         link = home / rel
         if link.exists() or link.is_symlink():
@@ -661,7 +664,8 @@ def path_guard() -> list[str]:
 
 
 def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
-              shared: pathlib.Path, work: pathlib.Path) -> list[str]:
+              runs: pathlib.Path, shared: pathlib.Path,
+              work: pathlib.Path) -> list[str]:
     """Wrap ARGV in the bubblewrap confinement a run executes under.
 
     The confinement binds `/` read-write, so what a run cannot write is
@@ -676,12 +680,21 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     runs sharing the real one leaked into each other: two dogfood runs picked
     the same /tmp output dir and one "ran" its e2e by reusing the other's
     verdict. Only this run's own directory is bound back in.
+
+    RUNS, the directory holding every arm's and sample's run of this
+    scenario (`<--out>/<scenario>`), is hidden the same way, so no run reads
+    or writes another: a sibling's HOME, its account material, its notes.
+    Not the raw --out, which a direct run may point at ~ or a repo root.
+    Campaigns of the broker are kept apart by its own unit. Without bwrap
+    there is no sibling isolation at all; the verdict's `isolated_tmp` says
+    which a run had.
     """
     binds = []
     exe_dir = pathlib.Path(claude).resolve().parent
     if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
         binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
-    # Last, so a read-only ancestor bind above cannot shadow them.
+    # Last, so a read-only ancestor bind or the tmpfs over RUNS cannot shadow
+    # them; an inherited E2E_SHARED under RUNS is bound back in the same way.
     binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
     # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
     # included) and ~/.ssh is hidden; only the run, the shared log dir and
@@ -717,7 +730,7 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # with the token in hand; measured with a 3s timeout against `sleep 300`.
     return [shutil.which("bwrap"), "--dev-bind", "/", "/",
             "--unshare-pid", "--proc", "/proc", "--die-with-parent",
-            *home_guard, *path_guard(), "--tmpfs", "/tmp",
+            *home_guard, *path_guard(), "--tmpfs", "/tmp", "--tmpfs", str(runs),
             *binds, "--chdir", str(work), "--", *argv]
 
 
@@ -929,7 +942,8 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
         argv += ["--mcp-config", str(run / "mcp.json")]
     bwrap = shutil.which("bwrap")
     if bwrap:
-        argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work)
+        argv = sandboxed(argv, claude=args.claude, run=run, runs=out,
+                         shared=shared, work=work)
     verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()
     try:

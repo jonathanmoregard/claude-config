@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -164,13 +165,8 @@ def test_stage_drops_only_the_deny_that_covers_the_staged_home(tmp_path):
     staged = home / ".claude/settings.json"
     assert not staged.is_symlink()
     got = json.loads(staged.read_text())
-    # Every other deny stays, in order; the narrow account-material denies
-    # standing in for the dropped ones are the only additions.
-    deny = got["permissions"]["deny"]
-    added = [d for d in deny if d not in kept]
-    assert [d for d in deny if d in kept] == kept
-    assert added and all(d.startswith(("Read(", "Edit(")) and d in r.stdout
-                         for d in added)
+    # Every other deny stays, in order, and nothing stands in for the dropped.
+    assert got["permissions"]["deny"] == kept
     assert list(got) == list(settings)
     assert {k: v for k, v in got.items() if k != "permissions"} == \
         {k: v for k, v in settings.items() if k != "permissions"}
@@ -190,80 +186,44 @@ def test_stage_leaves_settings_alone_when_no_deny_covers_the_home(tmp_path):
     assert (home / ".claude/settings.json").read_text() == text
 
 
-def _denied(deny: list[str], tool: str, path: pathlib.Path) -> bool:
-    """Whether a `TOOL(//glob)` rule in DENY covers PATH, by gitignore rules
-    as Claude Code documents them: `**` spans any number of segments, and a
-    pattern matching a directory covers everything under it. Independent of
-    the harness's own matcher on purpose."""
-    for rule in deny:
-        if not (rule.startswith(f"{tool}(//") and rule.endswith(")")):
-            continue
-        glob = rule[len(tool) + 2:-1].rstrip("/") or "/"
-        if any(p.full_match(glob) for p in (path, *path.parents)):
-            return True
-    return False
-
-
-# Account material in a staged HOME, as the harness's scrub finds it by name.
-_ACCOUNT_FILES = (".claude.json", ".claude.json.backup", ".claude/.credentials.json",
-                  ".claude/backups/.claude.json.backup.1", ".ssh/id_ed25519",
-                  ".codex/auth.json")
-
-
-def _stage_with_deny(tmp_path, deny: list[str], home_rel="out/runs/s/new/1/home",
-                     home_arg: pathlib.Path | None = None):
+def _stage_with_deny(tmp_path, deny: list[str], home_rel="out/runs/s/new/1/home"):
     src = tmp_path / "cfg"
     src.mkdir()
     # arftl-allow: permission-widened (a deny-only fixture for a staged copy)
     (src / "settings.json").write_text(json.dumps({"permissions": {"deny": deny}}))
-    home = home_arg or tmp_path / home_rel
+    home = tmp_path / home_rel
     r = harness("stage", "--config", str(src), "--home", str(home))
     assert r.returncode == 0, r.stderr
     got = json.loads((home / ".claude/settings.json").read_text())
     return r, got["permissions"]["deny"]
 
 
-@pytest.mark.parametrize("glob", ["/{t}/**/home/**", "/{t}/**/home/*", "//**"])
-def test_stage_keeps_every_runs_account_material_denied(tmp_path, glob):
-    """The dropped reviewer deny covers every staged HOME under its prefix,
-    not just the run's own. Without a replacement the agent under test could
-    Read a sibling arm's, sample's or campaign's .claude.json or refreshed
-    .credentials.json. Its own HOME stays readable apart from those."""
-    rule = f"Read({glob.format(t=tmp_path)})"
-    r, deny = _stage_with_deny(tmp_path, [rule])
-    assert rule not in deny
-    runs = tmp_path / "out/runs"
-    for home in (runs / "s/old/1/home", runs / "s/new/2/home",
-                 runs / "other/new/1/home", runs / "s/new/1/home"):
-        for rel in _ACCOUNT_FILES:
-            assert _denied(deny, "Read", home / rel), home / rel
-    own = runs / "s/new/1/home"
-    for rel in (".claude/skills/s/references/r.md", ".local/state/claude-tasks/x/n.md",
-                ".claude/settings.json"):
-        assert not _denied(deny, "Read", own / rel), rel
-    assert "replaced by" in r.stdout and all(d in r.stdout for d in deny)
-
-
-def test_stage_replacement_mirrors_the_dropped_rules_tool(tmp_path):
-    rule = f"Edit(/{tmp_path}/**/home/**)"
-    _, deny = _stage_with_deny(tmp_path, [rule])
-    sibling = tmp_path / "out/runs/s/old/1/home"
-    assert _denied(deny, "Edit", sibling / ".claude/.credentials.json")
-    assert not _denied(deny, "Read", sibling / ".claude/.credentials.json")
-
-
-@pytest.mark.parametrize("glob", ["/{t}/**/home", "/{t}/out", "/{t}/out/runs/",
-                                  "/{t}/out/*/s"])
-def test_stage_drops_a_deny_naming_an_ancestor_of_the_home(tmp_path, glob):
+@pytest.mark.parametrize("glob", ["/{t}/**/home", "/{t}/**/home/*", "/{t}/**/home/**/",
+                                  "/{t}/out", "/{t}/out/runs/", "/{t}/out/*/s", "//**"])
+def test_stage_drops_a_deny_naming_the_home_or_an_ancestor(tmp_path, glob):
     """Gitignore semantics: a pattern that matches a directory covers all of
-    it, so a deny naming HOME or any directory above it denies the agent its
-    own HOME just the same, and goes like the `/**` form does."""
+    it, so a deny naming HOME or any directory above it (`/**` or `/*` after
+    it or not) denies the agent its own HOME, and goes."""
     rule = f"Read({glob.format(t=tmp_path)})"
     r, deny = _stage_with_deny(tmp_path, [rule])
-    assert rule not in deny and rule in r.stdout
-    own = tmp_path / "out/runs/s/new/1/home"
-    assert not _denied(deny, "Read", own / ".claude/skills/s/references/r.md")
-    assert _denied(deny, "Read", tmp_path / "out/runs/s/old/1/home/.claude.json")
+    assert deny == [] and rule in r.stdout
+
+
+@pytest.mark.parametrize("glob", [
+    "//**/.env",                   # its literal prefix `/` is an ancestor; the rule is not
+    "/{t}/**/home/.claude.json",   # one named file in HOME, not HOME
+    "/{t}/**/home/?*",             # a tail other than the strip's three: kept,
+    "/{t}/**/home/[a-z]*",         # loudly, though it may cover all of HOME
+    "/{t}/[^o]ut/**",              # `[^o]`: not `o` to gitignore, `^` or `o` to fnmatch
+])
+def test_stage_keeps_a_deny_that_names_less_than_the_home(tmp_path, glob):
+    """Only a rule whose glob, less one trailing `/**`, `/*` or `/`, names
+    HOME or an ancestor goes. Anything narrower stays: dropping a rule that
+    still guarded something is silent, keeping one the agent trips on is
+    loud."""
+    rule = f"Read({glob.format(t=tmp_path)})"
+    r, deny = _stage_with_deny(tmp_path, [rule])
+    assert deny == [rule] and "dropped" not in r.stdout
 
 
 @pytest.mark.parametrize("tool", ["Write", "MultiEdit", "NotebookEdit"])
@@ -289,8 +249,7 @@ def test_drop_own_home_denies_matches_both_names_of_a_linked_home(tmp_path, name
     rule = f"Read(/{tmp_path}/{named}/**/home/**)"
     # arftl-allow: permission-widened (a deny-only fixture for a staged copy)
     (home / ".claude/settings.json").write_text(json.dumps({"permissions": {"deny": [rule]}}))
-    dropped, _ = mod.drop_own_home_denies(home)
-    assert dropped == [rule]
+    assert mod.drop_own_home_denies(home) == [rule]
 
 
 def _scenario(tmp_path, check_body: str) -> pathlib.Path:
@@ -406,6 +365,49 @@ EOF
                              'grep -q "open the PR" "$1/final.txt" && test -f "$1/marker"')
     r, _, verdicts = _run(tmp_path, sc, claude)
     assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
+
+
+def test_a_run_cannot_reach_a_sibling_run(tmp_path):
+    """Other arms' and samples' runs sit beside this one under the same
+    `<--out>/<scenario>`, each HOME holding its account material. The sandbox
+    hides every run there but the agent's own, which stays readable and
+    writable, as does an inherited E2E_SHARED outside it. Only that one
+    scenario's runs: --out itself may be ~ or a repo root, and what sits there
+    beside them stays in view. Built under /var/tmp:
+    under /tmp the sandbox's private /tmp hides it anyway and this passes
+    without testing anything."""
+    _require_sandbox()
+    base = pathlib.Path(tempfile.mkdtemp(prefix="e2e-siblings-", dir="/var/tmp"))
+    try:
+        sc = _scenario(tmp_path, "exit 0\n")
+        out = base / "out"
+        sibling = out / sc.name / "old/1/home/.claude.json"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text("sibling-account\n")
+        (out / "beside").write_text("beside-runs\n")
+        shared = base / "shared"
+        shared.mkdir()
+        report = shared / "report"
+        claude = fake_claude(base, _ok(f"""
+{{ cat {sibling} || echo "sibling unreadable"
+   cat "$E2E_RUN/marker" {out / "beside"}
+   echo w > "$E2E_RUN/own" && echo "own run writable"; }} > {report} 2>&1
+"""))
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / "CLAUDE.md").write_text("x\n")
+        r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                    "--out", str(out), "--claude", str(claude),
+                    env={**os.environ, "E2E_SHARED": str(shared)})
+        assert r.returncode == 0, r.stderr
+        assert report.is_file(), f"E2E_SHARED was not writable: {r.stdout[-800:]}"
+        text = report.read_text()
+        assert "sibling-account" not in text and "sibling unreadable" in text, text
+        assert "ready" in text and "own run writable" in text, text
+        assert "beside-runs" in text, text
+        assert (out / sc.name / "new/1/own").read_text() == "w\n"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def test_check_failure_is_fail(tmp_path):
