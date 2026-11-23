@@ -3,8 +3,9 @@
 `wait-for agent` is a quiet-only alarm: it exits 5 when neither the subagent's
 transcript nor its meta file has been touched for the idle limit, and never
 reads the transcript's contents. A synthetic transcript under a temporary HOME
-stands in for a real background agent; `notify-send` and `sleep` are stubs, so
-every case finishes in a few seconds at most.
+stands in for a real background agent; `sleep` is a stub, so every case
+finishes in a few seconds at most, and `notify-send` is a logging stub so a
+case can prove no desktop notification is sent.
 """
 from __future__ import annotations
 
@@ -78,8 +79,8 @@ def test_quiet_transcript_and_meta_is_a_stall(tmp_path: Path) -> None:
     assert rc == 5, out
     assert out.startswith("agent bbb2 stalled: no activity for 10m")
     assert "(idle limit 60s)" in out
-    assert "bbb2 stalled" in notified(env)
-    assert "-u critical" in notified(env)
+    # The exit wakes the parent; a stall sends no desktop notification.
+    assert notified(env) == ""
 
 
 def test_fresh_transcript_is_not_a_stall(tmp_path: Path) -> None:
@@ -103,7 +104,8 @@ def test_absent_meta_and_old_transcript_is_a_stall(tmp_path: Path) -> None:
     write_agent(tmp_path, "eee5", meta=None)
     rc, out = run(env, "eee5", "--idle", "60")
     assert rc == 5, out
-    assert "eee5 stalled" in notified(env)
+    assert "eee5 stalled" in out
+    assert notified(env) == ""
 
 
 def test_finished_meta_is_not_a_finish_signal(tmp_path: Path) -> None:
