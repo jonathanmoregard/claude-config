@@ -33,6 +33,7 @@ import fcntl
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -113,7 +114,8 @@ def seed_stage(stage: Path) -> None:
 
 def publish_stage(stage: Path) -> None:
     """Make the home's managed paths what they are in stage: files by bytes
-    and mode, links by target, directories by mode. What
+    and executability, links by target, with the modes the production
+    publish leaves (copy_into_home). What
     render_codex.never_pruned_paths names is never pruned: the hook
     generations live sessions may run are only added to (what a killed run
     left among them aside, render_codex.left_in_hook_generations), and
@@ -152,23 +154,59 @@ def refuse_hook_collisions(stage: Path) -> None:
 
 def copy_into_home(path: Path, stage: Path, skip: tuple[Path, ...] = ()) -> None:
     """Put at path what stage holds there, recursively: add and replace,
-    each entry atomically (common.replace_entry), never remove."""
+    each entry atomically (common.replace_entry), never remove.
+
+    Modes as the production publish's rsync -rltE (no -p) leaves them: a
+    new entry takes the stage's under the umask; an existing directory or
+    file keeps the home's, but for a file's executability, which follows
+    the stage's. A private directory or file stays private.
+    """
     if path in skip:
         return
     staged = common.in_stage(path, stage)
     if staged.is_dir() and not staged.is_symlink():
         if not (path.is_dir() and not path.is_symlink()):
-            common.replace_entry(path, lambda entry: entry.mkdir())
-        mode = staged.stat().st_mode & 0o7777
-        if path.stat().st_mode & 0o7777 != mode:
-            path.chmod(mode)
+            mode = stat.S_IMODE(staged.stat().st_mode)
+            common.replace_entry(path, lambda entry: entry.mkdir(mode))
         for name in sorted(os.listdir(staged)):
             copy_into_home(path / name, stage, skip)
-    elif staged.exists() or staged.is_symlink():
-        if common.entry_state(staged) != common.entry_state(path):
-            common.replace_entry(
-                path, lambda entry: shutil.copy2(staged, entry, follow_symlinks=False)
-            )
+    elif staged.is_symlink():
+        target = os.readlink(staged)
+        if not (path.is_symlink() and os.readlink(path) == target):
+            common.replace_entry(path, lambda entry: entry.symlink_to(target))
+    elif staged.exists():
+        copy_file_into_home(path, staged)
+
+
+def copy_file_into_home(path: Path, staged: Path) -> None:
+    staged_mode = stat.S_IMODE(staged.stat().st_mode)
+    kept: int | None = None
+    if path.is_file() and not path.is_symlink():
+        kept = with_executability(stat.S_IMODE(path.stat().st_mode), staged_mode)
+        if path.read_bytes() == staged.read_bytes():
+            if stat.S_IMODE(path.stat().st_mode) != kept:
+                path.chmod(kept)
+            return
+
+    def build(entry: Path) -> None:
+        # open(2) puts a new file's mode under the umask, as rsync does.
+        fd = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL, staged_mode & 0o777)
+        with staged.open("rb") as source, os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+        if kept is not None:
+            entry.chmod(kept)
+
+    common.replace_entry(path, build)
+
+
+def with_executability(mode: int, source: int) -> int:
+    """mode, made executable or not as source is, the way rsync -E changes
+    an existing file: x turned on wherever r is, or every x turned off."""
+    if bool(mode & 0o111) == bool(source & 0o111):
+        return mode
+    if source & 0o111:
+        return mode | (mode & 0o444) >> 2
+    return mode & ~0o111
 
 
 def prune_home(path: Path, stage: Path) -> None:

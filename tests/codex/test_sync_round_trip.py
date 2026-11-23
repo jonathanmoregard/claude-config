@@ -1609,7 +1609,6 @@ def test_a_direct_sync_publishes_exactly_the_stage_its_check_passed() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
         (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
-        (rt.codex / "AGENTS.md").chmod(0o600)
         rt.edit_config(lambda config: config.pop("features"))
         assert_check_fails(rt, *(str(path) for path in unsafe))
 
@@ -1631,6 +1630,36 @@ def test_a_direct_sync_publishes_exactly_the_stage_its_check_passed() -> None:
 
         rt.sync_ok()
         assert snapshot(rt.home) == published
+
+
+def test_a_direct_sync_keeps_the_home_modes_the_production_publish_keeps() -> None:
+    # The production publish rsyncs without -p (-rltE): an existing
+    # directory or file keeps the home's mode, but for a file's
+    # executability, which follows the stage's (x set where r is, or all x
+    # cleared). A direct run chmodded the home to the stage's modes instead:
+    # a private 0700 directory became 0755, a 0600 file 0644. The modes
+    # expected here are the ones that rsync leaves for the same stage.
+    with round_trip() as rt:
+        script = next(
+            path for path in sorted((rt.codex / "scripts").iterdir()) if path.stat().st_mode & 0o111
+        )
+        modes = {  # path: (set in the home, expected after the sync)
+            rt.codex / "claude-setup-mirror": (0o700, 0o700),
+            rt.codex / "AGENTS.md": (0o600, 0o600),
+            script: (0o640, 0o750),
+            rt.codex / "skills" / "demo-skill" / "SKILL.md": (0o754, 0o644),
+        }
+        (rt.codex / "AGENTS.md").write_text("hand edit\n", encoding="utf-8")
+        for path, (before, _) in modes.items():
+            path.chmod(before)
+        rt.sync_ok()
+        assert {path: path.stat().st_mode & 0o7777 for path in modes} == {
+            path: after for path, (_, after) in modes.items()
+        }
+        assert (rt.codex / "AGENTS.md").read_text(encoding="utf-8") != "hand edit\n"
+        published = snapshot(rt.home, ("",))
+        rt.sync_ok()
+        assert snapshot(rt.home, ("",)) == published
 
 
 # Runs sync_codex.main() with the check parked until a signal arrives: the
@@ -2039,6 +2068,7 @@ if __name__ == "__main__":
     test_profile_config_files_cannot_loosen_the_session()
     test_a_direct_sync_whose_check_fails_leaves_the_home_as_it_was()
     test_a_direct_sync_publishes_exactly_the_stage_its_check_passed()
+    test_a_direct_sync_keeps_the_home_modes_the_production_publish_keeps()
     test_a_direct_sync_stopped_before_it_publishes_leaves_the_home_as_it_was()
     test_a_second_direct_sync_changes_nothing_while_one_holds_the_home()
     test_check_remediation_names_the_checked_sync()
