@@ -236,7 +236,8 @@ class ValidationTests(Fixture):
                              "maxBudgetUsd", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
                              "readOnlyPaths")
 
-    def test_shipped_config_loads_in_a_broker_still_running_older_code(self) -> None:
+    def test_shipped_config_adds_no_key_an_older_broker_rejects(self) -> None:
+        # Checks the key set only; it does not execute an older loader.
         raw = json.loads((HERE / "config.json").read_text())["agentE2eBroker"]
         self.assertLessEqual(set(raw), set(self._PRE_SLOT_POLICY_KEYS))
 
@@ -565,12 +566,23 @@ class RunTests(Fixture):
             self.assertGreaterEqual(time.monotonic() - t0, 3)
         self.assertEqual(list(self.out.glob("*")) if self.out.exists() else [], [])
 
+    def _cancel_after_a_poll(self, rec) -> None:
+        # Flip the flag only after the wait loop has polled at least once, so a
+        # check that runs on the first pass alone cannot satisfy the test.
+        import threading
+        threading.Timer(self.server.SLOT_POLL_SEC + 0.5,
+                        lambda: setattr(rec, "cancelled", True)).start()
+
     def test_cancel_while_queued_stops_waiting(self) -> None:
+        self.raw["maxQueueSec"] = 120
         rec = self.server._InFlight()
-        rec.cancelled = True
+        self._cancel_after_a_poll(rec)
+        t0 = time.monotonic()
         with self._hold(self.policy["slots"]):
             with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for a campaign slot"):
                 self.server._tool_run(self.req(), rec)
+            self.assertLess(time.monotonic() - t0, 30)
+        self._assert_slots_free()
 
     def test_mirror_lock_waits_rather_than_refuses(self) -> None:
         require_units(self)
@@ -592,7 +604,7 @@ class RunTests(Fixture):
                 self.server._tool_run(self.req())
             self.assertLess(time.monotonic() - t0, self.raw["maxQueueSec"] + 2.0)
 
-    def test_git_holds_the_mirror_lock_while_it_lives(self) -> None:
+    def test_descendants_of_git_inherit_and_keep_the_mirror_lock_fd(self) -> None:
         import fcntl
         self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
         fd = self.server._open_lock(self.policy["lock"])
@@ -607,11 +619,14 @@ class RunTests(Fixture):
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_cancel_while_waiting_for_the_mirror_lock(self) -> None:
+        self.raw["maxQueueSec"] = 120
         rec = self.server._InFlight()
-        rec.cancelled = True
+        t0 = time.monotonic()
         with self._hold([self.policy["lock"]]):
+            self._cancel_after_a_poll(rec)
             with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for the mirror"):
                 self.server._tool_run(self.req(), rec)
+            self.assertLess(time.monotonic() - t0, 30)
         # The slot taken before the mirror wait is given back.
         self._assert_slots_free()
 

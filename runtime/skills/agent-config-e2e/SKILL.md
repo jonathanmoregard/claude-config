@@ -40,8 +40,8 @@ from `new_ref`, and returns the summary table, every verdict and the
 transcripts' directory. It blocks until done. A few campaigns run at once; when
 every slot is busy the call waits up to 30 minutes for one before it errors.
 `model` is haiku or sonnet and `n` at most 2 per call, so call it again for
-more samples and add the counts. Independent calls can go in one message to
-run in parallel.
+more samples and add the counts. Calls in one message run one after another; for
+parallel campaigns use separate sessions or subagents, since each call blocks its caller.
 
 Run the harness directly only when the broker cannot serve: a change to the
 harness itself, an unpushed ref, or a larger batch. It cannot run inside the
