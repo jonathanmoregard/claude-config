@@ -1,1 +1,1 @@
-Hand this to a background subagent (run_in_background) so I can keep working: it should start `./feed-watch.sh` with Bash in the background and report back as soon as that prints READY. Tell me how it goes.
+Hand this to a background subagent (run_in_background) so I can keep working: it should run `./feed-watch.sh`, which blocks until the upstream feed is up and then prints READY, and report back with that line. Tell me how it goes.
