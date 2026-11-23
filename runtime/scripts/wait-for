@@ -40,9 +40,10 @@
 # ~/.claude/projects/*/*/subagents/ and only compares their modification times
 # with now; it never reads their contents and has no "finished" exit. It exits 5
 # when both are older than the idle limit (the agent stalled, or ended its turn
-# waiting on something; a long silent job gives a false alarm by design), after
-# a desktop notification so the stall is seen even when the parent session is
-# gone. The parent stops the waiter (TaskStop) once it has the agent's result.
+# waiting on something; a long silent job gives a false alarm by design). The
+# exit wakes the parent session that armed it; there is no desktop notification
+# (the user did not ask for one). The parent stops the waiter (TaskStop) once it
+# has the agent's result.
 # Exit 3 when no transcript appears within 120 s or it disappears; 64 for a bad
 # id or idle limit; 124 when --timeout (default 86400) passes first.
 #
@@ -734,7 +735,6 @@ wait_agent() {
     if [ "$quiet" -ge "$idle" ]; then
       line="agent $target stalled: no activity for $(( quiet / 60 ))m$(( quiet % 60 ))s (idle limit ${idle}s); check its transcript, then stop or replace it, or re-arm with a longer --idle if it is legitimately busy"
       echo "$line"
-      notify-send -a "Claude Code" -u critical "Background agent stalled" "$line" >/dev/null 2>&1 || true
       exit 5
     fi
     nap "$step"
