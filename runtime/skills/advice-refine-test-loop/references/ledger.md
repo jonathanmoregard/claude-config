@@ -9,9 +9,9 @@ inside a field, `-` for an empty field.
 | 1 | date | `YYYY-MM-DD` |
 | 2 | source | `artl` or `sweep` |
 | 3 | run | short commit, then round or lens: `a1b2c3d/r2`, `a1b2c3d/races` |
-| 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a finding raised by a sibling line, or a lens name |
+| 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a finding raised by a sibling line, `reframe` for a rabbit-hole thread (`rabbit-hole.md`), or a lens name |
 | 5 | trigger | what made the check run: the part of the diff that met its `When`; `always` for A; for a sweep, why it was run |
-| 6 | where | `file:line`; `-` on a `none` row |
+| 6 | where | the finding's schema `file` and `line` verbatim, `/abs/path:<int>` (0 = whole file); `-` on a `none` row |
 | 7 | claim | one sentence |
 | 8 | outcome | `reproduced`, `refuted`, `unconfirmed`, `advisory`, `none` |
 | 9 | fixed | `yes`, `no`, `deferred`, `open`, `-` |
@@ -30,6 +30,12 @@ Rules:
    `yes`, `no` or `deferred`).
 5. Write `fp_reason` in a few plain words, and reuse an earlier reason's
    exact wording when it fits, so reasons can be counted.
+6. A review finding's `where` is the `file:line` its reviewer reported, never
+   paraphrased: `scripts/convergence-check.mts` exits 3 on any other form.
+   Sweep rows are not read by it.
+7. A `reframe` row's outcome is `reproduced` when the thread's verdict is
+   `wrong_shape` or `intractable_as_framed`, `none` when every thread is
+   `tractable`.
 
 ## Reading it
 

@@ -136,17 +136,20 @@ nothing new unconfirmed. Cap: four rounds. At the cap without two empty
 rounds, stop and report "not converged" with the count per round; the user
 decides what happens next.
 
+Once a round is adjudicated, append its rows to `<notes>/review-ledger.tsv`
+(`references/ledger.md`; a `none` row per silent check). Before rounds 3–4, run
+`node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
+(this close-out's runs, in order). `fire` → `references/rabbit-hole.md`
+first; at the cap, report-only.
+
 ## Report
 
 Return a compact ledger: rounds run and why the loop stopped, reviewer calls
 and model usage when available, B's hunt classes per round, files read,
 findings proposed / reproduced / refuted / unconfirmed / fixed / deferred,
 design and advisory findings surfaced, commands run, and final gate status.
-List every unconfirmed finding with what was tried.
-
-Then append to `<notes>/review-ledger.tsv` (format:
-`references/ledger.md`): one row per finding, and one `none` row per check
-that ran and reported nothing.
+List every unconfirmed finding with what was tried. Reframes: threads,
+verdicts, approach, whether the user was asked.
 
 End the report with the `ledger-tally.sh` line for each check that ran in
 this close-out. If a line says `drop` or `reword`, or an `exclude?` line
