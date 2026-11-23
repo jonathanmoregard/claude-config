@@ -198,6 +198,30 @@ def test_classifier_ignores_the_session_settings_and_cwd(tmp_path: Path) -> None
     assert Path(cwd).resolve() == Path(tempfile.gettempdir()).resolve(), cwd
 
 
+def test_classifier_runs_unlocked_and_result_is_rechecked(tmp_path: Path) -> None:
+    """The stub finds the session lock free, then records this turn (an ask
+    answered mid-classify) and says QUESTION: the Stop must not reply twice."""
+    state = tmp_path / ".claude" / "tmp" / "night-proceed"
+    bindir = tmp_path / "lockbin"
+    bindir.mkdir()
+    (bindir / "claude").write_text(f"""#!{PYTHON}
+import fcntl, json, pathlib, sys
+sys.stdin.read()
+with open("{state}/s1.lock", "a") as f:
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); got = "free"
+    except OSError:
+        got = "held"
+    pathlib.Path("{state}/s1.json").write_text(json.dumps(["turn:p1"]))
+pathlib.Path("{tmp_path}/lock-state").write_text(got)
+print("QUESTION")
+""")
+    (bindir / "claude").chmod(0o755)
+    assert run(tmp_path, stop(AB, prompt_id="p1"),
+               extra={"PATH": f"{bindir}:{os.environ['PATH']}"}) is None
+    assert (tmp_path / "lock-state").read_text() == "free"
+
+
 def load_hook(tmp: Path, monkeypatch) -> object:
     """The hook as a module, HOME at tmp, so main() can run in-process."""
     monkeypatch.setenv("HOME", str(tmp))
@@ -227,7 +251,7 @@ def test_hanging_classifier_fails_open(tmp_path: Path, monkeypatch, capsys) -> N
     (bindir / "claude").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     mod = load_hook(tmp_path, monkeypatch)
-    mod.CLASSIFY_TIMEOUT = 0.5
+    mod.CLASSIFY_TIMEOUT = 2
     started = time.monotonic()
     assert main_out(mod, stop(AB), monkeypatch, capsys) == ""
     assert time.monotonic() - started < 5
