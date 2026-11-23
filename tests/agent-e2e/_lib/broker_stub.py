@@ -28,8 +28,8 @@ AGENT_E2E = {
             "through scripts/agent-e2e/agent_e2e.py with a real headless Claude agent, arm "
             "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on "
             "origin (origin/<branch> or a pushed 40-hex commit). Up to maxCampaigns "
-            "campaigns run at once; when every slot is busy the call waits in line for one "
-            "(up to maxQueueSec), then blocks until done (up to an hour). Returns the harness summary table, every run's "
+            "campaigns run at once; when every slot is busy the call waits for one to free "
+            "(up to maxQueueSec, not strictly first-come-first-served), then blocks until done (up to an hour). Returns the harness summary table, every run's "
             "verdict and final.txt, and the output directory holding transcripts. Every PASS, "
             "FAIL and INCONCLUSIVE is reported; nothing is retried.",
             obj({"scenario": S, "old_ref": S, "new_ref": S, "model": S, "n": I, "jobs": I,

@@ -16,8 +16,8 @@ an old/new campaign of one scenario, nothing else.
 - Model, sample count, parallelism, per-run budget, per-run timeout and the
   whole call's worst-case wall time are bounded by config.json.
 - At most maxCampaigns campaigns at once, each holding a slot lock until its
-  unit stops; a caller finding every slot busy waits up to maxQueueSec. Git
-  work on the shared mirror is serialised by a separate, short-held lock.
+  unit stops. Git work on the shared mirror is serialised by a separate lock
+  held only during setup. One maxQueueSec deadline bounds both waits.
 - No caller-chosen paths, commands or environment.
 
 Protocol: MCP 2024-11-05 over stdio, JSON-RPC 2.0 line-delimited.
@@ -70,6 +70,12 @@ _POLICY_KEYS = frozenset({
 _POSITIVE_INTS = ("maxSamples", "maxJobs", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
                   "maxCampaigns", "maxQueueSec")
 SLOT_POLL_SEC = 2.0
+# Worst case of the setup steps' own subprocess timeouts, in order: mirror init
+# 60, fetch 300, three refs resolved at up to 3 x 60 each, three scenario
+# cat-files at 60, harness cat-file 60 + clone 120 + checkout 120, scenario
+# archive: tar 120 then archive wait 120. The client timeout in
+# mcp-servers.json must cover maxQueueSec + this + the longest run.
+SETUP_BOUND_SEC = 60 + 300 + 3 * 3 * 60 + 3 * 60 + 60 + 120 + 120 + 120 + 120
 _ARGS = frozenset({"scenario", "old_ref", "new_ref", "model", "n", "jobs",
                    "budget_usd", "timeout_sec"})
 _SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -519,12 +525,12 @@ def _open_lock(path: Path) -> int:
     return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
 
 
-def _acquire_slot(policy: dict, rec: Optional[_InFlight]) -> int:
-    """Wait (up to maxQueueSec) for a free campaign slot; return its locked fd.
-    The fd goes to the supervisor, so the slot frees only once the unit stops."""
-    deadline = time.monotonic() + policy["maxQueueSec"]
+def _acquire(paths: list, deadline: float, rec: Optional[_InFlight], what: str,
+             busy: str) -> int:
+    """Poll PATHS until one locks, the request is cancelled, or DEADLINE passes.
+    Polling is not first-come-first-served: a later caller may win a freed lock."""
     while True:
-        for path in policy["slots"]:
+        for path in paths:
             fd = _open_lock(path)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -532,11 +538,18 @@ def _acquire_slot(policy: dict, rec: Optional[_InFlight]) -> int:
             except BlockingIOError:
                 os.close(fd)
         if rec is not None and rec.cancelled:
-            raise RuntimeError("cancelled while queued for a campaign slot")
+            raise RuntimeError(f"cancelled while waiting for {what}")
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"all {len(policy['slots'])} agent-e2e campaign slots stayed busy "
-                               f"for {policy['maxQueueSec']}s; try again later")
+            raise RuntimeError(busy)
         time.sleep(SLOT_POLL_SEC)
+
+
+def _acquire_slot(policy: dict, rec: Optional[_InFlight], deadline: float) -> int:
+    """A free campaign slot's locked fd. The fd goes to the supervisor, so the
+    slot frees only once the unit stops."""
+    return _acquire(policy["slots"], deadline, rec, "a campaign slot",
+                    f"all {len(policy['slots'])} agent-e2e campaign slots stayed busy "
+                    f"for {policy['maxQueueSec']}s; try again later")
 
 
 def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
@@ -546,12 +559,15 @@ def _tool_run(args: dict, rec: Optional[_InFlight] = None) -> str:
     if not os.access(exe, os.X_OK):
         raise RuntimeError(f"BROKEN safety boundary: claude is not executable: {exe}")
     _private_dir(policy["stateDir"])
-    lock = _acquire_slot(policy, rec)
+    # One deadline bounds every wait before the run: slot, then mirror lock.
+    deadline = time.monotonic() + policy["maxQueueSec"]
+    lock = _acquire_slot(policy, rec, deadline)
     try:
         campaign = None
-        mirror = _open_lock(policy["lock"])
+        mirror = _acquire([policy["lock"]], deadline, rec, "the mirror lock",
+                          f"the agent-e2e mirror lock stayed busy past the "
+                          f"{policy['maxQueueSec']}s queue limit; try again later")
         try:
-            fcntl.flock(mirror, fcntl.LOCK_EX)
             _update_mirror(policy)
             master = _resolve(policy, "origin/master")
             old = _resolve(policy, req["old_ref"])
@@ -614,8 +630,8 @@ TOOLS = [{
         "through scripts/agent-e2e/agent_e2e.py with a real headless Claude agent, arm "
         "old=old_ref vs arm new=new_ref, outside the caller's sandbox. Refs must be on origin "
         "(origin/<branch> or a pushed 40-hex commit). Up to maxCampaigns campaigns run at "
-        "once; when every slot is busy the call waits in line for one (up to maxQueueSec), "
-        "then blocks until done (up to an hour). Returns the harness summary table, every run's "
+        "once; when every slot is busy the call waits for one to free (up to maxQueueSec, "
+        "not strictly first-come-first-served), then blocks until done (up to an hour). Returns the harness summary table, every run's "
         "verdict and final.txt, and the output directory holding transcripts. Every PASS, "
         "FAIL and INCONCLUSIVE is reported; nothing is retried."),
     "inputSchema": {

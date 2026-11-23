@@ -219,8 +219,10 @@ class ValidationTests(Fixture):
         raw = json.loads((HERE / "config.json").read_text())["agentE2eBroker"]
         servers = json.loads((HERE.parents[2] / "runtime/mcp-servers.json").read_text())
         timeout_ms = servers["agent_e2e_broker"]["timeout"]
-        # call_timeout = worst + 120, plus the harness's 60s grace and setup.
-        need = raw["maxQueueSec"] + raw["maxCallSec"] + 120 + 60 + 120
+        # Queue + mirror wait share maxQueueSec; then setup at its worst; then the
+        # run's call_timeout (worst + 120), _run_argv's +60 and its 10s TERM grace.
+        need = (raw["maxQueueSec"] + self.server.SETUP_BOUND_SEC
+                + raw["maxCallSec"] + 120 + 60 + 10)
         self.assertGreaterEqual(timeout_ms, need * 1000)
 
     def test_shipped_config_names_paths_of_this_repo(self) -> None:
@@ -312,14 +314,29 @@ class RunTests(Fixture):
             text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
 
-    def test_waits_for_a_slot_then_runs(self) -> None:
+    def _release_later(self, paths) -> list:
         import threading
-        stack = self._hold(self.policy["slots"])
-        threading.Timer(1.0, stack.close).start()
-        t0 = time.monotonic()
+        stack = self._hold(paths)
+        released: list = []
+        def release() -> None:
+            released.append(time.time())
+            stack.close()
+        threading.Timer(1.0, release).start()
+        return released
+
+    def _assert_campaign_after(self, released: list) -> None:
+        # The campaign dir is made only after both locks are held, so it must
+        # postdate the release.
+        dirs = list(self.out.glob("*"))
+        self.assertEqual(len(dirs), 1, dirs)
+        self.assertTrue(released, "lock never released")
+        self.assertGreaterEqual(dirs[0].stat().st_ctime, released[0] - 0.05)
+
+    def test_waits_for_a_slot_then_runs(self) -> None:
+        released = self._release_later(self.policy["slots"])
         text = self.server._tool_run(self.req())
-        self.assertGreaterEqual(time.monotonic() - t0, 1.0)
         self.assertIn("harness exit 0", text)
+        self._assert_campaign_after(released)
 
     def test_all_slots_busy_past_the_queue_limit_refuses(self) -> None:
         with self._hold(self.policy["slots"]):
@@ -333,15 +350,31 @@ class RunTests(Fixture):
         rec = self.server._InFlight()
         rec.cancelled = True
         with self._hold(self.policy["slots"]):
-            with self.assertRaisesRegex(RuntimeError, "cancelled while queued"):
+            with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for a campaign slot"):
                 self.server._tool_run(self.req(), rec)
 
     def test_mirror_lock_waits_rather_than_refuses(self) -> None:
-        import threading
-        stack = self._hold([self.policy["lock"]])
-        threading.Timer(1.0, stack.close).start()
+        released = self._release_later([self.policy["lock"]])
         text = self.server._tool_run(self.req())
         self.assertIn("harness exit 0", text)
+        self._assert_campaign_after(released)
+
+    def test_mirror_lock_wait_shares_the_queue_deadline(self) -> None:
+        with self._hold([self.policy["lock"]]):
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "mirror lock stayed busy"):
+                self.server._tool_run(self.req())
+            self.assertLess(time.monotonic() - t0, self.raw["maxQueueSec"] + 2.5)
+
+    def test_cancel_while_waiting_for_the_mirror_lock(self) -> None:
+        rec = self.server._InFlight()
+        rec.cancelled = True
+        with self._hold([self.policy["lock"]]):
+            with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for the mirror"):
+                self.server._tool_run(self.req(), rec)
+        # The slot taken before the mirror wait is given back.
+        with self._hold(self.policy["slots"]):
+            pass
 
     def test_slot_is_never_opened_through_a_symlink(self) -> None:
         owner_file = Path(self.tmp.name) / "owner-file"
