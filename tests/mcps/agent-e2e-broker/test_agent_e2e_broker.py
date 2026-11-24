@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -21,6 +23,13 @@ import unittest
 HERE = Path(__file__).resolve().parents[3] / "runtime" / "mcps" / "agent-e2e-broker"
 SERVER = HERE / "server.py"
 HARNESS = HERE.parents[1] / "scripts" / "agent-e2e" / "agent_e2e.py"
+RUNTIME = HERE.parents[1]
+REDACTION = RUNTIME / "hooks" / "secret_redaction.py"
+# A stand-in `secret-redact` (the real one is a nixos-config package no CI
+# runner has): same contract, finds `sk-ant-` tokens, fails on FAIL-THE-SCAN.
+FAKE_REDACT = HERE.parents[2] / "tests" / "stubs" / "secret-redact-fake"
+POLICY = {"path": [str(FAKE_REDACT), *os.environ["PATH"].split(":")]}
+TOKEN = "sk-ant-oat01-" + "Q" * 40
 
 
 def load_server():
@@ -135,6 +144,8 @@ class Fixture(unittest.TestCase):
         harness = self.repo / "runtime/scripts/agent-e2e/agent_e2e.py"
         harness.parent.mkdir(parents=True)
         shutil.copy(HARNESS, harness)
+        (self.repo / "runtime/hooks").mkdir()
+        shutil.copy(REDACTION, self.repo / "runtime/hooks/secret_redaction.py")
         scen = self.repo / "tests/agent-e2e/demo"
         scen.mkdir(parents=True)
         (scen / "prompt.md").write_text("say hi\n")
@@ -167,10 +178,11 @@ class Fixture(unittest.TestCase):
             "stateDir": f"{self.state.name}/broker",
             "harness": "runtime/scripts/agent-e2e/agent_e2e.py",
             "scenarioRoot": "tests/agent-e2e", "claudeExecutable": str(self.claude),
-            "path": os.environ["PATH"].split(":"),
+            "path": [str(FAKE_REDACT), *os.environ["PATH"].split(":")],
             "models": ["haiku", "sonnet"], "maxSamples": 2, "maxJobs": 2,
             "maxBudgetUsd": 3.0, "maxTimeoutSec": 900, "maxCallSec": 3600,
             "outputLimitChars": 20000, "readOnlyPaths": [],
+            "maxCampaigns": 2, "maxQueueSec": 3,
         }
         self.server._load_config = lambda: {"agentE2eBroker": dict(self.raw)}
         self.policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
@@ -183,6 +195,346 @@ class Fixture(unittest.TestCase):
     def req(self, **over) -> dict:
         return {"scenario": "demo", "old_ref": "origin/master", "new_ref": "origin/feat/x",
                 "model": "haiku", **over}
+
+
+class ScrubRunsTests(unittest.TestCase):
+    """The broker scrubs campaign runs itself: a SIGKILLed unit (cancel,
+    RuntimeMaxSec, a broker that exits) never reaches the harness's own scrub."""
+
+    def _run_tree(self, runs: Path) -> Path:
+        home = runs / "sc/new/1/home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude.json").write_text("s\n")
+        (home / ".claude/.credentials.json").symlink_to("/etc/hostname")
+        (home / "notes.md").write_text("keep\n")
+        return home
+
+    def test_scrubber_is_the_deployed_harness(self) -> None:
+        self.assertEqual(load_server().SCRUBBER.resolve(), HARNESS.resolve())
+
+    def test_scrubs_runs_a_killed_unit_left(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "runs")
+            self.assertEqual(load_server()._scrub_runs(POLICY, Path(tmp) / "runs"), "")
+            self.assertEqual(sorted(p.name for p in home.rglob("*")), [".claude", "notes.md"])
+
+    def test_missing_runs_dir_is_not_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(load_server()._scrub_runs(POLICY, Path(tmp) / "runs"), "")
+
+    def test_a_link_at_runs_is_refused_not_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "decoy")
+            (Path(tmp) / "runs").symlink_to(Path(tmp) / "decoy")
+            report = load_server()._scrub_runs(POLICY, Path(tmp) / "runs")
+            # A refusal, not a crash: a scrubber traceback also exits 1.
+            self.assertNotIn("Traceback", report)
+            # O_DIRECTORY|O_NOFOLLOW on a link: ENOTDIR, not ELOOP.
+            self.assertIn(f"{Path(tmp) / 'runs'}: [Errno 20] Not a directory", report)
+            self.assertTrue((home / ".claude.json").is_file())
+
+    def test_the_logs_outside_runs_are_redacted_once_the_unit_stopped(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            campaign = Path(tmp) / "c"
+            (campaign / "out/runs").mkdir(parents=True)
+            (campaign / "harness.out").write_text(f"new#1 PASS saw {TOKEN}\n")
+            (campaign / "harness.err").write_text("FAIL-THE-SCAN\n")
+            report = server._scrub_stopped(POLICY, campaign)
+            self.assertNotIn(TOKEN, (campaign / "harness.out").read_text())
+            self.assertIn("[REDACTED:anthropic-token:", (campaign / "harness.out").read_text())
+            self.assertTrue((campaign / "harness.err").read_text().startswith(
+                "[agent-e2e-broker] withheld: not scanned for secrets"))
+            self.assertIn("harness.err: withheld, not scanned", report)
+            self.assertFalse((campaign / "scrubbed").exists())
+
+    def test_a_scrub_that_dies_locks_runs_until_a_later_one_completes(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "runs")
+            hang = Path(tmp) / "hang.py"
+            hang.write_text("import time\ntime.sleep(30)\n")
+            server.SCRUBBER, server.SCRUB_TIMEOUT = hang, 1
+            report = server._scrub_runs(POLICY, Path(tmp) / "runs")
+            self.assertIn("locked (mode 000) until a later scrub completes", report)
+            self.assertEqual(stat.S_IMODE((Path(tmp) / "runs").stat().st_mode), 0)
+            server.SCRUBBER, server.SCRUB_TIMEOUT = load_server().SCRUBBER, 600
+            self.assertEqual(server._scrub_runs(POLICY, Path(tmp) / "runs"), "")
+            self.assertEqual(stat.S_IMODE((Path(tmp) / "runs").stat().st_mode), 0o700)
+            self.assertFalse((home / ".claude.json").exists())
+
+    def test_prune_removes_an_expired_campaign_the_scrub_could_not_clean(self) -> None:
+        server = load_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-old")
+            locked = self._locked(home, 2)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("keep\n")
+            outside.chmod(0o500)
+            (home / "link").symlink_to(outside)
+            old = time.time() - server.RETAIN_SEC - 60
+            os.utime(Path(tmp) / "c-old", (old, old))
+            try:
+                server._prune(Path(tmp))
+            finally:
+                for d in locked:
+                    if d.exists():
+                        d.chmod(0o700)
+            self.assertFalse((Path(tmp) / "c-old").exists())
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o500, "followed a link")
+            outside.chmod(0o700)
+
+    def test_the_scrub_section_is_capped(self) -> None:
+        server = load_server()
+        section = server._scrub_section("a" * server.SCRUB_REPORT_CHARS, "b" * 100, "")
+        self.assertEqual(len(section), server.SCRUB_REPORT_CHARS + len("\n[agent-e2e-broker] scrub reports cut"))
+        self.assertTrue(section.endswith("scrub reports cut"))
+        self.assertEqual(server._scrub_section("", "x"), "x")
+
+    def _campaign(self, root: Path, name: str, runs: bool = True) -> Path:
+        campaign = root / name
+        (campaign / "out").mkdir(parents=True)
+        return self._run_tree(campaign / "out/runs") if runs else campaign
+
+    def test_sweep_scrubs_settled_campaigns_once_and_leaves_the_rest(self) -> None:
+        server = load_server()
+        asked = []
+
+        def state(policy, unit):
+            asked.append(unit)
+            return "inactive" if unit.endswith("done") else "active"
+        server._unit_state = state
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            done = self._campaign(root, "c-done")
+            live = self._campaign(root, "c-live")
+            setup = self._campaign(root, "c-setup-done", runs=False)
+            mine = self._campaign(root, "c-mine-done")
+            self.assertEqual(server._scrub_settled(POLICY, root, root / "c-mine-done"), "")
+            self.assertFalse((done / ".claude.json").exists())
+            self.assertTrue((root / "c-done/scrubbed").exists())
+            self.assertTrue((live / ".claude.json").is_file())
+            self.assertTrue((mine / ".claude.json").is_file())
+            self.assertFalse((setup / "scrubbed").exists())
+            asked.clear()
+            server._scrub_settled(POLICY, root, root / "c-mine-done")
+            self.assertNotIn(server.UNIT_PREFIX + "c-done", asked)
+
+    def test_sweep_reports_a_failed_probe_instead_of_skipping_silently(self) -> None:
+        server = load_server()
+
+        def broken(policy, unit):
+            raise RuntimeError("no bus")
+        server._unit_state = broken
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-done")
+            self.assertIn("no bus", server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x"))
+            self.assertTrue((home / ".claude.json").is_file())
+
+    def test_probe_asks_the_user_manager_env(self) -> None:
+        server = load_server()
+        seen = {}
+        real = subprocess.run
+
+        def spy(argv, **kw):
+            seen.update(kw.get("env") or {})
+            return real(["true"], capture_output=True, text=True)
+        server.subprocess.run = spy
+        try:
+            self.assertEqual(server._unit_state({"path": os.environ["PATH"].split(":")}, "x"), "")
+        finally:
+            server.subprocess.run = real
+        self.assertEqual(seen.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}")
+
+    def test_probe_raises_when_systemctl_fails(self) -> None:
+        server = load_server()
+        real = subprocess.run
+        server.subprocess.run = lambda argv, **kw: real(["false"], capture_output=True, text=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "systemctl exit 1"):
+                server._unit_state({"path": os.environ["PATH"].split(":")}, "x")
+        finally:
+            server.subprocess.run = real
+
+    def test_a_failed_mark_is_reported_not_raised(self) -> None:
+        server = load_server()
+        server._unit_state = lambda policy, unit: "inactive"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-done")
+            (Path(tmp) / "c-done").chmod(0o500)
+            try:
+                self.assertIn("could not mark c-done",
+                              server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x"))
+                self.assertIn("could not mark c-done",
+                              server._scrub_after_unit(POLICY, Path(tmp) / "c-done"))
+            finally:
+                (Path(tmp) / "c-done").chmod(0o700)
+            self.assertFalse((home / ".claude.json").exists())
+            self.assertFalse((Path(tmp) / "c-done/scrubbed").exists())
+
+    def test_post_unit_scrub_marks_only_a_stopped_unit(self) -> None:
+        server = load_server()
+
+        def broken(policy, unit):
+            raise RuntimeError("no bus")
+        for state, marked, said in (("inactive", True, None), ("failed", True, None),
+                                    ("active", False, "still active"),
+                                    ("deactivating", False, "still deactivating"),
+                                    (broken, False, "no bus")):
+            server._unit_state = state if callable(state) else (lambda p, u, s=state: s)
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                home = self._campaign(Path(tmp), "c")
+                report = server._scrub_after_unit(POLICY, Path(tmp) / "c")
+                self.assertFalse((home / ".claude.json").exists(), "scrub skipped")
+                self.assertEqual((Path(tmp) / "c/scrubbed").exists(), marked)
+                if said:
+                    self.assertIn(said, report)
+                else:
+                    self.assertEqual(report, "")
+
+
+    def test_post_unit_scrub_asks_systemd_before_it_scrubs(self) -> None:
+        # The unit is still running when asked and stops during the scrub,
+        # after writing into a run the scrub already walked: a probe taken
+        # after the scrub would read "inactive" and mark a dirty campaign.
+        server = load_server()
+        states = ["active"]
+        server._unit_state = lambda policy, unit: states[-1]
+        real = server._scrub_runs
+
+        def scrub_then_unit_writes(policy, runs):
+            report = real(policy, runs)
+            (runs / "sc/new/1/home/.claude.json").write_text("s\n")
+            states.append("inactive")
+            return report
+        server._scrub_runs = scrub_then_unit_writes
+        with tempfile.TemporaryDirectory() as tmp:
+            self._campaign(Path(tmp), "c")
+            self.assertIn("still active", server._scrub_after_unit(POLICY, Path(tmp) / "c"))
+            self.assertFalse((Path(tmp) / "c/scrubbed").exists())
+
+    def _locked(self, home: Path, n: int) -> list:
+        locked = []
+        for i in range(n):
+            d = home / f".ssh/k_{i}"
+            d.mkdir(parents=True)
+            (d / "f").write_text("s\n")
+            d.chmod(0o000)
+            locked.append(d)
+        return locked
+
+    def test_a_dirty_campaign_is_reported_in_full_once_then_in_one_line(self) -> None:
+        server = load_server()
+        server._unit_state = lambda policy, unit: "inactive"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._campaign(Path(tmp), "c-done")
+            locked = self._locked(home, 1)
+            try:
+                first = server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x")
+                again = server._scrub_settled(POLICY, Path(tmp), Path(tmp) / "x")
+            finally:
+                for d in locked:
+                    d.chmod(0o700)
+            self.assertIn("k_0", first)
+            self.assertEqual(again.count("\n"), 0, again)
+            self.assertIn("as reported before", again)
+            self.assertFalse((Path(tmp) / "c-done/scrubbed").exists())
+
+    def test_a_scrub_report_names_a_bounded_number_of_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._run_tree(Path(tmp) / "runs")
+            locked = self._locked(home, 30)
+            try:
+                report = load_server()._scrub_runs(POLICY, Path(tmp) / "runs")
+            finally:
+                for d in locked:
+                    d.chmod(0o700)
+        lines = report.splitlines()
+        self.assertEqual(len(lines), 1 + load_server().SCRUB_REPORT_LINES + 1, report)
+        self.assertRegex(lines[-1], r"^\.\.\. \d+ more; `scrub ")
+        self.assertLess(report.count("k_"), 30, report)
+
+
+class KilledCampaignTests(Fixture):
+    def test_a_campaign_killed_mid_run_is_scrubbed_by_the_broker(self) -> None:
+        # The stub plants account material in its staged HOME and hangs; the
+        # campaign is then stopped the way a cancel stops it (SIGTERM to the
+        # supervisor, which stops the unit with SIGKILL), so the harness's own
+        # per-run scrub never runs. Only the broker's scrub can remove it.
+        require_units(self)
+        require_sandbox(self)
+        self.claude.write_text("#!/usr/bin/env bash\necho s > \"$HOME/.claude.json\"\n"
+                               "touch \"$E2E_RUN/planted\"\nsleep 300\n")
+        rec = self.server._InFlight()
+
+        def stop_once_planted() -> None:
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if rec.proc is not None and list(self.out.glob("*/out/runs/*/*/*/planted")):
+                    os.killpg(rec.proc.pid, signal.SIGTERM)
+                    return
+                time.sleep(0.5)
+
+        import signal
+        import threading
+        threading.Thread(target=stop_once_planted, daemon=True).start()
+        self.server._tool_run(self.req(n=1), rec)
+        self.assertTrue(list(self.out.glob("*/out/runs/*/*/*/planted")), "stub never ran")
+        self.assertEqual(list(self.out.glob("*/out/runs/**/.claude.json")), [])
+        self.assertTrue(list(self.out.glob("*/scrubbed")), "clean campaign left unmarked")
+
+    def test_scrub_and_sweep_reports_lead_the_response(self) -> None:
+        # The stub leaves an entry the scrub cannot remove, and an earlier
+        # campaign whose unit has stopped waits for the sweep; both reports must
+        # come before the header lines a truncated response still carries.
+        require_units(self)
+        require_sandbox(self)
+        self.claude.write_text(
+            "#!/usr/bin/env bash\nmkdir -p \"$HOME/.ssh/l\"; touch \"$HOME/.ssh/l/k\"\n"
+            "chmod 000 \"$HOME/.ssh/l\"\n"
+            "echo '{\"type\":\"result\",\"result\":\"hi\",\"is_error\":false,"
+            "\"total_cost_usd\":0.01}'\n")
+        for d in (self.policy["stateDir"], self.out):
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            d.chmod(0o700)
+        settled = self.out / "00-settled"
+        (settled / "out/runs/sc/new/1/home").mkdir(parents=True)
+        (settled / "out/runs/sc/new/1/home/.claude.json").write_text("s\n")
+        (settled / "out/runs/sc/new/1/home/.ssh/l").mkdir(parents=True)
+        (settled / "out/runs/sc/new/1/home/.ssh/l").chmod(0o000)
+        real = self.server._unit_state
+        self.server._unit_state = lambda policy, unit: (
+            "inactive" if unit.endswith("00-settled") else real(policy, unit))
+        try:
+            text = self.server._tool_run(self.req(n=1))
+        finally:
+            for lock in self.out.glob("*/out/runs/**/.ssh/l"):
+                lock.chmod(0o700)
+        head = text.split("harness = origin/master")[0]
+        self.assertIn("00-settled/out/runs incomplete", head)
+        own = [c for c in self.out.iterdir() if c.name != "00-settled"]
+        self.assertEqual(len(own), 1)
+        self.assertIn(f"{own[0]}/out/runs incomplete", head)
+        self.assertFalse((settled / "out/runs/sc/new/1/home/.claude.json").exists())
+
+    def test_many_unremovable_entries_leave_the_verdicts_in_the_response(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        self.claude.write_text(
+            "#!/usr/bin/env bash\nfor i in $(seq 1 150); do d=\"$HOME/.ssh/k_$i\"; "
+            "mkdir -p \"$d\"; touch \"$d/f\"; chmod 000 \"$d\"; done\n"
+            "echo '{\"type\":\"result\",\"result\":\"hi\",\"is_error\":false,"
+            "\"total_cost_usd\":0.01}'\n")
+        try:
+            text = self.server._tool_run(self.req(n=1))
+        finally:
+            for d in self.out.glob("*/out/runs/**/.ssh/k_*"):
+                d.chmod(0o700)
+        self.assertIn("harness = origin/master", text)
+        self.assertIn("--- per run ---", text)
+        self.assertRegex(text, r"\n- new#1 PASS ")
+        self.assertIn("more; `scrub", text)
 
 
 class ValidationTests(Fixture):
@@ -212,6 +564,41 @@ class ValidationTests(Fixture):
         policy = self.server._load_policy({"agentE2eBroker": self.raw})
         with self.assertRaisesRegex(RuntimeError, "worst-case"):
             self.server._validate_request(self.req(n=2, jobs=1, timeout_sec=900), policy)
+
+    def test_client_timeout_covers_queue_wait_plus_longest_call(self) -> None:
+        self.server.PROTOCOL = "https"
+        policy = self.server._load_policy(json.loads((HERE / "config.json").read_text()))
+        servers = json.loads((HERE.parents[2] / "runtime/mcp-servers.json").read_text())
+        timeout_ms = servers["agent_e2e_broker"]["timeout"]
+        # Queue + mirror wait share maxQueueSec; then setup at its worst; then the
+        # run's call_timeout (worst + 120), _run_argv's +60 and its 10s TERM grace.
+        need = (policy["maxQueueSec"] + self.server.SETUP_BOUND_SEC
+                + policy["maxCallSec"] + 120 + 60 + 10)
+        self.assertGreaterEqual(timeout_ms, need * 1000)
+
+    # The keys a broker accepted before campaign slots. A broker already running
+    # in an open session re-reads config.json on every call and refuses unknown
+    # keys, and the deploy rewrites that file in place: a key outside this set
+    # fails every call of every such session until its MCP server restarts.
+    # New policy keys therefore stay optional, with in-code defaults.
+    _PRE_SLOT_POLICY_KEYS = ("version", "remoteUrl", "stateDir", "harness", "scenarioRoot",
+                             "claudeExecutable", "path", "models", "maxSamples", "maxJobs",
+                             "maxBudgetUsd", "maxTimeoutSec", "maxCallSec", "outputLimitChars",
+                             "readOnlyPaths")
+
+    def test_shipped_config_adds_no_key_an_older_broker_rejects(self) -> None:
+        # Checks the key set only; it does not execute an older loader.
+        raw = json.loads((HERE / "config.json").read_text())["agentE2eBroker"]
+        self.assertLessEqual(set(raw), set(self._PRE_SLOT_POLICY_KEYS))
+
+    def test_queue_limits_default_when_absent_and_are_checked_when_present(self) -> None:
+        raw = {k: v for k, v in self.raw.items() if k not in ("maxCampaigns", "maxQueueSec")}
+        policy = self.server._load_policy({"agentE2eBroker": raw})
+        self.assertEqual((len(policy["slots"]), policy["maxQueueSec"]), (3, 1800))
+        for key in ("maxCampaigns", "maxQueueSec"):
+            for bad in (0, -1, True, "3", 1.5):
+                with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
+                    self.server._load_policy({"agentE2eBroker": {**raw, key: bad}})
 
     def test_shipped_config_names_paths_of_this_repo(self) -> None:
         self.server.PROTOCOL = "https"
@@ -288,13 +675,319 @@ class RunTests(Fixture):
         with self.assertRaisesRegex(RuntimeError, "has no"):
             self.server._tool_run(self.req(scenario="absent"))
 
-    def test_one_campaign_at_a_time(self) -> None:
+    def _hold(self, paths):
+        import contextlib, fcntl
+        stack = contextlib.ExitStack()
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        for p in paths:
+            fh = stack.enter_context(open(p, "w"))
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        return stack
+
+    def _assert_slots_free(self) -> None:
+        # Non-blocking: a slot fd left open fails here instead of hanging the suite.
         import fcntl
-        self.policy["lock"].parent.mkdir(mode=0o700)
-        with open(self.policy["lock"], "w") as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
-            with self.assertRaisesRegex(RuntimeError, "one at a time"):
+        for slot in self.policy["slots"]:
+            with open(slot, "w") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.fail(f"{slot.name} was not given back")
+
+    def test_pre_slot_broker_lock_counts_as_a_slot(self) -> None:
+        legacy = self.policy["stateDir"] / "lock"
+        self.assertEqual(self.policy["slots"][0], legacy)
+        self.assertNotEqual(self.policy["lock"], legacy)
+        with self._hold([legacy, *self.policy["slots"][1:]]):
+            with self.assertRaisesRegex(RuntimeError, "slots stayed busy"):
                 self.server._tool_run(self.req())
+        require_units(self)
+        require_sandbox(self)
+        with self._hold([legacy]):   # an old broker mid-campaign
+            self.assertIn("harness exit 0", self.server._tool_run(self.req()))
+
+    # Setup's git children in order, each named by one exact argv element. old_ref
+    # is a SHA so the SHA path of _resolve runs too.
+    _SETUP_STEPS = ("init", "fetch", "refs/remotes/origin/master^{commit}", "OLD^{commit}",
+                    "--contains", "NEW:tests/agent-e2e/demo/prompt.md",
+                    "NEW:tests/agent-e2e/demo/check.sh", "prune", "archive", "clone",
+                    "checkout")
+
+    def test_cancel_at_any_setup_step_spawns_no_more_git_and_leaves_no_campaign(self) -> None:
+        from unittest import mock
+        old = git(self.repo, "rev-parse", "origin/master")
+        new = git(self.repo, "rev-parse", "origin/feat/x")
+        real_popen = subprocess.Popen
+        for i, step in enumerate(self._SETUP_STEPS):
+            step = step.replace("OLD", old).replace("NEW", new)
+            with self.subTest(step=step):
+                self.raw["stateDir"] = f"{self.state.name}/broker-{i}"
+                policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
+                rec, late, hit = self.server._InFlight(), [], []
+
+                def popen(argv, *a, **k):
+                    is_git = "git" in argv[:7]   # bare, or under the group watchdog
+                    if rec.cancelled and is_git:
+                        late.append(argv)
+                    proc = real_popen(argv, *a, **k)
+                    if is_git and not hit and step in argv:
+                        hit.append(argv)
+                        rec.cancelled = True   # lands while this child runs
+                    return proc
+
+                real_prune = self.server._prune
+
+                def prune(campaigns):
+                    if rec.cancelled:
+                        late.append("prune")
+                    real_prune(campaigns)
+                    if step == "prune":   # the local step between the last check and archive
+                        hit.append("prune")
+                        rec.cancelled = True
+
+                self.server._prune = prune
+                try:
+                    with mock.patch.object(subprocess, "Popen", popen), \
+                            self.assertRaisesRegex(RuntimeError, "cancelled during campaign setup"):
+                        self.server._tool_run(self.req(old_ref=old), rec)
+                finally:
+                    self.server._prune = real_prune
+                self.assertTrue(hit, f"setup never reached {step}")
+                self.assertEqual(late, [])
+                campaigns = policy["campaigns"]
+                self.assertEqual(list(campaigns.glob("*")) if campaigns.exists() else [], [])
+                self.policy = policy
+                self._assert_slots_free()
+
+    def test_setup_failure_up_to_the_launch_leaves_no_campaign(self) -> None:
+        from unittest import mock
+        real_popen = subprocess.Popen
+
+        def no_supervisor(*a):
+            raise RuntimeError("BROKEN safety boundary: not on policy path: setpriv")
+
+        def launch_fails(argv, *a, **k):
+            if str(argv[0]).endswith("setpriv"):
+                raise PermissionError(13, "Permission denied", argv[0])
+            return real_popen(argv, *a, **k)
+
+        for i, (name, patch, error) in enumerate((
+                ("_supervised", mock.patch.object(self.server, "_supervised", no_supervisor),
+                 RuntimeError),
+                ("launch", mock.patch.object(subprocess, "Popen", launch_fails), OSError))):
+            with self.subTest(fails=name):
+                self.raw["stateDir"] = f"{self.state.name}/broker-{i}"
+                self.policy = self.server._load_policy({"agentE2eBroker": dict(self.raw)})
+                with patch, self.assertRaises(error):
+                    self.server._tool_run(self.req())
+                self.assertEqual(list(self.policy["campaigns"].glob("*")), [])
+                self._assert_slots_free()
+
+    def test_failed_scenario_extraction_frees_the_mirror_lock(self) -> None:
+        # An archive larger than a pipe blocks writing once tar stops reading; it
+        # inherits the mirror lock fd, so it must be reaped before setup fails.
+        import fcntl
+        from unittest import mock
+        git(self.repo, "switch", "-qc", "feat/big")
+        (self.repo / "tests/agent-e2e/demo/blob").write_bytes(os.urandom(1 << 20))
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "big")
+        git(self.repo, "push", "-q", "origin", "feat/big")
+        git(self.repo, "switch", "-q", "master")
+        real_run = subprocess.run
+
+        def tar_times_out(argv, *a, **k):
+            if argv[0] == "tar":
+                raise subprocess.TimeoutExpired(argv, k.get("timeout"))
+            return real_run(argv, *a, **k)
+
+        with mock.patch.object(subprocess, "run", tar_times_out), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            self.server._tool_run(self.req(new_ref="origin/feat/big"))
+        with open(self.policy["lock"], "w") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.fail("a git archive outlived setup and kept the mirror lock")
+
+    def test_lock_fd_is_closed_when_flock_fails_otherwise(self) -> None:
+        import errno, fcntl, types
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        def no_locks(fd, op):
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        self.server.fcntl = types.SimpleNamespace(flock=no_locks, LOCK_EX=fcntl.LOCK_EX,
+                                                  LOCK_NB=fcntl.LOCK_NB)
+        real_open, opened = self.server._open_lock, []
+        self.server._open_lock = lambda p: opened.append(real_open(p)) or opened[-1]
+        with self.assertRaises(OSError):
+            self.server._acquire([self.policy["lock"]], time.monotonic() + 1, None, "x", "busy")
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError, msg="the lock fd was left open"):
+            os.fstat(opened[0])
+
+    def test_mirror_lock_frees_soon_after_the_git_timeout_when_the_broker_dies(self) -> None:
+        import fcntl, multiprocessing, signal
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        started = Path(self.tmp.name) / "git-started"
+
+        def broker() -> None:
+            fd = self.server._open_lock(self.policy["lock"])
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.policy["mirror_fd"] = fd
+            self.server._git_run(self.policy, ["-c", f"alias.stall=!touch {started}; sleep 60",
+                                               "stall"], timeout=2)
+
+        proc = multiprocessing.get_context("fork").Process(target=broker)
+        proc.start()
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(started.exists(), "the stalled git never started")
+        os.kill(proc.pid, signal.SIGKILL)   # nothing in the broker enforces the timeout now
+        proc.join()
+        # The 2s timeout plus the kill grace, with slack; a stalled git otherwise
+        # keeps the mirror locked for its whole 60s.
+        deadline, freed = time.monotonic() + 10, False
+        while not freed and time.monotonic() < deadline:
+            with open(self.policy["lock"], "w") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    freed = True
+                except BlockingIOError:
+                    time.sleep(0.2)
+        self.assertTrue(freed, "a stalled git kept the mirror lock long past its timeout")
+
+    def test_timed_out_git_takes_its_children_with_it(self) -> None:
+        import subprocess as sp
+        marker = Path(self.tmp.name) / "child-alive"
+        self.policy["mirror"].parent.mkdir(mode=0o700, exist_ok=True)
+        alias = f"!sh -c 'sleep 3; touch {marker}' & sleep 30"
+        with self.assertRaises(sp.TimeoutExpired):
+            self.server._git_run(self.policy, ["-c", f"alias.stall={alias}", "stall"], timeout=1)
+        time.sleep(3.5)
+        self.assertFalse(marker.exists(), "git's child outlived the timeout")
+
+    def test_runs_while_another_campaign_holds_a_slot(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        with self._hold(self.policy["slots"][:1]):
+            text = self.server._tool_run(self.req())
+        self.assertIn("harness exit 0", text)
+
+    def _release_later(self, paths) -> list:
+        import threading
+        stack = self._hold(paths)
+        released: list = []
+        def release() -> None:
+            released.append(time.time())
+            stack.close()
+        threading.Timer(1.0, release).start()
+        return released
+
+    def _record_setup_start(self) -> list:
+        real, started = self.server._update_mirror, []
+        def update(policy):
+            started.append(time.time())
+            return real(policy)
+        self.server._update_mirror = update
+        return started
+
+    def _assert_setup_after(self, started: list, released: list) -> None:
+        # Setup's first step runs only once both locks are held, so it must
+        # postdate the release (stamped just before the lock is let go).
+        self.assertTrue(released, "lock never released")
+        self.assertEqual(len(started), 1, started)
+        self.assertGreaterEqual(started[0], released[0])
+
+    def test_waits_for_a_slot_then_runs(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        started = self._record_setup_start()
+        released = self._release_later(self.policy["slots"])
+        text = self.server._tool_run(self.req())
+        self.assertIn("harness exit 0", text)
+        self._assert_setup_after(started, released)
+
+    def test_all_slots_busy_past_the_queue_limit_refuses(self) -> None:
+        with self._hold(self.policy["slots"]):
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, r"all 2 .* slots stayed busy for 3s"):
+                self.server._tool_run(self.req())
+            self.assertGreaterEqual(time.monotonic() - t0, 3)
+        self.assertEqual(list(self.out.glob("*")) if self.out.exists() else [], [])
+
+    def _cancel_after_a_poll(self, rec) -> None:
+        # Flip the flag only after the wait loop has polled at least once, so a
+        # check that runs on the first pass alone cannot satisfy the test.
+        import threading
+        threading.Timer(self.server.SLOT_POLL_SEC + 0.5,
+                        lambda: setattr(rec, "cancelled", True)).start()
+
+    def test_cancel_while_queued_stops_waiting(self) -> None:
+        self.raw["maxQueueSec"] = 120
+        rec = self.server._InFlight()
+        self._cancel_after_a_poll(rec)
+        t0 = time.monotonic()
+        with self._hold(self.policy["slots"]):
+            with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for a campaign slot"):
+                self.server._tool_run(self.req(), rec)
+            self.assertLess(time.monotonic() - t0, 30)
+        self._assert_slots_free()
+
+    def test_mirror_lock_waits_rather_than_refuses(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+        started = self._record_setup_start()
+        released = self._release_later([self.policy["lock"]])
+        text = self.server._tool_run(self.req())
+        self.assertIn("harness exit 0", text)
+        self._assert_setup_after(started, released)
+
+    def test_mirror_lock_wait_shares_the_queue_deadline(self) -> None:
+        # Slots free at 1s (taken at the 2s poll), mirror busy throughout, 3s
+        # budget, 2s polls: a shared deadline gives up at the 4s poll; a fresh
+        # mirror deadline (2s + 3s) would give up at 6s.
+        self._release_later(self.policy["slots"])
+        with self._hold([self.policy["lock"]]):
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "mirror lock stayed busy"):
+                self.server._tool_run(self.req())
+            self.assertLess(time.monotonic() - t0, self.raw["maxQueueSec"] + 2.0)
+
+    def test_descendants_of_git_inherit_and_keep_the_mirror_lock_fd(self) -> None:
+        import fcntl
+        self.policy["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+        fd = self.server._open_lock(self.policy["lock"])
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.policy["mirror_fd"] = fd
+        # A helper git leaves behind, detached from git's output pipes.
+        alias = "!sleep 5 </dev/null >/dev/null 2>&1 &"
+        self.server._git_run(self.policy, ["-c", f"alias.bg={alias}", "bg"], timeout=10)
+        os.close(fd)   # the broker's own copy is gone, as if it died
+        with open(self.policy["lock"], "w") as fh:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_cancel_while_waiting_for_the_mirror_lock(self) -> None:
+        self.raw["maxQueueSec"] = 120
+        rec = self.server._InFlight()
+        t0 = time.monotonic()
+        with self._hold([self.policy["lock"]]):
+            self._cancel_after_a_poll(rec)
+            with self.assertRaisesRegex(RuntimeError, "cancelled while waiting for the mirror"):
+                self.server._tool_run(self.req(), rec)
+            self.assertLess(time.monotonic() - t0, 30)
+        # The slot taken before the mirror wait is given back.
+        self._assert_slots_free()
+
+    def test_slot_is_never_opened_through_a_symlink(self) -> None:
+        owner_file = Path(self.tmp.name) / "owner-file"
+        owner_file.write_text("OWNER-DATA\n")
+        self.policy["lock"].parent.mkdir(mode=0o700)
+        self.policy["slots"][0].symlink_to(owner_file)
+        with self.assertRaises(OSError):
+            self.server._tool_run(self.req())
+        self.assertEqual(owner_file.read_text(), "OWNER-DATA\n")
 
     def test_lock_is_never_opened_through_a_symlink(self) -> None:
         owner_file = Path(self.tmp.name) / "owner-file"
@@ -360,9 +1053,11 @@ class RunDirReadTests(Fixture):
         self.assertNotIn("CANARY-OUTSIDE-RUN-DIR", text)
 
     def test_endless_and_huge_run_files_are_read_bounded(self) -> None:
+        require_units(self)   # without the unit, check.sh never writes the huge file
         require_sandbox(self)
         ref = self.push_script("check.sh", 'truncate -s 3G "$1/final.txt"\n')
         text = self.isolated_run(self.req(new_ref=ref))
+        self.assertIn("harness exit 0", text)
         self.assertLess(len(text), self.raw["outputLimitChars"] + 1000)
         self.assertIn("agent-e2e campaign `demo`", text)
 
@@ -431,14 +1126,14 @@ class UnitBindTests(Fixture):
             git(self.repo, "commit", "-qam", "reads swapped")
             git(self.repo, "push", "-q", "origin", "feat/reads-swapped")
             git(self.repo, "switch", "-q", "master")
-            launch = self.server._run_argv
+            launch = self.server._launch
 
             def swap_then_launch(*a, **kw):
                 needed.rename(needed.with_name(needed.name + "-moved"))
                 needed.symlink_to(secret)
                 return launch(*a, **kw)
 
-            self.server._run_argv = swap_then_launch
+            self.server._launch = swap_then_launch
             text = self.server._tool_run(self.req(new_ref="origin/feat/reads-swapped"))
             logs = [p.read_text() for p in self.out.glob("*/out/runs/demo/new/1/setup.log")]
             self.assertNotIn("SECRET-CANARY", text + "".join(logs))
@@ -453,6 +1148,7 @@ class UnitBindTests(Fixture):
             shutil.rmtree(secret, ignore_errors=True)
 
     def test_scenario_code_reads_the_bash_guard_config_the_harness_copies(self) -> None:
+        require_units(self)
         require_sandbox(self)
         config = self.home / ".config/dcg/config.toml"
         if not config.is_file():
@@ -544,13 +1240,64 @@ class ReviewFindingTests(Fixture):
         self.assertEqual(list(self.out.glob("*/harness")), [])
         self.assertTrue(list(self.out.glob("*/out/runs/demo/new/1/verdict.json")))
 
-    def test_redacts_private_and_age_keys(self) -> None:
-        key = "AGE-SECRET-KEY-1" + "Q" * 58
-        pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
-        out = self.server._redact(f"{key}\n{pem}\nAKIA" + "A" * 16)
-        self.assertNotIn(key, out)
-        self.assertNotIn("abc", out)
-        self.assertNotIn("AKIA" + "A" * 16, out)
+    def test_redacts_through_the_shared_scanner(self) -> None:
+        cli = self.server._secret_redact(self.policy)
+        self.assertEqual(Path(cli).parent, FAKE_REDACT)
+        out = self.server._redact(f"a {TOKEN} b", cli)
+        self.assertNotIn(TOKEN, out)
+        self.assertIn("[REDACTED:anthropic-token:", out)
+
+    @unittest.skipIf(shutil.which("secret-redact") is None,
+                     "the real secret-redact (nixos-config) is not on PATH")
+    def test_the_real_scanner_covers_what_the_old_patterns_did(self) -> None:
+        # The broker's own regex list went when it moved to the shared scanner.
+        cli = shutil.which("secret-redact")
+        armor = "-" * 5 + "BEGIN OPENSSH PRIVATE KEY" + "-" * 5
+        for secret in ("AGE-SECRET-KEY-1" + "Q" * 58, "AKIA" + "IOSFODNN7EXAMPLQ",
+                       "sk-ant-api03-" + "x" * 40, "ghp_" + "a" * 36, "tvly-" + "b" * 24,
+                       f"{armor}\nabc\n{armor.replace('BEGIN', 'END')}",
+                       "xoxb-" + "1" * 12, "sk-proj-" + "z" * 30):
+            with self.subTest(secret=secret[:12]):
+                self.assertNotIn(secret, self.server._redact(f"x {secret} y", cli))
+
+    def test_no_scanner_on_the_policy_path_refuses_the_run(self) -> None:
+        empty = Path(self.tmp.name) / "empty-bin"
+        empty.mkdir()
+        self.raw["path"] = [str(empty)]
+        with self.assertRaisesRegex(RuntimeError, "BROKEN safety boundary: secret-redact"):
+            self.server._tool_run(self.req())
+
+    def test_a_failed_response_scan_withholds_the_body(self) -> None:
+        require_units(self)
+        require_sandbox(self)
+
+        def broken(body, cli):
+            raise self.server.secret_redaction.ScanError("scanner down")
+        self.server._redact = broken
+        text = self.server._tool_run(self.req(n=1))
+        self.assertTrue(text.startswith("[agent-e2e-broker] response withheld: "
+                                        "the secret scan failed (scanner down); runs: "), text)
+        self.assertNotIn("--- per run ---", text)
+
+    def test_a_token_a_run_printed_is_redacted_on_disk(self) -> None:
+        # The campaign's own harness is origin/master's and may predate
+        # redaction: here it has no client to redact with, so only the broker's
+        # required scrub after the unit can make the Read-allowed tree clean.
+        require_units(self)
+        require_sandbox(self)
+        git(self.repo, "rm", "-q", "runtime/hooks/secret_redaction.py")
+        git(self.repo, "commit", "-qm", "master harness without redaction")
+        git(self.repo, "push", "-q", "origin", "master")
+        self.claude.write_text(
+            f"#!/usr/bin/env bash\necho {TOKEN} > \"$E2E_WORK/notes.txt\"\n"
+            "echo '{\"type\":\"result\",\"result\":\"the token is " + TOKEN
+            + "\",\"is_error\":false,\"total_cost_usd\":0.01}'\n")
+        text = self.server._tool_run(self.req(n=1))
+        self.assertNotIn(TOKEN, text)
+        kept = [p for p in self.out.rglob("*") if p.is_file() and not p.is_symlink()
+                and TOKEN.encode() in p.read_bytes()]
+        self.assertEqual(kept, [])
+        self.assertTrue(list(self.out.glob("*/scrubbed")), "clean campaign left unmarked")
 
     def test_pushed_scenario_code_reaches_no_token_and_writes_only_its_run(self) -> None:
         require_units(self)
@@ -636,11 +1383,15 @@ class ReviewFindingTests(Fixture):
         root = Path(self.tmp.name)
         # The run dir is the one path bwrap binds back into its private /tmp.
         self.claude.write_text("#!/usr/bin/env bash\ntouch \"$E2E_RUN/started\"\nsleep 30\n")
-        broker = root / "broker"
-        broker.mkdir()
+        # The runtime layout the server finds its siblings by: mcps/<it>,
+        # mcps/broker_paths.py, hooks/secret_redaction.py.
+        broker = root / "rt/mcps/broker"
+        broker.mkdir(parents=True)
         source = SERVER.read_text()
         (broker / "server.py").write_text(source.replace('PROTOCOL = "https"', 'PROTOCOL = "file"'))
-        shutil.copy(HERE.parent / "broker_paths.py", root / "broker_paths.py")
+        shutil.copy(HERE.parent / "broker_paths.py", broker.parent / "broker_paths.py")
+        (root / "rt/hooks").mkdir()
+        shutil.copy(REDACTION, root / "rt/hooks/secret_redaction.py")
         (broker / "config.json").write_text(json.dumps({"agentE2eBroker": self.raw}))
         proc = subprocess.Popen([sys.executable, str(broker / "server.py")],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -662,14 +1413,15 @@ class ReviewFindingTests(Fixture):
         while time.monotonic() < deadline:
             harness = subprocess.run(["pgrep", "-f", f"{self.out}/.*runs"],
                                      capture_output=True, text=True).stdout.split()
-            with open(self.policy["lock"], "w") as fh:
-                try:
-                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    locked = False
-                except BlockingIOError:
-                    locked = True
-            # The lock may be free only once no harness is left running.
-            self.assertFalse(harness and not locked, "harness runs without the lock")
+            locked = False
+            for slot in self.policy["slots"]:
+                with open(slot, "w") as fh:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        locked = True
+            # A slot may be free only once no harness is left running.
+            self.assertFalse(harness and not locked, "harness runs without its slot")
             if not harness and not locked:
                 freed = True
                 break

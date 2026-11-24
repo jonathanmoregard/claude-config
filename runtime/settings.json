@@ -91,6 +91,7 @@
       "Read(//home/jonathan/.claude/scripts/**)",
       "Read(//home/jonathan/.claude/runtime/**)",
       "Read(//home/jonathan/.claude/proposals/**)",
+      "Read(//home/jonathan/.local/state/agent-e2e-broker/**)",
       "Read(//home/jonathan/.local/state/claude-proposals/**)",
       "Read(//home/jonathan/.local/state/claude-tasks/**)",
       "Read(//home/jonathan/.local/state/klaffat/e2e-artifacts/**)",
@@ -318,6 +319,7 @@
       "Read(~/.claude/.credentials.json)",
       "Read(//home/jonathan/.claude/.credentials.json)",
       "Read(//home/jonathan/.claude/.claude.json)",
+      "Read(//home/jonathan/.local/state/agent-e2e-broker/**/home/**)",
       "Read(//home/jonathan/.claude/session-env/**)",
       "Read(//home/jonathan/.claude/automation-review/**)",
       "Read(//home/jonathan/.codex/auth.json)",
@@ -428,6 +430,11 @@
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/native-agent-route-observer.py",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/agent-idle-alarm.py",
+            "timeout": 5
           }
         ]
       },
@@ -447,6 +454,16 @@
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/bash-output-guard.py",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "timeout": 5
           }
         ]
       },
@@ -479,6 +496,18 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
@@ -490,6 +519,16 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "^AskUserQuestion$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -516,6 +555,16 @@
           {
             "type": "command",
             "command": "python3 -S -E $HOME/.claude/hooks/deny-hints.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f $HOME/.claude/hooks/sandbox-aid.py ] || exit 0; python3 -S -E $HOME/.claude/hooks/sandbox-aid.py",
             "timeout": 5
           }
         ]
@@ -727,6 +776,15 @@
       }
     ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -S -E $HOME/.claude/hooks/night-proceed.py",
+            "timeout": 45
+          }
+        ]
+      },
       {
         "hooks": [
           {
@@ -996,8 +1054,14 @@
   "sandbox": {
     "enabled": false,
     "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false,
+    "allowUnsandboxedCommands": true,
     "failIfUnavailable": true,
+    "excludedCommands": [
+      "~/.claude/scripts/unit-read *",
+      "/home/jonathan/.claude/scripts/unit-read *",
+      "~/.claude/scripts/wait-for unit *",
+      "/home/jonathan/.claude/scripts/wait-for unit *"
+    ],
     "network": {
       "allowAllUnixSockets": true,
       "tlsTerminate": {},
@@ -1026,6 +1090,10 @@
         "~/.cache/nix",
         "~/.cache/uv",
         "~/.cargo"
+      ],
+      "denyWrite": [
+        "/home/jonathan/.local/state/ai-router/jobs",
+        "/home/jonathan/.local/state/ai-router/quota"
       ],
       "denyRead": [
         "/run/user/1003",

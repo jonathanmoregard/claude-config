@@ -17,8 +17,10 @@ hook, work = sys.argv[1:3]
 numstat = subprocess.run(["git", "-C", work, "diff", "--numstat", "-z", "--no-renames",
                           "origin/main...HEAD"],
                          capture_output=True, text=True, check=True).stdout.split("\0")
+# And present ones only: a live advisor's Read of a deleted file fails.
 files = [row.split("\t", 2)[2] for row in numstat
          if row.count("\t") >= 2 and not row.startswith("-\t")]
+files = [f for f in files if os.path.exists(os.path.join(work, f))]
 prompt = ("Assume this finished change can ship broken. Try to falsify its acceptance "
           "claims.\nRe-read fresh:\n" + "\n".join(os.path.join(work, f) for f in files))
 verdict = json.dumps({"verdict": "PASS", "verdict_reason": "", "findings": []})

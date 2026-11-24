@@ -123,8 +123,9 @@ research before the user sees it.
 3. End with the line from
    `~/.claude/skills/advice-refine-test-loop/scripts/ledger-tally.sh` for
    each lens that ran. If a line says `drop` or `reword`, or an `exclude?`
-   line appears, put it to the user as one closed question. Change nothing
-   yourself. Stop there.
+   line appears that `references/exclusion-decisions.tsv` there does not
+   already decide (by meaning, not wording), put it to the user as one
+   closed question. Change nothing yourself. Stop there.
 
 ## When To Run
 

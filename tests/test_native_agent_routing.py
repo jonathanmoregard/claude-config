@@ -109,9 +109,11 @@ def test_settings_observes_resolved_agent_models_without_a_model_hook():
         if entry.get("matcher") == "Agent"
         for hook in entry.get("hooks", [])
     ]
-    assert post_commands == [
-        "python3 -S -E $HOME/.claude/hooks/native-agent-route-observer.py"
-    ]
+    # The observer records resolved models; other Agent hooks (the idle alarm)
+    # may sit beside it, but none of them is a model-routing hook.
+    assert "python3 -S -E $HOME/.claude/hooks/native-agent-route-observer.py" in post_commands
+    assert not any("ai-router" in command or "model" in command.rsplit("/", 1)[-1]
+                   for command in post_commands)
     pre_commands = [
         hook.get("command", "")
         for entry in configured["PreToolUse"]
