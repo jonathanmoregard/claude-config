@@ -198,6 +198,19 @@ def on_read(payload: dict, session: str) -> None:
         g.write_json(half(base, "reads"), {"ts": time.time(), "paths": paths})
 
 
+def on_handback(payload: dict, session: str) -> None:
+    """The advisor's own SubagentHandback call: its verdict, as sent.
+
+    Measured 2026-11-24: a background advisor can end its run with this tool
+    call instead of a closing text turn, so SubagentStop's
+    last_assistant_message carries no verdict. The handback's `message` is
+    the same reply, so it takes the SubagentStop path.
+    """
+    tool_input = payload.get("tool_input")
+    message = tool_input.get("message") if isinstance(tool_input, dict) else None
+    on_stop({**payload, "last_assistant_message": message}, session)
+
+
 def on_stop(payload: dict, session: str) -> None:
     if payload.get("agent_type") != "advisor":
         return
@@ -248,6 +261,8 @@ def main() -> int:
         on_send(payload, session)
     elif event == "PostToolUse" and tool == "Read":
         on_read(payload, session)
+    elif event == "PostToolUse" and tool == "SubagentHandback":
+        on_handback(payload, session)
     elif event == "SubagentStop":
         on_stop(payload, session)
     return 0

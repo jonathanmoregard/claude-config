@@ -159,7 +159,20 @@ class Sandbox:
                   "tool_use_id": "tu-" + agent}
         stop = self.stop_event(verdict, agent, session)
         read_steps = [self.read_event(r, agent, session) for r in reads]
-        if order == "async":
+        if order == "handback":
+            # Measured 2026-11-24 (Claude Code, background advisor): the
+            # advisor's last turn is a SubagentHandback tool call carrying the
+            # verdict, so SubagentStop has no verdict text of its own.
+            launch["tool_response"] = {"isAsync": True, "status": "async_launched",
+                                       "agentId": agent, "prompt": prompt}
+            handback = {"session_id": session, "hook_event_name": "PostToolUse",
+                        "cwd": str(self.work), "tool_name": "SubagentHandback",
+                        "tool_input": {"message": result},
+                        "tool_response": {"success": True},
+                        "agent_id": agent, "agent_type": "advisor"}
+            stop["last_assistant_message"] = ""
+            steps = [launch, *read_steps, handback, stop]
+        elif order == "async":
             launch["tool_response"] = {"isAsync": True, "status": "async_launched",
                                        "agentId": agent, "prompt": prompt}
             steps = [launch, *read_steps, stop]
@@ -743,7 +756,16 @@ def test_one_verdict_is_recorded_once_in_either_order(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.review("PASS", agent="a1", order="async")
     sb.review("PASS", agent="a2", order="sync")
-    assert [r["agent_id"] for r in sb.records()] == ["a1", "a2"]
+    sb.review("PASS", agent="a3", order="handback")
+    assert [r["agent_id"] for r in sb.records()] == ["a1", "a2", "a3"]
+
+
+def test_a_verdict_handed_back_through_subagenthandback_opens_the_gate(sb):
+    # Measured on PR #118: a background advisor returned its verdict only via
+    # SubagentHandback; nothing was recorded and the gate refused the PR.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.review("PASS", order="handback")
+    assert sb.gate("gh pr create --fill") is None
 
 
 # --- the ask backstop and its grant ------------------------------------------
@@ -969,7 +991,7 @@ def test_every_gate_event_is_wired_to_an_existing_script():
     assert _registered("PreToolUse", "pr-open-gate.py") == ["^(Bash|mcp__github__create_pull_request)$"]
     assert _registered("PermissionRequest", "pr-open-gate.py")
     assert _registered("UserPromptSubmit", "pr-open-gate.py")
-    assert _registered("PostToolUse", "artl-evidence.py") == ["^(Agent|Read|SendMessage)$"]
+    assert _registered("PostToolUse", "artl-evidence.py") == ["^(Agent|Read|SendMessage|SubagentHandback)$"]
     assert _registered("SubagentStop", "artl-evidence.py")
 
 
