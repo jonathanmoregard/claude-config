@@ -392,6 +392,38 @@ def test_the_agent_home_is_the_staged_home_at_the_real_home_path(tmp_path):
         assert report["repos"] != "0", report
 
 
+def test_a_vendored_skill_resolves_where_the_projection_puts_it(tmp_path):
+    """runtime/skills/X -> ../../vendor/<sub>/skills/X resolves, in the
+    deployed projection, to ~/.claude/vendor/<sub>/skills/X: the checkout's
+    runtime/ is at ~/.claude/runtime and its submodules at ~/.claude/vendor.
+    The staged HOME flattens runtime/ into ~/.claude, so the arm's own pinned
+    submodules must be staged at ~/.claude/vendor and the link must land there
+    too -- the path the policy's vendor rule names. Dangling, a Read of the
+    skill was refused and perm-read-vendor-skill FAILed."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    link = next((p for p in sorted((RUNTIME / "skills").iterdir())
+                 if p.is_symlink() and "/vendor/" in os.readlink(p)), None)
+    if link is None:
+        pytest.skip("no vendored skill link in this checkout")
+    sub = os.path.normpath(os.path.join("runtime/skills", os.readlink(link))).split("/")[1]
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "resolved=$(realpath {real}/.claude/skills/{link.name}/SKILL.md 2>&1)"
+   echo "readable=$(test -r {real}/.claude/skills/{link.name}/SKILL.md && echo yes || echo no)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    _, out, verdicts = _run(tmp_path, sc, claude)
+    if "not fetched locally" in verdicts[0].get("config", "") \
+            or "not initialised" in verdicts[0].get("config", ""):
+        pytest.skip(f"vendor submodules unavailable here: {verdicts[0]['config']}")
+    report = dict(line.split("=", 1)
+                  for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+    assert report == {
+        "resolved": f"{real}/.claude/vendor/{sub}/skills/{link.name}/SKILL.md",
+        "readable": "yes"}, (report, verdicts[0].get("config"))
+
+
 SANDBOX_PATHS = SCENARIOS / "_lib/sandbox_paths.py"
 
 

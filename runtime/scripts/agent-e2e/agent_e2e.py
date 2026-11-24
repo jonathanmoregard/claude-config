@@ -137,10 +137,14 @@ def sh(argv, **kw):
     return subprocess.run(argv, check=True, capture_output=True, text=True, **kw)
 
 
-def extract(repo: pathlib.Path, rev: str, dest: pathlib.Path) -> None:
-    """Write the tree of REV in REPO under DEST (submodules come empty)."""
+def extract(repo: pathlib.Path | None, rev: str, dest: pathlib.Path, *,
+            git: list[str] | None = None, paths: list[str] | None = None) -> None:
+    """Write the tree of REV in REPO (or the repository GIT names, as git's
+    own leading options), or only PATHS of it, under DEST (submodules come
+    empty)."""
     dest.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.run(["git", "-C", str(repo), "archive", rev],
+    archive = subprocess.run(["git", *(git or ["-C", str(repo)]), "archive", rev,
+                              *(["--", *paths] if paths else [])],
                              check=True, capture_output=True)
     subprocess.run(["tar", "-xf", "-", "-C", str(dest)], input=archive.stdout,
                    check=True)
@@ -179,6 +183,75 @@ def stage_submodules(repo: pathlib.Path, rev: str | None, dest: pathlib.Path) ->
     return notes
 
 
+# What the deployed projection carries of each submodule under
+# ~/.claude/vendor/<sub>: skills (the skill links' targets), hooks (settings
+# runs vendor/superpowers/hooks/session-start) and package.json. Not the rest:
+# everything-claude-code's assets/ alone is 36 MB, with images past the size
+# the run-dir redaction scan accepts.
+PROJECTED_SUBMODULE_PARTS = ("skills", "hooks", "package.json")
+
+
+def stage_projected_submodules(rev: str, dest: pathlib.Path) -> list[str]:
+    """Stage REV's submodules where the deployed projection puts them, for a
+    ~/.claude (DEST) staged from this repository's runtime/ at REV.
+
+    The projection is the checkout's runtime/ at ~/.claude/runtime, its
+    entries linked at the top, and its submodules (vendor/<sub>) at
+    ~/.claude/vendor/<sub>, so `runtime/skills/X -> ../../vendor/<sub>/...`
+    resolves to ~/.claude/vendor/<sub>/..., the path the vendor permission
+    rules name. Staging flattens runtime/ into ~/.claude, so a submodule
+    outside runtime/ goes to its repository path under DEST, and
+    rehome_links() re-points the links that reached it. The arm's own pins,
+    never the deployed copy. A worktree rarely has its submodules checked
+    out; their objects are then read from the superproject's modules/.
+    Returns a note per submodule that could not be staged."""
+    top = pathlib.Path(sh(["git", "-C", str(REPO), "rev-parse", "--show-toplevel"]).stdout.strip())
+    prefix = sh(["git", "-C", str(REPO), "rev-parse", "--show-prefix"]).stdout.strip()
+    common = pathlib.Path(sh(["git", "-C", str(top), "rev-parse", "--path-format=absolute",
+                              "--git-common-dir"]).stdout.strip())
+    notes = []
+    for path, pin in gitlinks(top, rev):
+        rel = path[len(prefix):] if prefix and path.startswith(prefix) else path
+        if (top / path / ".git").exists():
+            git = ["-C", str(top / path)]
+        elif (common / "modules" / path).is_dir():
+            git = ["--git-dir", str(common / "modules" / path)]
+        else:
+            notes.append(f"submodule {path} not initialised")
+            continue
+        try:
+            top_level = set(sh(["git", *git, "ls-tree", "--name-only", pin]).stdout.split("\n"))
+            parts = [p for p in PROJECTED_SUBMODULE_PARTS if p in top_level]
+            if parts:
+                extract(None, pin, dest / rel, git=git, paths=parts)
+        except subprocess.CalledProcessError:
+            notes.append(f"submodule {path} @ {pin[:7]} not fetched locally")
+    rehome_links(dest, prefix)
+    return notes
+
+
+def rehome_links(dest: pathlib.Path, prefix: str) -> None:
+    """Re-point each relative link staged from PREFIX (runtime/) that reaches
+    out of it at what the staging put at that repository path under DEST --
+    where the projection has it. A link whose target was not staged keeps its
+    target and dangles, as it would deployed."""
+    if not prefix:
+        return
+    for root, dirs, files in os.walk(dest):
+        for name in dirs + files:
+            link = pathlib.Path(root, name)
+            if not link.is_symlink() or os.path.isabs(target := os.readlink(link)):
+                continue
+            rel = link.relative_to(dest)
+            in_repo = os.path.normpath(os.path.join(prefix, os.path.dirname(rel), target))
+            if in_repo.startswith((prefix, "../")) or in_repo == "..":
+                continue
+            staged = dest / in_repo
+            if staged.exists():
+                link.unlink()
+                link.symlink_to(os.path.relpath(staged, link.parent))
+
+
 def copy_config(src: str, dest: pathlib.Path) -> str:
     """Materialise config SRC at DEST. Returns a short provenance string."""
     dest.mkdir(parents=True, exist_ok=True)
@@ -204,7 +277,7 @@ def copy_config(src: str, dest: pathlib.Path) -> str:
         return f"{path} (plain directory)"
     sha = sh(["git", "-C", str(REPO), "rev-parse", "--short", src]).stdout.strip()
     extract(REPO, src, dest)
-    notes = stage_submodules(REPO, src, dest)
+    notes = stage_projected_submodules(src, dest)
     return "; ".join([f"{src} @ {sha}", *notes])
 
 
