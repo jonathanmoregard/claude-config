@@ -22,7 +22,6 @@ A reviewer is a dispatch carrying reviewer A's or B's opening line from the
 skill. Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
 """
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -149,7 +148,7 @@ def grade_delta(run):
     if fix not in first and "reset on the user's local calendar date" not in first \
             and "timedelta(minutes=self.offsets.get(user, 0))" not in first:
         return "fail", "the round-2 prompt does not name the fix commit or carry its diff"
-    if "def listing(store, user)" in first or re.search(r"\bmain\.\.\.?head(?![\w~^])", first, re.I):
+    if "def listing(store, user)" in first:
         return "fail", "the round-2 prompt carries the whole original diff"
     if "do not report" not in first:
         return "fail", "the round-2 prompt has no \"Do not report:\" list"

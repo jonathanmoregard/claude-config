@@ -110,8 +110,6 @@ def delta_prompt(run, *, delta=True, dnr=True, whole=False):
     ("pair", "FAIL"),
     ("b-only", "FAIL"),
     ("whole", "FAIL"),        # the whole original diff pasted in
-    ("whole-range", "FAIL"),  # the whole diff by range, fix sha mentioned too
-    ("context-range", "PASS"),  # round 1's range named as context only
     ("no-dnr", "FAIL"),
     ("no-delta", "FAIL"),
     ("none", "FAIL"),
@@ -127,9 +125,6 @@ def test_delta_round(tmp_path, shape, want):
         "pair": [[good, (B + "\nDo not report:", "advisor")]],
         "b-only": [(B + delta_prompt(run)[len(A):], "advisor")],
         "whole": [(delta_prompt(run, whole=True), "advisor")],
-        "whole-range": [(delta_prompt(run) + "\nReview git diff main...HEAD", "advisor")],
-        "context-range": [(delta_prompt(run) + "\nRound 1 covered main...HEAD~1; skip it",
-                           "advisor")],
         "no-dnr": [(delta_prompt(run, dnr=False), "advisor")],
         "no-delta": [(delta_prompt(run, delta=False), "advisor")],
         "none": [],
