@@ -100,6 +100,8 @@ concurrent reproducers would mutate shared state.
 
 Then:
 
+- First: multiple fixes haphazardly patching one unaddressed root cause?
+  `references/one-root-cause.md`.
 - Reproduced, and caused by the diff or violating its acceptance contract:
   fix it now. The reproducer stays as a regression test.
 - Reproduced but pre-existing and unrelated: record it separately; do not
