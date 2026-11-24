@@ -27,7 +27,9 @@ Rules:
 3. For a sweep item, `reproduced` means the cited lines show what the item
    claims.
 4. `fixed` is the only column edited after the row is written (`open` →
-   `yes`, `no` or `deferred`).
+   `yes`, `no` or `deferred`). One exception: a row that
+   `convergence-check.mts` names on exit 11 or 12 is corrected in place, in
+   whichever column it names, before the rerun (`rabbit-hole.md` 1.3).
 5. Write `fp_reason` in a few plain words, and reuse an earlier reason's
    exact wording when it fits, so reasons can be counted.
 6. A review finding's `where` is the `file:line` its reviewer reported, never
