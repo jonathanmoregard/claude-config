@@ -630,13 +630,21 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # Hidden by the private /tmp or by the HOME mount otherwise: the binary's
     # real directory, and the path bwrap execs, usually a link to it
     # (~/.local/bin/claude). Straight in either, the binary alone comes back:
-    # its directory would be all of it.
+    # its directory would be all of it. A link is recreated as the same link,
+    # not bound: its directory is usually on PATH as well, so path_guard() has
+    # already put the link back, and bwrap refuses to mount a file onto one
+    # ("Can't mount on symlink destination"); --symlink accepts an identical
+    # link already there. Its target is the real binary bound just before it.
     exe_bind = []
     hidden = (pathlib.Path("/tmp"), home)
     real = pathlib.Path(claude).resolve()
     run_by = [pathlib.Path(claude)] if os.path.isabs(claude) else []
     for path in dict.fromkeys([real if real.parent in hidden else real.parent, *run_by]):
-        if any(path.is_relative_to(h) for h in hidden):
+        if not any(path.is_relative_to(h) for h in hidden):
+            continue
+        if path.is_symlink():
+            exe_bind += ["--symlink", os.readlink(path), str(path)]
+        else:
             exe_bind += ["--ro-bind", str(path), str(path)]
     # Last, so neither mount above nor a read-only ancestor bind shadows them.
     binds = ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]

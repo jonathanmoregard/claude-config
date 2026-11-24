@@ -277,22 +277,74 @@ def test_the_sandbox_mounts_the_staged_home_at_the_real_home_path(tmp_path):
     assert later and min(later) > home[0], argv
 
 
-def test_the_claude_binary_is_bound_at_the_path_it_is_run_by(tmp_path):
+@pytest.fixture
+def in_real_home():
+    """A fresh directory inside the account's real HOME, removed afterwards.
+
+    What the HOME mount hides, and what is bound back over it, only shows for
+    paths really under the real HOME; a tmp_path under /tmp is hidden by the
+    private /tmp instead and cannot tell the two apart."""
+    import pwd as _pwd
+    import uuid
+    parent = pathlib.Path(_pwd.getpwuid(os.getuid()).pw_dir, ".local/state")
+    parent.mkdir(parents=True, exist_ok=True)
+    path = parent / f"agent-e2e-test-{uuid.uuid4().hex[:12]}"
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.mark.parametrize("on_path", [True, False], ids=["link-dir-on-PATH", "link-dir-off-PATH"])
+def test_a_symlinked_claude_in_the_real_home_runs(tmp_path, in_real_home, on_path):
     """`claude` is usually a link (~/.local/bin/claude -> a versioned binary)
-    in a directory the sandbox hides. bwrap execs the path it was given, so
-    that path comes back as well as the binary's real directory -- whether or
-    not the link's directory happens to be on the harness's PATH."""
-    mod = _harness_module()
-    (tmp_path / "versions").mkdir()
-    (tmp_path / "versions/1.0").write_text("#!/bin/sh\n")
-    (tmp_path / "bin").mkdir()
-    (tmp_path / "bin/claude").symlink_to(tmp_path / "versions/1.0")
-    run = tmp_path / "run"
-    argv = mod.sandboxed(["true"], claude=str(tmp_path / "bin/claude"), run=run,
-                         shared=run / "shared", work=run / "work")
-    bound = [(src, dst) for _, src, dst in _ops(argv, "--ro-bind")]
-    assert (str(tmp_path / "bin/claude"),) * 2 in bound, argv
-    assert (str(tmp_path / "versions"),) * 2 in bound, argv
+    in a directory the HOME mount hides, and that directory is usually on PATH
+    too, so path_guard() binds it back with the link in it. bwrap execs the
+    path it was given: it has to resolve inside either way, and bwrap refuses
+    to mount a file onto a link ("Can't mount on symlink destination")."""
+    _require_sandbox()
+    (in_real_home / "versions").mkdir()
+    real = fake_claude(in_real_home / "versions", _ok(), name="1.0")
+    (in_real_home / "bin").mkdir()
+    (in_real_home / "bin/claude").symlink_to(real)
+    path = os.environ.get("PATH", "")
+    env = {**os.environ, "PATH": f"{in_real_home / 'bin'}:{path}" if on_path else path}
+    sc = _scenario(tmp_path, "exit 0")
+    r, out, verdicts = _run(tmp_path, sc, in_real_home / "bin/claude", env=env)
+    stderr = [p.read_text() for p in out.glob("*/*/*/stderr.txt")]
+    assert [v["verdict"] for v in verdicts] == ["PASS"], (r.stdout, stderr)
+
+
+def test_a_run_under_the_real_home_sees_no_sibling_and_no_account_state(tmp_path, in_real_home):
+    """--out inside the real HOME is the broker's layout (~/.local/state/
+    agent-e2e-broker/...). The run's own directory is bound back over the HOME
+    mount, and nothing beside it: another arm's or sample's staged home, with
+    its account material, stays out of reach, and so does the real
+    ~/.claude.json."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    out = in_real_home / "out"
+    sibling = out / "sc/old/1/home/.claude.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("{}\n")
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "sibling=$(test -e {sibling} && echo seen || echo hidden)"
+   echo "parent=$(ls -A {out} 2>/dev/null | tr '\\n' ' ')"
+   echo "claude_json=$(test -e {real}/.claude.json && echo seen || echo hidden)"
+   echo "own=$(test -d "$E2E_RUN/home/.claude" && echo seen || echo hidden)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    report = dict(line.split("=", 1)
+                  for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+    assert report["own"] == "seen", report
+    assert report["sibling"] == "hidden", report
+    assert report["parent"].strip() in ("", "sc"), report
+    assert report["claude_json"] == "hidden", report
 
 
 def test_the_agent_home_is_the_staged_home_at_the_real_home_path(tmp_path):
