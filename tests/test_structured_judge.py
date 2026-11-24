@@ -175,10 +175,11 @@ def test_failure_message_quotes_the_output_with_the_token_redacted(env, monkeypa
 def test_nothing_is_left_behind(env, monkeypatch, code) -> None:
     monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(env, code=code))
     before = set(os.listdir(env))
-    try:
-        judge("p", SCHEMA)
-    except Inconclusive:
-        pass
+    if code == 0:
+        assert judge("p", SCHEMA) == {"ok": True}
+    else:
+        with pytest.raises(Inconclusive):
+            judge("p", SCHEMA)
     assert set(os.listdir(env)) - {"claude"} == before - {"claude"}
 
 
