@@ -57,7 +57,9 @@ python3 runtime/scripts/agent-e2e/agent_e2e.py run tests/agent-e2e/<scenario> \
 Run it with `run_in_background: true`, since a batch takes minutes. Finished
 runs are skipped on re-run, so a killed batch never re-spends.
 `agent_e2e.py --help` has the full contract. `stage --config SRC --home DIR`
-builds one sandbox HOME so you can poke it by hand.
+builds that HOME and nothing else, to inspect what a run would stage: the
+credentials and other lent paths (`LINKS`) are bound in by the sandbox, so a
+staged HOME on its own has no login and is no place to run an agent.
 
 ## Writing a scenario
 
