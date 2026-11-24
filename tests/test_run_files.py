@@ -68,6 +68,17 @@ def test_socket_is_refused(run: Path) -> None:
         sock.close()
 
 
+def test_missing_run_dir_is_the_hosts_fault(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        read_run(tmp_path / "no-such-run", "work/f.txt")
+
+
+@pytest.mark.parametrize("rel", ["../secret", "work/../../secret", "/etc/passwd", "", "."])
+def test_rel_must_stay_below_the_run_dir(run: Path, rel: str) -> None:
+    with pytest.raises(ValueError):
+        read_run(run, rel)
+
+
 def test_host_io_fault_propagates_unchanged(run: Path, monkeypatch) -> None:
     def eio(fd):
         raise OSError(errno.EIO, os.strerror(errno.EIO))

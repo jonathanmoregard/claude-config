@@ -2,11 +2,12 @@
 
 check.sh runs outside the agent sandbox and the run dir is the agent's to
 write, so a grader reads run content only as a regular file reached without a
-symlink at any step: a planted link (to ~/.ssh, say) or FIFO is refused, never
-followed or blocked on. A host I/O fault raises OSError, so it is never graded
-as the agent's FAIL. Standard library only, so it works from the
-tests/agent-e2e tree the e2e broker extracts. helper_lang.read_run is the same
-walk inside a grader that also needs the runtime layout.
+symlink at any step below the run dir: a planted link (to ~/.ssh, say) or
+FIFO is refused, never followed or blocked on. What the agent cannot cause is
+not graded as its FAIL: a missing or unreadable run dir and a host I/O fault
+raise OSError, a REL that leaves the run dir raises ValueError. Standard
+library only, so it works from the tests/agent-e2e tree the e2e broker
+extracts.
 """
 import errno
 import os
@@ -23,17 +24,19 @@ class Refused(Exception):
 # OSError is the host's fault (EIO, EMFILE, ENOMEM) and propagates unchanged.
 _AGENT_CAUSED = {errno.ELOOP: 'a symlink', errno.ENOTDIR: 'not a directory',
                  errno.ENXIO: 'not a regular file', errno.EACCES: 'unreadable'}
+_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
 def read_run(top: Path, rel: str, limit: int = -1) -> bytes | None:
-    """REL under TOP, at most LIMIT bytes, or None when it is absent."""
-    fd = None
+    """REL under TOP, at most LIMIT bytes, or None when the agent left it absent."""
+    parts = PurePosixPath(rel).parts
+    if not parts or PurePosixPath(rel).is_absolute() or {'..', '.'} & set(parts):
+        raise ValueError(f'{rel!r} is not a path below the run dir')
+    fd = os.open(top, _FLAGS | os.O_DIRECTORY)  # the harness made it: any error is the host's
     try:
-        for part in (top, *PurePosixPath(rel).parts):
-            fd, parent = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                 dir_fd=fd), fd
-            if parent is not None:
-                os.close(parent)
+        for part in parts:
+            fd, parent = os.open(part, _FLAGS, dir_fd=fd), fd
+            os.close(parent)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise Refused(f"{top.name}/{rel}: not a regular file")
         with open(fd, "rb", closefd=False) as f:
@@ -45,5 +48,4 @@ def read_run(top: Path, rel: str, limit: int = -1) -> bytes | None:
             raise
         raise Refused(f"{top.name}/{rel}: {_AGENT_CAUSED[e.errno]}") from None
     finally:
-        if fd is not None:
-            os.close(fd)
+        os.close(fd)
