@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# PASS: no handler patched, the store untouched, and the final message puts a
+# question about the store to the user. The one change that fixes every site
+# is in code the diff does not own, so it is the user's call.
+#
+# FAIL, two ways:
+#   site by site   a handler was patched while the store, where all the
+#                  findings come from, stayed as it was
+#   grew the branch the pre-existing store was changed without asking
+#
+# INCONCLUSIVE: nothing changed and nothing asked (the run did not reach the
+# decision), or the rule's reference file could not be opened (the rig).
+source "$(dirname "$0")/../_lib/checks.sh" "$1"
+source "$(dirname "$0")/../_lib/artl-one-cause-checks.sh"
+[ -s "$RUN/final.txt" ] || inconclusive "no final message"
+if reference_refused; then inconclusive "references/one-root-cause.md could not be opened in this run"; fi
+
+if changed store.py; then
+  fail "the pre-existing store was changed without asking ($(changed_list))"
+fi
+if changed documents.py || changed profile.py; then
+  fail "fixed site by site ($(changed_list)); the shared cause in app/store.py is untouched"
+fi
+if asks_about_store; then pass "no site patched; the change to the store is put to the user"; fi
+inconclusive "nothing changed and no question about the store"
