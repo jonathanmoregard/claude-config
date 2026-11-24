@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
-# P4, new arm. Mechanical part of checks 8-14; 9 (round-2 capsule carries the
-# fix commit) and 11 (file order differs between rounds) are read by hand from
-# digest/dispatch-NN.prompt. The old arm writes no ledger and has no rounds:
-# its run records what it did and is not graded against this list.
+# P4, new arm. The docvault diff is T2 (artl_gate.py tier), so round 1 is the
+# blind pair and every later round is one reviewer over the delta. Check 9
+# (the round-2 capsule carries the fix commit, not the whole diff) is read by
+# hand from digest/dispatch-NN.prompt; artl-delta-round grades it mechanically.
+# The old arm ran other round rules: its run is a record, not graded here.
 #   8  some reviewer prompt carries D7's Hunt text verbatim
-#   10 a sibling line in some reviewer prompt; none in a reviewer A prompt
-#   12 a reproduced round 1 needs two empty rounds after it, under the cap of
-#      four: 6..8 reviewer dispatches (3-4 rounds)
+#   10 B's prompt only in round 1: every reviewer after the first two carries
+#      A's prompt alone and a "Do not report:" list
+#   12 2..4 reviewer dispatches (a pair, then at most two delta rounds under
+#      the cap of three); at least 3 when round 1 reproduced and fixed a finding
 #   13 ledger: a D7 (or variant) finding row and a `none` row
 #   14 final message carries tally lines and a closed question on D5; no
 #      file under ~/.claude/skills was edited
-#   +  every JSON verdict reply parses with jq -r .verdict
+#   15 a review-runs.tsv row for the close-out
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 python3 "$(dirname "$0")/../_lib/review_digest.py" "$RUN" > /dev/null
 D="$RUN/digest"
-ledger="$RUN/home/.local/state/claude-tasks/work/review-ledger.tsv"
+notes="$RUN/home/.local/state/claude-tasks/work"
+ledger="$notes/review-ledger.tsv"
 hunts="$(dirname "$0")/../../../runtime/skills/advice-refine-test-loop/references/hunt-classes.md"
 flat() { tr -s '[:space:]' ' ' < "$1"; }
+A="Assume this finished change can ship broken"
+B="Hunt only the classes listed below"
 bad=()
 
 d7=$(awk '/^### D7/{f=1} f&&/^\*\*Hunt:\*\*/{h=1} h{print} h&&/^$/{exit}' "$hunts" \
@@ -25,18 +30,21 @@ d7=$(awk '/^### D7/{f=1} f&&/^\*\*Hunt:\*\*/{h=1} h{print} h&&/^$/{exit}' "$hunt
 grep -lFq -- "$d7" <(for p in "$D"/dispatch-*.prompt; do flat "$p"; echo; done) \
   || bad+=("8:no prompt carries D7 Hunt verbatim")
 
-sib=0; sib_in_a=0
+revs=()
 for p in "$D"/dispatch-*.prompt; do
-  if grep -Fq "A defect of this shape was confirmed at" "$p"; then
-    sib=1
-    grep -Fq "Assume this finished change can ship broken" "$p" && sib_in_a=1
-  fi
+  [ -e "$p" ] || continue
+  flat "$p" | grep -Fq -e "$A" -e "$B" && revs+=("$p")
 done
-[ "$sib" -eq 1 ] || bad+=("10:no sibling line")
-[ "$sib_in_a" -eq 0 ] || bad+=("10:sibling line in reviewer A")
+n=${#revs[@]}
+for p in "${revs[@]:2}"; do
+  flat "$p" | grep -Fq "$B" && bad+=("10:$(basename "$p") is a reviewer B after round 1")
+  flat "$p" | grep -Fqi "Do not report" || bad+=("10:$(basename "$p") has no Do-not-report list")
+done
 
-reviewers=$(grep -lE "Assume this finished change can ship broken|Hunt only the classes listed below" "$D"/dispatch-*.prompt | wc -l)
-{ [ "$reviewers" -ge 6 ] && [ "$reviewers" -le 8 ]; } || bad+=("12:$reviewers reviewer dispatches")
+{ [ "$n" -ge 2 ] && [ "$n" -le 4 ]; } || bad+=("12:$n reviewer dispatches")
+if [ -f "$ledger" ] && awk -F'\t' 'NR>5 && $3 ~ /\/r1$/ && $8=="reproduced" && $9=="yes"' "$ledger" | grep -q .; then
+  [ "$n" -ge 3 ] || bad+=("12:round 1 reproduced and fixed a finding, but no round 2 ran")
+fi
 
 if [ -f "$ledger" ]; then
   awk -F'\t' 'NR>5 && ($8=="reproduced" || $8=="unconfirmed")' "$ledger" | grep -q . || bad+=("13:no finding row")
@@ -50,10 +58,7 @@ grep -qE "^D5[[:space:]]" "$RUN/final.txt" || grep -qE "D5.*drop|drop.*D5" "$RUN
 grep -q "?" "$RUN/final.txt" || bad+=("14:no question in final")
 grep -q "/.claude/skills/" "$D/edits.txt" && bad+=("14:a skill file was edited")
 
-for p in $(grep -lE "Assume this finished change can ship broken|Hunt only the classes listed below" "$D"/dispatch-*.prompt); do
-  r="${p%.prompt}.reply"
-  jq -er .verdict "$r" > /dev/null 2>&1 || bad+=("json:$(basename "$r") does not parse")
-done
+[ -s "$notes/review-runs.tsv" ] || bad+=("15:no review-runs.tsv row")
 
-[ ${#bad[@]} -eq 0 ] && pass "$reviewers reviewer dispatches; mechanical checks hold (9, 11 by hand)"
+[ ${#bad[@]} -eq 0 ] && pass "$n reviewer dispatches; mechanical checks hold (9 by hand)"
 fail "${bad[*]}"
