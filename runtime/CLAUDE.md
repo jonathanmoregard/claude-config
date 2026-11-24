@@ -50,7 +50,7 @@ User instructions override everything below.
 
 ## Build + review
 - Substantial multi-part or unattended work → invoke `orchestrate` and follow it. Use judgment for ordinary branch-sized changes; subagents are a context tool, not a ritual.
-- Fixes creating new defects, or a fix that turns out inert → stop the loop. Research the standard design for the problem, then replace accidental deviations instead of stacking patches.
+- Fixes creating new defects, a fix that turns out inert, or multiple fixes haphazardly patching one unaddressed root cause → stop the loop. Research the standard design for the problem, then replace accidental deviations instead of stacking patches.
 
 ## Model
 - NixOS/VM setup, complex multi-step debugging, branch surgery, harness architecture → Opus. On Sonnet with a task that fits → say so upfront.
