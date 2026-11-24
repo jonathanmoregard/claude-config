@@ -32,9 +32,10 @@ SCENARIO is a directory holding:
                 real-HOME state an MCP server in the sandbox needs, bound
                 read-only at their own path under bwrap (e.g. a broker's
                 GitHub token). The agent can read them too: lend no more.
-                Under bwrap an entry the host lacks makes the run
-                INCONCLUSIVE; without it the real HOME is all there and
-                `lend` is not consulted.
+                Each entry must be a path inside HOME. Under bwrap an entry
+                the host lacks, or one the staged HOME already holds, makes
+                the run INCONCLUSIVE; without bwrap the real HOME is all
+                there and nothing is mounted.
     check.sh    `check.sh RUN` grades one run: exit 0 PASS, 1 FAIL, anything
                 else INCONCLUSIVE. RUN holds final.txt (the agent's last message),
                 commands.txt (every Bash command the agent issued, one per
@@ -67,8 +68,9 @@ FIDELITY
     is staged); the claude binary and every link to it; and the run and
     shared dirs, with the rest of the scenario's out dir hidden. Only the
     credentials, the run and the shared dir are writable, and nothing else of
-    the real HOME is visible. A lent path the staged HOME already holds, or
-    one the scenario lends that the host lacks, makes the run INCONCLUSIVE.
+    the real HOME is visible. A path the scenario lends that the host lacks,
+    or that the staged HOME already holds, makes the run INCONCLUSIVE; any
+    other row the host lacks or the staged HOME holds is skipped.
     Without bwrap HOME is the staged dir itself and LINKS are links. MCP
     servers are not loaded (--strict-mcp-config): the agent cannot reach real
     external systems through them. A scenario that needs an MCP tool has
@@ -854,6 +856,24 @@ def _path_in_home() -> list[pathlib.Path]:
     return out
 
 
+def _link_dirs_in_home(d: pathlib.Path) -> list[pathlib.Path]:
+    """The dirs that entries of PATH dir D link into, where those lie in the
+    real HOME (not ~/.claude, not HOME itself) and outside D."""
+    config, out = REAL_HOME / ".claude", []
+    try:
+        entries = list(os.scandir(d))
+    except OSError:
+        return out
+    for e in entries:
+        if not e.is_symlink():
+            continue
+        parent = pathlib.Path(os.path.realpath(e.path)).parent
+        if (parent != REAL_HOME and _within(parent, REAL_HOME)
+                and not _within(parent, config) and not _within(parent, d.resolve())):
+            out.append(parent)
+    return list(dict.fromkeys(out))
+
+
 def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
                  lend: list[str] | tuple[str, ...] = ()
                  ) -> list[tuple[pathlib.Path, str, bool]]:
@@ -892,7 +912,12 @@ def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
     rows = [(home / rel, mode, False) for rel, mode in LINKS.items()]
     rows += [(home / rel, "ro", False) for rel in CHECKOUT_ROOTS]
     rows += [(home / rel, "ro", True) for rel in lend]
-    rows += [(p, "ro", False) for p in _path_in_home()]
+    for p in _path_in_home():
+        rows.append((p, "ro", False))
+        # A tool there that links elsewhere in HOME (pipx, uv tool, npm -g:
+        # bin/t -> ../lib/t) needs its target's dir lent too, or it dangles.
+        for target in _link_dirs_in_home(p):
+            rows.append((target, "ro", False))
     rows.append((run.parents[1], "tmpfs", True))
     exe = pathlib.Path(claude if os.path.isabs(claude) else shutil.which(claude) or claude)
     real = exe.resolve()
