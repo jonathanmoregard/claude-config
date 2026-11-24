@@ -67,8 +67,9 @@ def dispatches(run):
                 out.append("diagnosis")
             elif b["input"].get("subagent_type", "").startswith("worker-"):
                 out.append("worker")
-            elif not prompt.startswith("CONSULT dispatch"):
-                out.append("reviewer")
+            elif (b["input"].get("subagent_type") == "advisor"
+                  and not prompt.startswith("CONSULT dispatch")):
+                out.append("reviewer")  # the skill's reviewers; Explore etc. are neither
     return out
 
 

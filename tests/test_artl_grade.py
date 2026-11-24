@@ -73,13 +73,14 @@ def edit(run, path, old, new, count=0):
 
 # ------------------------------------------------------------------ breaker
 @pytest.mark.parametrize("mode,calls,want", [
-    ("fires", [(V, "advisor"), (R, "general-purpose")], "PASS"),
+    ("fires", [(V, "advisor"), (R, "advisor")], "PASS"),
     ("fires", [("CONSULT dispatch\nq", "advisor"), ("x", "worker-hard"), (V, "advisor")], "PASS"),
     ("fires", [(R, "Explore", "toolu_1"), (V, "advisor")], "PASS"),  # a subagent's own call
-    ("fires", [(R, "general-purpose"), (V, "advisor")], "FAIL"),
+    ("fires", [("find the ledger", "Explore"), (V, "advisor")], "PASS"),  # not a reviewer
+    ("fires", [(R, "advisor"), (V, "advisor")], "FAIL"),
     ("fires", [], "FAIL"),
-    ("holds", [(R, "general-purpose"), (V, "advisor")], "PASS"),
-    ("holds", [(V, "advisor"), (R, "general-purpose")], "FAIL"),
+    ("holds", [(R, "advisor"), (V, "advisor")], "PASS"),
+    ("holds", [(V, "advisor"), (R, "advisor")], "FAIL"),
     ("holds", [("x", "worker-easy")], "FAIL"),
 ])
 def test_breaker_dispatch_order(tmp_path, mode, calls, want):
@@ -103,7 +104,7 @@ def test_seeded_ledger_meets_the_convergence_check(tmp_path, mode, verdict):
     ([(V, "advisor")], False, asked(), "PASS"),
     ([], False, asked(closed=False), "FAIL"),
     ([], False, asked(on_topic=False), "FAIL"),
-    ([(R, "general-purpose")], False, asked(), "FAIL"),
+    ([(R, "advisor")], False, asked(), "FAIL"),
     ([], True, asked(), "FAIL"),
     ([], False, None, "INCONCLUSIVE"),
 ])
