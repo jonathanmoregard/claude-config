@@ -9,7 +9,7 @@ inside a field, `-` for an empty field.
 | 1 | date | `YYYY-MM-DD` |
 | 2 | source | `artl` or `sweep` |
 | 3 | run | `artl`: `<token>/r<N>`, always. The token is picked once, at the Entry Gate: the start commit and the time, `<short commit>-<HHMM>`, as in `a1b2c3d-1432/r2`. N counts this close-out's rounds from 1. A re-invoked close-out picks a new token. `sweep`: short commit, then lens, as in `a1b2c3d/races` |
-| 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a site the fixer's class search found, or a lens name |
+| 4 | check | `A`, a class id (`D3`, `G11`), `variant` for a site the fixer's class search found, or a lens name |
 | 5 | trigger | what made the check run: the part of the diff that met its `When`; `always` for A; for a sweep, why it was run |
 | 6 | where | `file:line` exactly as the reviewer reported it; `-` on a `none` row |
 | 7 | claim | one sentence |
