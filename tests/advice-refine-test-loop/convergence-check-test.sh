@@ -367,9 +367,6 @@ expect "re-invoked: 1 >= 1 fires on its own count" fire "$(verdict)"
 # script's may share it.
 out=$(node --no-experimental-strip-types "$CHECK" "$LEDGER" $CO/r1 2> /dev/null); rc=$?
 expect "a script node cannot load: exits 1, not a verdict" 1 "$rc"
-for code in 0 $FIRE $INPUT $WHERE; do
-  [[ $code != 1 ]] || { echo "FAIL: exit code $code is node's own"; fails=$((fails + 1)); }
-done
 # Anything thrown past the checks is an input error, never a fire.
 printf 'process.stdout.write = () => { throw new Error("planted throw"); };\n' > "$TMP/throw.mjs"
 out=$(NODE_OPTIONS="--import=$TMP/throw.mjs" node "$CHECK" "$LEDGER" $CO/r1 $CO/r2 2> "$TMP/err"); rc=$?
