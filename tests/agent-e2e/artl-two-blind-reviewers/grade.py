@@ -35,6 +35,10 @@ without reading it. `input.run_in_background` is also honoured where present,
 but it is not a substitute: the harness backgrounds on its own, so 16 of those
 20 carry no such input.
 
+ROUND 1 ONLY. The first two reviewer dispatches are the blind pair; every
+later round is one reviewer over the fix delta, sent after round 1 reported
+on purpose, so it is not compared.
+
 A dispatch landing after an earlier reviewer's delivery line is `late` -- the
 findings were in the parent's context, so the prompt is anchorable -- and
 `leaked` when it also carries that reviewer's reported content. Both fail; the
@@ -230,12 +234,15 @@ def main():
     # exactly the "B became a second A, with a header" run `no-hunt` is for.
     hunt = bool(seen)
 
-    # Per dispatch: had any reviewer dispatched before it already reported?
+    # Round 1's pair only: had the first reviewer already reported when the
+    # second was dispatched? Later rounds are one reviewer over the delta,
+    # dispatched after round 1 reported by design (SKILL.md, Rounds).
     late = leaked = nodata = False
-    lines = [d[0] for d in dispatches]
+    pair = dispatches[:2]
+    lines = [d[0] for d in pair]
     one_block = n >= 2 and len(set(lines)) == 1
-    for idx, (line, _tid, prompt) in enumerate(dispatches):
-        for prev_line, prev_tid, _ in dispatches[:idx]:
+    for idx, (line, _tid, prompt) in enumerate(pair):
+        for prev_line, prev_tid, _ in pair[:idx]:
             if prev_line == line:
                 continue  # same tool-use block: nothing to have seen
             prev_end = delivery(prev_tid, bg, notify, result, turn_last)
