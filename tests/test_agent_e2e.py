@@ -484,7 +484,7 @@ PY
 
 
 def test_without_mounts_a_path_maps_to_itself(monkeypatch):
-    """Without bwrap the agent's HOME is RUN/home itself: nothing to map."""
+    """No E2E_MOUNTS (a grader run by hand on a canned run): nothing to map."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("sandbox_paths", SANDBOX_PATHS)
     mod = importlib.util.module_from_spec(spec)
@@ -522,6 +522,7 @@ def test_a_scenario_lends_only_the_paths_it_names(tmp_path, in_real_home):
 @pytest.mark.parametrize("entry", ["../etc", "/etc", ".", "a/.."])
 def test_a_lend_outside_home_or_of_all_of_it_is_refused(tmp_path, entry):
     """`lend` names paths inside HOME, never the whole of it."""
+    _require_sandbox()
     claude = fake_claude(tmp_path, _ok())
     sc = _scenario(tmp_path, "exit 0")
     (sc / "lend").write_text(f"# comment\n\n{entry}\n")
@@ -620,7 +621,7 @@ def test_a_config_bin_on_path_imports_its_own_tools(tmp_path):
 def test_an_absent_lend_is_inconclusive(tmp_path, in_real_home):
     """A scenario that lends a path the host does not have (a typo, `~/x`)
     asked for something the run will not get: no verdict, and the message
-    names the entry. Under bwrap only: without it nothing is lent."""
+    names the entry."""
     _require_sandbox()
     claude = fake_claude(tmp_path, _ok())
     sc = _scenario(tmp_path, "exit 0")
@@ -649,8 +650,8 @@ def test_a_lend_the_staged_home_already_holds_is_inconclusive(tmp_path, in_real_
 @pytest.mark.parametrize("rel", [".claude/plugins", ".claude/.credentials.json"])
 def test_an_optional_row_the_staged_home_provides_is_skipped(tmp_path, rel):
     """An arm SRC copied whole from a ~/.claude carries plugins/ and
-    .credentials.json of its own. The run goes ahead on the staged copy, as
-    it does without bwrap, and the real one is not bound over it (review r2:
+    .credentials.json of its own. The run goes ahead on the staged copy,
+    and the real one is not bound over it (review r2:
     every bwrap run of such an arm was INCONCLUSIVE)."""
     mod = _harness_module()
     mod.REAL_HOME = tmp_path / "realhome"
@@ -786,10 +787,9 @@ def test_a_sibling_run_under_a_lent_root_is_unreachable(tmp_path, in_real_home):
     assert _report(out) == {"sibling": "hidden", "lent": "b", "own": "seen"}
 
 
-def _sandbox_check_env(run: pathlib.Path, bwrap: bool,
-                       real_home: pathlib.Path | None = None) -> dict:
-    """The env check.sh gets from the harness for RUN, with or without bwrap,
-    on a host whose HOME is REAL_HOME (default: this account's)."""
+def _sandbox_check_env(run: pathlib.Path, real_home: pathlib.Path | None = None) -> dict:
+    """The env check.sh gets from the harness for RUN, on a host whose HOME
+    is REAL_HOME (default: this account's)."""
     mod = _harness_module()
     if real_home is not None:
         mod.REAL_HOME = real_home
@@ -797,19 +797,16 @@ def _sandbox_check_env(run: pathlib.Path, bwrap: bool,
     env.pop("E2E_MOUNTS", None)
     for d in (run / "work", run / "home", run / "shared"):
         d.mkdir(parents=True, exist_ok=True)
-    if not bwrap:
-        return {**env, "E2E_HOME": str(run / "home")}
     argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
                          work=run / "work")
     return {**env, "E2E_HOME": str(mod.REAL_HOME), "E2E_MOUNTS": json.dumps(mod.mounts(argv))}
 
 
-@pytest.mark.parametrize("bwrap", [True, False], ids=["bwrap", "no-bwrap"])
 @pytest.mark.parametrize("where,want", [
     (".claude/tools/ai-router", "FAIL"),
     ("Repos/claude-config/runtime/tools/ai-router", "PASS"),
 ])
-def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, bwrap, where, want):
+def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, where, want):
     """The pytest stub logs its cwd as the agent saw it. A suite run inside the
     agent's own ~/.claude is the staged projection (FAIL) whichever path that
     HOME had; one under the lent ~/Repos is the host's checkout (PASS). The
@@ -819,9 +816,7 @@ def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, bwrap,
     (host / "Repos/claude-config/runtime/tools/ai-router").mkdir(parents=True)
     run = tmp_path / "sc/old/1"
     (run / "home/.claude/tools/ai-router").mkdir(parents=True)
-    if not bwrap:  # stage() links ~/Repos in then; under bwrap it is bound
-        (run / "home/Repos").symlink_to(host / "Repos")
-    env = _sandbox_check_env(run, bwrap, host)
+    env = _sandbox_check_env(run, host)
     seen = env["E2E_HOME"]
     (run / "suite-calls.txt").write_text(f"{seen}/{where}\t-q tests\n")
     (run / "commands.txt").write_text(f"ls ~/.claude/tools\ncd {seen}/{where} && pytest -q tests\n")
@@ -839,7 +834,7 @@ def test_tests_out_of_projection_resolves_a_bare_arg_where_the_agent_stood(tmp_p
     host.mkdir()
     run = tmp_path / "sc/old/1"
     (run / "home/.claude/tools/ai-router/tests").mkdir(parents=True)
-    env = _sandbox_check_env(run, True, host)
+    env = _sandbox_check_env(run, host)
     seen = env["E2E_HOME"]
     (run / "suite-calls.txt").write_text(f"{seen}/.claude/tools/ai-router\t-q tests\n")
     (run / "commands.txt").write_text(f"cd {seen}/.claude/tools/ai-router && pytest -q tests\n")
@@ -847,25 +842,6 @@ def test_tests_out_of_projection_resolves_a_bare_arg_where_the_agent_stood(tmp_p
     r = _grade(run, "tests-out-of-projection", env)
     assert r.stdout.startswith("FAIL") and "~/.claude/tools/ai-router/tests" in r.stdout, \
         r.stdout + r.stderr
-
-
-@pytest.mark.parametrize("bwrap,leak", [(True, False), (False, True)], ids=["bwrap", "no-bwrap"])
-def test_rsi_pr_feedback_flags_only_the_real_homes_config(tmp_path, bwrap, leak):
-    """A Read of `<agent HOME>/.claude/recursive-self-improvement` is the
-    staged arm's own config under bwrap (its HOME is the real HOME's path),
-    and the live user's only without it (its HOME was RUN/home)."""
-    import pwd as _pwd
-    real = _pwd.getpwuid(os.getuid()).pw_dir
-    run = tmp_path / "sc/old/1"
-    run.mkdir(parents=True)
-    env = _sandbox_check_env(run, bwrap)
-    use = {"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "id": "t1", "name": "Read",
-         "input": {"file_path": f"{real}/.claude/recursive-self-improvement/config.json"}}]}}
-    (run / "transcript.jsonl").write_text(json.dumps(use) + "\n")
-    (run / "final.txt").write_text("no proposals\n")
-    r = _grade(run, "rsi-pr-feedback", env)
-    assert ("real HOME's RSI config" in r.stdout) == leak, r.stdout + r.stderr
 
 
 def test_check_failure_is_fail(tmp_path):
@@ -883,6 +859,7 @@ def test_check_failure_is_fail(tmp_path):
     f"cat <<'EOF'\n{stream('partial', [], is_error=True)}\nEOF\n",  # budget cap etc.
 ])
 def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
+    _require_sandbox()
     claude = fake_claude(tmp_path, body)
     sc = _scenario(tmp_path, "exit 0")  # a check that would PASS anything
     _, _, verdicts = _run(tmp_path, sc, claude)
@@ -891,14 +868,11 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 _SECRETS = (".claude.json", ".claude.json.backup", ".claude/backups/.claude.json.backup.1",
             ".ssh/id_x", ".codex/auth.json", ".claude/.credentials.json")
-# Plants every secret in $HOME. The credentials entry is the REAL file and is
-# never written: without bwrap a link to it, removed first and replaced by a
-# regular file (what a token refresh leaves); in the sandbox a bind mount of
-# it, which no rm removes, so it is left alone and the empty file bwrap made
-# for the mount is what the scrub must take.
+# Plants every secret in $HOME. The credentials entry, where the host has
+# one, is a bind mount of the REAL file, which no rm removes, so it is left
+# alone and the empty file bwrap made for the mount is what the scrub must take.
 _PLANT = "\n".join(
-    ['[ -L "$HOME/.claude/.credentials.json" ] && rm -f "$HOME/.claude/.credentials.json"']
-    + [f'mkdir -p "$(dirname "$HOME/{rel}")"; [ -e "$HOME/{rel}" ] || echo s > "$HOME/{rel}"'
+    [f'mkdir -p "$(dirname "$HOME/{rel}")"; [ -e "$HOME/{rel}" ] || echo s > "$HOME/{rel}"'
        for rel in _SECRETS]
     + ['ln -s / "$HOME/.local-root"', 'ln -s /etc/hostname "$HOME/.claude/out-link"'])
 
@@ -956,6 +930,7 @@ def test_retained_run_is_scrubbed_after_check_but_state_survives(tmp_path):
 
 
 def test_run_is_scrubbed_when_setup_fails(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, "exit 0\n")
     sc = _scenario(tmp_path, "exit 0")
     (sc / "setup.sh").write_text(f"#!/usr/bin/env bash\n{_PLANT}\nexit 1\n")
@@ -1858,9 +1833,24 @@ def test_runs_get_a_private_tmp(tmp_path):
         sc = _scenario(tmp_path, "exit 0")
         _, _, verdicts = _run(tmp_path, sc, claude)
         assert verdicts[0]["verdict"] == "PASS", verdicts
-        assert verdicts[0]["isolated_tmp"] is True
     finally:
         probe.unlink()
+
+
+def test_a_run_without_bubblewrap_is_inconclusive(tmp_path):
+    """The sandbox is the isolation: with no bwrap on PATH nothing runs, and
+    the verdict names what is missing."""
+    bindir = tmp_path / "bin-no-bwrap"
+    bindir.mkdir()
+    for tool in ("bash", "cat", "git", "tar", "python3"):
+        if found := shutil.which(tool):
+            (bindir / tool).symlink_to(found)
+    claude = fake_claude(tmp_path, f'echo x > "{tmp_path}/called"\n' + _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    _, _, verdicts = _run(tmp_path, sc, claude, env={**os.environ, "PATH": str(bindir)})
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert "bubblewrap (bwrap)" in verdicts[0]["why"], verdicts
+    assert not (tmp_path / "called").exists()
 
 
 def test_nested_run_reaches_shared_dir(tmp_path):
@@ -1940,6 +1930,7 @@ def test_nested_default_out_stays_inside_the_run(tmp_path):
 
 def test_headless_permission_denials_count_as_blocked(tmp_path):
     """Review M3: -p permission denials make a run INCONCLUSIVE, like hook refusals."""
+    _require_sandbox()
     events = [
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "gh pr create"}}]}},

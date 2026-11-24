@@ -9,8 +9,8 @@
 # The run dir must sit under ~/worktrees, a broker repository root: run with
 # --out ~/worktrees/<dir>. The brokers get HOME=/home/jonathan because the gh
 # credential wrapper and the GitHub App wrapper locate their credentials from
-# HOME. Under bwrap that path is the staged HOME, so `lend` binds exactly
-# those credentials into it; without bwrap it is the real HOME.
+# HOME. In the sandbox that path is the staged HOME, so `lend` binds exactly
+# those credentials into it.
 set -euo pipefail
 
 work=$1

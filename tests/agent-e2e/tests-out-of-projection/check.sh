@@ -53,9 +53,9 @@ for line in filter(None, lines):
     for candidate in candidates:
         # The host file first: a path in the agent's HOME is RUN/home, one in
         # what the harness lends (~/Repos) the host's own, one in the private
-        # /tmp nothing on the host. Then realpath on purpose: without bwrap
-        # ~/Repos is a link in the staged HOME, so a suite reached through it is
-        # the host's checkout wearing a staged path, not the projection.
+        # /tmp nothing on the host. Then realpath on purpose: a suite reached
+        # through a link in the staged HOME is wherever the link lands, not
+        # the projection.
         host = to_host(candidate)
         if host is None:
             outside.append(candidate)

@@ -6,8 +6,8 @@ real HOME. A path the agent logged or named is therefore not a host path, and
 comparing it with RUN/home, or reading it as the real HOME, grades the wrong
 file. The harness hands check.sh the run's mounts in E2E_MOUNTS (a JSON list
 of [inside, host] pairs in mount order, host null for a private tmpfs);
-`to_host` replays them. Without bwrap the variable is unset and every path
-maps to itself, which is then exactly right: the agent's HOME was RUN/home.
+`to_host` replays them. With the variable unset (a grader run by hand on a
+canned run dir) every path maps to itself.
 
     sys.path.insert(0, "<scenario>/../_lib"); from sandbox_paths import to_host
 """
