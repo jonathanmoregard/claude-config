@@ -29,11 +29,13 @@ SCOPE = "/tests/agent-e2e/"
 
 def flagged(text: str, suffix: str) -> list[str]:
     """Lines of `text` that use regex/grep, comments and silenced lines excluded."""
-    pat = PY_USE if suffix == ".py" else SH_USE
+    # Both patterns on every file: a .sh grader often embeds Python in a heredoc.
+    del suffix
     out = []
     for line in text.splitlines():
         code = line.strip()
-        if code and not code.startswith("#") and MARKER not in line and pat.search(code):
+        if code and not code.startswith("#") and MARKER not in line and \
+                (PY_USE.search(code) or SH_USE.search(code)):
             out.append(code)
     return out
 

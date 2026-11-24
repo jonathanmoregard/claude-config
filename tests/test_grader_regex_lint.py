@@ -34,6 +34,11 @@ def test_warns_on_python_regex_in_edit():
     assert "1 regex/grep line" in context(out)
 
 
+def test_python_heredoc_inside_shell_grader_is_scanned():
+    text = "python3 - <<'PY'\nimport re\nif re.search(r'pushed', final): ok()\nPY\n"
+    assert "re.search" in context(run({"file_path": E2E, "content": text}))
+
+
 def test_multiedit_scans_every_new_string():
     out = run({"file_path": E2E, "edits": [{"new_string": "echo hi"},
                                            {"new_string": "egrep -c x f"}]})

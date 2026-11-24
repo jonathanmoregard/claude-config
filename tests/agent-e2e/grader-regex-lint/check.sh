@@ -14,10 +14,9 @@ n = 0
 for p in Path(sys.argv[1]).iterdir():
     if p.suffix not in (".sh", ".py") or p.name == "setup.sh":
         continue
-    pat = PY_USE if p.suffix == ".py" else SH_USE
     for line in p.read_text(errors="replace").splitlines():
         code = line.strip()
-        if code and not code.startswith("#") and "regex-ok:" not in line and pat.search(code):  # regex-ok: grades code
+        if code and not code.startswith("#") and "regex-ok:" not in line and (PY_USE.search(code) or SH_USE.search(code)):  # regex-ok: grades code
             n += 1
 print(n)
 LINT
