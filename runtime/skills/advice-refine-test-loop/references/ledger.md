@@ -55,6 +55,8 @@ asks. Across every repository:
 It prints `check runs findings reproduced fixed refuted advice_taken propose`
 per check (named checks only, when given), then one `exclude?` line per
 `fp_reason` that meets rule 3 below. `propose` applies rules 1 and 2.
+`reframe` rows are skipped: a rabbit-hole diagnosis is not a reviewer check,
+so there is nothing to drop or reword.
 
 Then propose, to the user, never on your own:
 

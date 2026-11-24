@@ -54,6 +54,9 @@ mkdir -p "$ROOT/repo1" "$ROOT/repo2"
   for _ in 1 2; do row e/r1 under6 refuted - "noise"; done
   # five5: five findings all refuted -> below six, no proposal.
   for _ in 1 2 3 4 5; do row e/r1 five5 refuted - "single run reason"; done
+  # reframe: five all-tractable diagnoses, five runs of `none`. Not a
+  # reviewer check, so never tallied, never proposed for a drop.
+  for r in 1 2 3 4 5; do row j/r$r reframe none - -; done
   # exclusion candidates: three rows across two runs -> exclude? (boundary).
   row f/r1 X1 refuted - "test-only path"
   row f/r1 X1 refuted - "test-only path"
@@ -87,6 +90,9 @@ expect "A is never dropped"       "A${T}5${T}0${T}0${T}0${T}0${T}0${T}reword" "$
 expect "reword at half of six"    "reword6${T}1${T}6${T}2${T}1${T}3${T}0${T}reword" "$(line reword6)"
 expect "no reword below half"     "under6${T}1${T}6${T}4${T}4${T}2${T}0${T}-" "$(line under6)"
 expect "no reword below six"      "five5${T}1${T}5${T}0${T}0${T}5${T}0${T}-" "$(line five5)"
+
+expect "reframe rows are not a check" "" "$(line reframe)"
+expect "reframe is not tallied when named either" "" "$("$TALLY" --root "$ROOT" reframe | grep -v '^exclude')"
 
 excl=$(grep -E "^exclude\?${T}" <<<"$out")
 expect "exclude only the reason meeting both thresholds" \
