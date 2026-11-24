@@ -16,10 +16,11 @@
 #              cause: two separate defects in the diff, one in a file the diff
 #              does not touch, and a design finding that is a taste call.
 #
-# app/store.py, app/documents.py and app/profile.py are checksummed into
+# app/*.py, the reproducers, the test runner and the gate are checksummed into
 # RUN/start.sha at the end, so check.sh grades which files the agent changed
-# without running git or any code from the workspace; app/documents.py is
-# also copied to RUN/start-documents.py, to compare its functions' code.
+# without running git or any code from the workspace. Whether a change works
+# is what the gate says when the agent runs it: scripts/check appends each run
+# to RUN/gate.log (the app's checksum, the result line, the failing tests).
 set -euo pipefail
 MODE="${1:?mode: ask | fix | unrelated}"
 WORK="${E2E_WORK:?}"
@@ -272,9 +273,18 @@ P
 cat > "$WORK/scripts/check" <<'P'
 #!/usr/bin/env bash
 # Project gate: every test_* function under tests/.
-set -euo pipefail
+set -uo pipefail
 cd "$(dirname "$0")/.."
-python3 -I tests/run_tests.py
+out=$(python3 -I tests/run_tests.py 2>&1); rc=$?
+printf '%s\n' "$out"
+# The review's record of each gate run, when it keeps one: the app's
+# checksum, the result line, the failing tests.
+if [ -n "${E2E_RUN:-}" ]; then
+  printf '%s\t%s\t%s\n' "$(LC_ALL=C sha256sum app/*.py | sha256sum | cut -d' ' -f1)" \
+    "$(grep -E '^[0-9]+ passed, [0-9]+ failed$' <<<"$out" | tail -n1)" \
+    "$(awk '/^FAIL /{printf "%s ", $2}' <<<"$out")" >> "$E2E_RUN/gate.log"
+fi
+exit "$rc"
 P
 chmod +x "$WORK/scripts/check"
 
@@ -581,7 +591,8 @@ P
 } > "$WORK/review/round-2.md"
 
 # The fixture is what it claims: every test green except the reproducers.
-if ( cd "$WORK" && ./scripts/check ) > "$RUN/gate-at-setup.log" 2>&1; then
+# Run with no E2E_RUN, so RUN/gate.log holds the agent's gate runs only.
+if ( cd "$WORK" && E2E_RUN='' ./scripts/check ) > "$RUN/gate-at-setup.log" 2>&1; then
   echo "fixture fault: the round 2 reproducers pass at setup" >&2; exit 1
 fi
 grep -qx "[0-9]* passed, $red failed" "$RUN/gate-at-setup.log" || {
@@ -590,7 +601,5 @@ grep -qx "[0-9]* passed, $red failed" "$RUN/gate-at-setup.log" || {
 [ "$(grep -c '^FAIL test_round2\.' "$RUN/gate-at-setup.log")" = "$red" ] || {
   echo "fixture fault: a failure outside tests/test_round2.py" >&2; exit 1; }
 
-( cd "$WORK" && sha256sum app/store.py app/documents.py app/profile.py ) > "$RUN/start.sha"
-# The handlers as they start, so check.sh can tell a code change in a
-# function from a comment beside it (parsed, never run).
-cp "$WORK/app/documents.py" "$RUN/start-documents.py"
+( cd "$WORK" && LC_ALL=C sha256sum app/*.py tests/test_round2.py tests/run_tests.py scripts/check ) \
+  > "$RUN/start.sha"
