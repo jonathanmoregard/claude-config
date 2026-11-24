@@ -23,8 +23,10 @@ def context(out: str) -> str:
 
 
 def test_warns_on_grep_in_written_grader():
-    out = run({"file_path": E2E, "content": 'grep -q done "$RUN/final.txt" && pass ok\n'})
-    assert "structured_judge" in context(out) and "regex-ok:" in context(out)
+    out = run({"file_path": E2E, "content": 'echo start\ngrep -q done "$RUN/final.txt" && pass ok\n'})
+    ctx = context(out)
+    assert "gained 1 regex/grep line" in ctx
+    assert 'grep -q done "$RUN/final.txt" && pass ok' in ctx and "echo start" not in ctx
     assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
 
 
@@ -52,12 +54,25 @@ def test_silenced_comment_and_clean_lines_stay_quiet():
     assert run({"file_path": E2E, "content": text}) == ""
 
 
+def test_edit_keeping_an_existing_grep_line_stays_quiet():
+    edit = {"file_path": E2E, "old_string": "grep -q a f\necho x", "new_string": "grep -q a f\necho y"}
+    assert run(edit) == ""
+    edit["new_string"] = "grep -q a f\ngrep -q b f"
+    assert "grep -q b f" in context(run(edit)) and "grep -q a f" not in context(run(edit))
+
+
+def test_trailing_comment_mentioning_grep_stays_quiet():
+    assert run({"file_path": E2E, "content": "echo ok  # no grep here\n"}) == ""
+
+
 def test_out_of_scope_paths_stay_quiet():
     assert run({"file_path": "/w/repo/tests/other/check.sh", "content": "grep x y\n"}) == ""
     assert run({"file_path": "/w/repo/tests/agent-e2e/demo/prompt.md", "content": "grep x\n"}) == ""
 
 
 def test_malformed_input_exits_zero_silently():
-    r = subprocess.run([sys.executable, "-S", "-E", str(HOOK)], input="not json",
-                       capture_output=True, text=True, timeout=10)
-    assert r.returncode == 0 and r.stdout == ""
+    for bad in ("not json", "[]", '{"tool_input": {"file_path": "' + E2E + '", "edits": null}}',
+                '{"tool_input": {"file_path": "' + E2E + '", "edits": [1]}}'):
+        r = subprocess.run([sys.executable, "-S", "-E", str(HOOK)], input=bad,
+                           capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0 and r.stdout == "", bad

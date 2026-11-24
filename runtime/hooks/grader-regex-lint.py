@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from collections import Counter
 
 PY_USE = re.compile(r"\bre\.(search|match|fullmatch|findall|finditer|compile|sub|split)\(")
 SH_USE = re.compile(r"(^|[\s|;&(`$])(e|f)?grep\b")
@@ -27,25 +28,35 @@ MARKER = "regex-ok:"
 SCOPE = "/tests/agent-e2e/"
 
 
-def flagged(text: str, suffix: str) -> list[str]:
-    """Lines of `text` that use regex/grep, comments and silenced lines excluded."""
-    # Both patterns on every file: a .sh grader often embeds Python in a heredoc.
-    del suffix
+def flagged(text: str) -> list[str]:
+    """Lines of `text` that use regex/grep, comments and silenced lines excluded.
+
+    Both patterns run on every file: a .sh grader often embeds Python in a
+    heredoc. A trailing ` #` comment is cut before matching."""
     out = []
     for line in text.splitlines():
         code = line.strip()
-        if code and not code.startswith("#") and MARKER not in line and \
-                (PY_USE.search(code) or SH_USE.search(code)):
+        if not code or code.startswith("#") or MARKER in line:
+            continue
+        if PY_USE.search(code.split(" #", 1)[0]) or SH_USE.search(code.split(" #", 1)[0]):
             out.append(code)
     return out
 
 
-def written(tool_input: dict) -> str:
+def gained(tool_input: dict) -> list[str]:
+    """Flagged lines the write adds: an Edit's old_string hits are subtracted."""
     if "content" in tool_input:
-        return tool_input.get("content") or ""
-    if "edits" in tool_input:
-        return "\n".join(e.get("new_string") or "" for e in tool_input["edits"])
-    return tool_input.get("new_string") or ""
+        return flagged(tool_input.get("content") or "")
+    pairs = tool_input.get("edits") or [tool_input]
+    out: list[str] = []
+    for edit in pairs:
+        before = Counter(flagged(edit.get("old_string") or ""))
+        for line in flagged(edit.get("new_string") or ""):
+            if before[line]:
+                before[line] -= 1
+            else:
+                out.append(line)
+    return out
 
 
 def main() -> None:
@@ -56,7 +67,7 @@ def main() -> None:
         suffix = path[path.rfind("."):] if "." in path else ""
         if SCOPE not in path or suffix not in (".sh", ".py"):
             return
-        hits = flagged(written(tool_input), suffix)
+        hits = gained(tool_input)
     except (ValueError, AttributeError, TypeError, OSError):
         return
     if not hits:

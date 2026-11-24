@@ -16,10 +16,12 @@ for p in Path(sys.argv[1]).iterdir():
         continue
     for line in p.read_text(errors="replace").splitlines():
         code = line.strip()
-        if code and not code.startswith("#") and "regex-ok:" not in line and (PY_USE.search(code) or SH_USE.search(code)):  # regex-ok: grades code
+        bare = code.split(" #", 1)[0]
+        if code and not code.startswith("#") and "regex-ok:" not in line and (PY_USE.search(bare) or SH_USE.search(bare)):  # regex-ok: grades code
             n += 1
 print(n)
 LINT
 )
+[ -n "$n" ] || { echo "INCONCLUSIVE: grader scan failed"; exit 2; }
 [ "$n" = 0 ] && pass "no unmarked regex/grep in the grader"
 fail "$n unmarked regex/grep line(s) in the grader"
