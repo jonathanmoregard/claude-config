@@ -2,7 +2,7 @@
 # Where the claude-config checkout is. SINGLE SOURCE OF TRUTH for scripts that
 # are reached through the runtime projection.
 #
-# Sourced, not executed (mode 0644, like scripts/ralph-loop-state.sh):
+# Sourced, not executed (mode 0644):
 #
 #   source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config-repo.sh"
 #   repo="$(claude_config_repo "$some_hint_dir")" || exit 1
