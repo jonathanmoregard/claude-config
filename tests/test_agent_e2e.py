@@ -646,18 +646,27 @@ def test_a_lend_the_staged_home_already_holds_is_inconclusive(tmp_path, in_real_
     assert str(rel) in verdicts[0]["why"] and "staged HOME" in verdicts[0]["why"], verdicts
 
 
-def test_a_staged_plugins_dir_is_not_shadowed(tmp_path):
-    """An arm whose config carries plugins/ provides ~/.claude/plugins itself;
-    the real plugin cache is not bound over it."""
+@pytest.mark.parametrize("rel", [".claude/plugins", ".claude/.credentials.json"])
+def test_an_optional_row_the_staged_home_provides_is_skipped(tmp_path, rel):
+    """An arm SRC copied whole from a ~/.claude carries plugins/ and
+    .credentials.json of its own. The run goes ahead on the staged copy, as
+    it does without bwrap, and the real one is not bound over it (review r2:
+    every bwrap run of such an arm was INCONCLUSIVE)."""
     mod = _harness_module()
     mod.REAL_HOME = tmp_path / "realhome"
-    (mod.REAL_HOME / ".claude/plugins/real").mkdir(parents=True)
+    real, staged = mod.REAL_HOME / rel, tmp_path / "out/sc/new/1/home" / rel
+    for p in (real, staged):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if rel.endswith("plugins"):
+            p.mkdir()
+        else:
+            p.write_text("{}")
     run = tmp_path / "out/sc/new/1"
-    (run / "home/.claude/plugins/staged").mkdir(parents=True)
     (run / "work").mkdir()
-    with pytest.raises(mod.Unexposable, match=r"\.claude/plugins.*staged HOME"):
-        mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
-                      work=run / "work")
+    (run / "shared").mkdir()
+    argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                         work=run / "work")
+    assert str(real) not in argv, argv
 
 
 def _bare_run(tmp_path) -> pathlib.Path:

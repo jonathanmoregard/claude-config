@@ -733,12 +733,15 @@ def path_guard() -> list[list[str]]:
 class Unexposable(Exception):
     """A row of the expose table that cannot be lent as asked: the host has
     no such path (ABSENT), or the staged HOME already holds its destination,
-    which the real one would shadow without a word. The run is INCONCLUSIVE,
-    save for an absent row the table marks optional."""
+    which the real one would shadow without a word (PROVIDED). The run is
+    INCONCLUSIVE, save for a row the table marks optional: absent, it is
+    skipped; provided, the staged copy stands, as it does without bwrap."""
 
-    def __init__(self, path: pathlib.Path, why: str, *, absent: bool = False):
+    def __init__(self, path: pathlib.Path, why: str, *, absent: bool = False,
+                 provided: bool = False):
         super().__init__(f"{path}: {why}")
         self.absent = absent
+        self.provided = provided
 
 
 def _within(path: pathlib.Path, root: pathlib.Path) -> bool:
@@ -770,7 +773,8 @@ def _hops(path: pathlib.Path, staged: pathlib.Path) -> tuple[list[str], pathlib.
             if os.path.lexists(mine) and (not todo or nxt.is_symlink()
                                           or mine.is_symlink() or not mine.is_dir()):
                 raise Unexposable(nxt, "the staged HOME already provides it; "
-                                       "lending the real one would shadow it")
+                                       "lending the real one would shadow it",
+                                  provided=True)
         if nxt.is_symlink():
             hops += 1
             if hops > 40:  # the kernel's own limit, give or take
@@ -860,7 +864,10 @@ def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
     what is there. A required row the host lacks makes the run INCONCLUSIVE; an
     optional one is skipped, which is no loss: the agent then finds nothing
     there, as it would on the host. A row whose destination the staged HOME
-    already provides is INCONCLUSIVE either way.
+    already provides is INCONCLUSIVE when required; when optional it is
+    skipped and the staged copy stands, as stage() leaves it without bwrap
+    (an arm SRC copied whole from a ~/.claude carries plugins/ and
+    .credentials.json of its own).
 
       row                          mode   required  why
       LINKS: ~/.claude/.credentials.json  rw  no    auth; refresh writes it
@@ -946,7 +953,7 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
         try:
             ops += expose(path, mode, staged)
         except Unexposable as exc:
-            if required or not exc.absent:
+            if required or not (exc.absent or exc.provided):
                 raise
     ops.sort(key=_mount_order)
     # A private pid namespace with its own procfs. Dropping a variable from

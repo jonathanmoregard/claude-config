@@ -1,19 +1,19 @@
-"""Home-anchored file rules must keep working when Claude runs with another HOME.
+"""Home-path file rules must keep working when Claude runs with another HOME.
 
 `~/` in a rule follows the HOME the CLI was started with; `//home/jonathan/`
-does not. The two fail in opposite directions when HOME is something else
-(a CI runner's /home/runner, a wrapper, sudo):
+does not. Under another HOME (a CI runner's /home/runner, the e2e harness
+without bubblewrap, a wrapper, sudo) each form alone breaks something:
 
 - a deny or ask written only as `~/` stops guarding the real file, and one
-  written only as `//home/jonathan/` guards nothing under the other HOME, so
-  each needs both forms: the real path stays closed whatever HOME is, and a
-  test run under another HOME still exercises the rule;
-- an allow written as `//home/jonathan/` matches nothing under another HOME and
-  turns into a prompt, while an allow under `~/` only ever opens a read or edit
-  inside the HOME the operator chose. Allows use `~/` alone.
+  written only as `//home/jonathan/` guards nothing under the other HOME;
+- an allow written only as `//home/jonathan/` matches nothing under the other
+  HOME and turns into a prompt (the e2e agent could not read its own skills in
+  CI), and one written only as `~/` drops the real path: a link in the staged
+  HOME into the real ~/Repos needs its target allowed too (review r2).
 
-Only Read(...) and Edit(...) carry paths the CLI consults; other path rules
-(Write, Grep, Glob) are accepted and ignored, so they are out of scope here.
+So every home-path Read(...) and Edit(...) rule, in every list, carries both
+forms. Only those two carry paths the CLI consults; Write, Grep and Glob path
+rules are accepted and ignored, so they are out of scope here.
 """
 
 import json
@@ -52,27 +52,19 @@ class PermissionAnchorTest(unittest.TestCase):
         self.assertIsNone(twin("Read(//etc/nixos/**)"))
         self.assertIsNone(twin("Grep(~/.config/Claude/**)"))
 
-    def test_home_denies_and_asks_carry_both_anchors(self):
+    def test_every_home_rule_carries_both_anchors(self):
         perms = load_permissions()
-        for kind in ("deny", "ask"):
+        checked = 0
+        for kind in ("allow", "deny", "ask"):
             rules = set(perms[kind])
             for rule in perms[kind]:
                 other = twin(rule)
                 if other is None:
                     continue
+                checked += 1
                 with self.subTest(kind=kind, rule=rule):
                     self.assertIn(other, rules, f"{kind} rule {rule} has no {other} twin")
-
-    def test_home_allows_use_tilde_only(self):
-        for rule in load_permissions()["allow"]:
-            m = RULE.match(rule)
-            if not m:
-                continue
-            with self.subTest(rule=rule):
-                self.assertFalse(
-                    m.group(2).startswith(ABS),
-                    f"allow {rule} is pinned to /home/jonathan; write it as ~/",
-                )
+        self.assertGreater(checked, 0, "no home-path rule found: is the anchor list stale?")
 
 
 if __name__ == "__main__":
