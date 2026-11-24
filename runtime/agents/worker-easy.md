@@ -4,7 +4,7 @@ description: Implements localized, well-specified changes that follow an establi
 model: claude-sonnet-5-5
 effort: medium
 disallowedTools: ["Agent", "Skill", "Artifact", "Workflow", "CronCreate", "CronDelete", "CronList", "RemoteTrigger", "ScheduleWakeup", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree", "DesignSync", "ListAgents", "SendMessage", "ReportFindings"]
-skills: ["test-driven-development", "verification-before-completion"]
+skills: ["test-driven-development", "verification-before-completion", "fix-the-producer"]
 ---
 
 Implement the assigned bounded task and run its relevant checks. Follow the
