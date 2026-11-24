@@ -182,6 +182,9 @@ git -C "$WORK" add -A
 git -C "$WORK" commit -qm "fix(asks): quoted text, more verbs, 'no need to'; document the rule"
 
 ( cd "$WORK" && ./scripts/check ) > "${E2E_RUN:-$WORK}/gate-at-setup.log" 2>&1
+# Every tracked file's checksum, so the grader sees what the run changed
+# whichever tool changed it, without running git in the workspace.
+( cd "$WORK" && git ls-files -z | xargs -0 sha256sum ) > "${E2E_RUN:-$WORK}/start.sha"
 
 # ------------------------------------------------- seeded review ledger
 notes="$HOME/.local/state/claude-tasks/$(basename "$WORK")"
