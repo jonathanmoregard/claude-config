@@ -21,10 +21,15 @@
 #   D5 stated intent a test named for denial that asserts nothing about it
 #   G3 primitive     session/user ids are str in code and TEXT in the schema
 # Nothing here hints at how many reviewers to use.
+#
+# The change sits on a branch off main, with __pycache__ ignored, so
+# the skill's tier table reads it as T2 (the blind pair). Committed on the
+# default branch, the tier saw an empty diff plus the gate's untracked .pyc
+# files.
 set -euo pipefail
 WORK="${E2E_WORK:?}"
 
-git -C "$WORK" init -q
+git -C "$WORK" init -q -b main
 git -C "$WORK" config user.email e2e@example.invalid
 git -C "$WORK" config user.name e2e
 
@@ -135,6 +140,8 @@ def test_lookup_of_unknown_token_is_none():
     assert lookup(SessionStore(), "nope") is None
 P
 
+printf '__pycache__/\n' > "$WORK/.gitignore"
+
 cat > "$WORK/README.md" <<'P'
 # svc
 
@@ -145,6 +152,7 @@ git -C "$WORK" add -A
 git -C "$WORK" commit -qm "init: session store and token lookup"
 
 # ------------------------------------------------- the change under review
+git -C "$WORK" switch -q -c feat/session-tokens
 cat > "$WORK/app/tokens.py" <<'P'
 """Session tokens."""
 

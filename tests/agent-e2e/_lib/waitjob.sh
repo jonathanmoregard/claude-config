@@ -54,7 +54,8 @@ open(sys.argv[1], "w").write(how + "\n")  # the grader's precondition check
 PY
 exec "$@"
 EOF
-  recorder=$(readlink -f "$(dirname "$0")/../../../runtime/scripts/record-user-unit-failure")
+  # The arm's own staged config: only tests/ is copied next to this script.
+  recorder=$(readlink -f "$RUN/home/.claude/scripts/record-user-unit-failure")
   printf '%s\n' "$slug" > "$WORK/unit-name.txt"
   systemd-run --user --unit="$slug" --working-directory="$WORK" \
     -p RemainAfterExit=yes \

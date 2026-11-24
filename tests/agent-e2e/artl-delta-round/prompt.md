@@ -1,0 +1,1 @@
+Round 1 of the close-out review on this branch is done: review/round-1.md has its findings and their outcomes, and the fix for the one that reproduced is committed. The gate (scripts/check) is green. Pick up advice-refine-test-loop from there and get the branch ready to ship; commit any fixes on this branch. I'll merge it myself.

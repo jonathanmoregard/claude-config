@@ -196,7 +196,7 @@ check_all_lines "--output-schema on every call"       "output-schema" yes
 check_all_lines "no --dangerously-* ever"             "dangerously" no
 check_all_lines "no --full-auto ever"                 "full-auto" no
 
-if grep -q -- "-m gpt-5.4" "$ARGS_FILE"; then
+if grep -q -- "-m gpt-5.6-luna" "$ARGS_FILE"; then
   printf '  PASS  %-46s\n' "fallback tier used on retry"; PASS=$((PASS + 1))
 else
   printf '  FAIL  %-46s\n' "fallback tier used on retry"; FAIL=$((FAIL + 1))

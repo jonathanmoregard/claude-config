@@ -29,7 +29,7 @@
 #   --timeout         Wall-clock cap in seconds. Default 300.
 #   --out             Write the verdict JSON here. Default: stdout.
 #   --fallback-model  Lighter tier tried once on quota exhaustion.
-#                     Default gpt-5.4.
+#                     Default gpt-5.6-luna.
 #
 # Exit codes — every one of them is a distinct routing decision upstream:
 #   0  a schema-shaped verdict was produced (.verdict is one of the three enum
@@ -83,7 +83,7 @@ TIMEOUT=300
 OUT=""
 # Must be an id the account is actually served; check `codex debug models` when
 # this rots. gpt-5.4 stopped being served ~2026-09-04 (400 on every request).
-FALLBACK_MODEL="gpt-5.4-mini"
+FALLBACK_MODEL="gpt-5.6-luna"  # a ChatGPT-account Codex rejects gpt-5.4-mini (HTTP 400, 2026-11-24)
 
 # Refuse sandbox-escaping flags outright. The loop's guarantee that Codex never
 # edits rests on this; a caller that wants it has misread the skill.

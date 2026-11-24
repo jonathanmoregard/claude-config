@@ -80,7 +80,6 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 GIT_TIMEOUT_S = 5
@@ -226,9 +225,10 @@ def current_branch(top: str) -> str | None:
     return git(top, "symbolic-ref", "-q", "--short", "HEAD")
 
 
-def numstat(top: str, a: str, b: str) -> list[tuple[str, int | None]] | None:
-    """[(path, lines changed or None for binary)] between two tree-ishes."""
-    out = git(top, "diff", "--numstat", "-z", "--no-renames", a, b)
+def numstat(top: str, a: str, b: str | None) -> list[tuple[str, int | None]] | None:
+    """[(path, lines changed or None for binary)] between two tree-ishes, or
+    between `a` and the working tree when `b` is None."""
+    out = git(top, "diff", "--numstat", "-z", "--no-renames", a, *([b] if b else []))
     if out is None:
         return None
     rows = []

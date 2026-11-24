@@ -35,6 +35,10 @@ without reading it. `input.run_in_background` is also honoured where present,
 but it is not a substitute: the harness backgrounds on its own, so 16 of those
 20 carry no such input.
 
+ROUND 1 ONLY. The first two reviewer dispatches are the blind pair; every
+later round is one reviewer over the fix delta, sent after round 1 reported
+on purpose, so it is not compared.
+
 A dispatch landing after an earlier reviewer's delivery line is `late` -- the
 findings were in the parent's context, so the prompt is anchorable -- and
 `leaked` when it also carries that reviewer's reported content. Both fail; the
@@ -129,6 +133,7 @@ def read(path):
     """
     dispatches = []
     bg, notify, result, turn_last, report = {}, {}, {}, {}, {}
+    failed = set()
     for i, line in enumerate(open(path, encoding="utf-8")):
         try:
             ev = json.loads(line)
@@ -139,7 +144,11 @@ def read(path):
         if parent:
             turn_last[parent] = i
             said = spoken_text(ev)
-            if said.strip():
+            # A `<synthetic>` turn is the harness's API-error text, not the
+            # reviewer speaking.
+            synthetic = (ev.get("message") or {}).get("model") == "<synthetic>" \
+                if isinstance(ev.get("message"), dict) else False
+            if said.strip() and not synthetic:
                 report[parent] = said
             continue
 
@@ -152,6 +161,8 @@ def read(path):
             elif sub == "task_notification" and ev.get("status") in (
                     "completed", "failed", "error"):
                 notify.setdefault(tid, i)
+                if ev.get("status") != "completed":
+                    failed.add(tid)
             continue
 
         for b in blocks(ev):
@@ -171,6 +182,10 @@ def read(path):
                 bg[b.get("id")] = True
             if any(m in norm(prompt) for m in REVIEW_MARKERS):
                 dispatches.append((i, b.get("id"), prompt))
+    # A dispatch that failed without saying a word (a spend limit, an API
+    # error) reviewed nothing and reported nothing: it is not a reviewer, and
+    # its retry takes its place in the pair.
+    dispatches = [d for d in dispatches if not (d[1] in failed and d[1] not in report)]
     return dispatches, bg, notify, result, turn_last, report
 
 
@@ -230,12 +245,15 @@ def main():
     # exactly the "B became a second A, with a header" run `no-hunt` is for.
     hunt = bool(seen)
 
-    # Per dispatch: had any reviewer dispatched before it already reported?
+    # Round 1's pair only: had the first reviewer already reported when the
+    # second was dispatched? Later rounds are one reviewer over the delta,
+    # dispatched after round 1 reported by design (SKILL.md, Rounds).
     late = leaked = nodata = False
-    lines = [d[0] for d in dispatches]
+    pair = dispatches[:2]
+    lines = [d[0] for d in pair]
     one_block = n >= 2 and len(set(lines)) == 1
-    for idx, (line, _tid, prompt) in enumerate(dispatches):
-        for prev_line, prev_tid, _ in dispatches[:idx]:
+    for idx, (line, _tid, prompt) in enumerate(pair):
+        for prev_line, prev_tid, _ in pair[:idx]:
             if prev_line == line:
                 continue  # same tool-use block: nothing to have seen
             prev_end = delivery(prev_tid, bg, notify, result, turn_last)

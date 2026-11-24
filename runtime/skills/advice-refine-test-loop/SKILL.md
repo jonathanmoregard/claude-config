@@ -5,9 +5,9 @@ description: Use when a finished, integrated non-trivial diff needs independent 
 
 # Empirical Close-out Review
 
-Two blind fresh reviewers propose falsifiable defects; observed behavior decides
-what gets fixed. Do not run per edit, task, or chunk. During implementation, use
-the project's tests, acceptance criteria, and real app-driving loop instead.
+Fresh blind reviewers propose falsifiable defects; observed behavior decides
+what gets fixed; the diff's risk tier sets the effort. Do not run per edit,
+task, or chunk; the project tests serve there.
 
 ## Entry Gate
 
@@ -18,6 +18,15 @@ the project's tests, acceptance criteria, and real app-driving loop instead.
    report that the gate was unavailable.
 4. If rendered UI changed, invoke `visual-verify` first and include its evidence
    in the review capsule.
+5. Note the start time, then pick the tier from the diff yourself; give a
+   one-line reason. If torn, take the higher.
+
+| Tier | When | Review |
+|---|---|---|
+| T0 | Docs only, or ≤15 lines outside behaviour paths (hooks, scripts, skills, agents, settings, CLAUDE.md) | None: the gates are the review. |
+| T1 | Up to ~80 lines in ≤5 files | Round 1 is reviewer A alone, B's triggered `Hunt` lines appended; then delta rounds. |
+| T2 | Larger, or cross-component | The blind pair, then delta rounds. |
+| T3 | Security, data loss or irreversibility: auth, secrets, crypto, permissions, sandboxes, gates, migrations, PII | T2, plus A's prompt once through `scripts/codex-advise.sh` in round 1; on a nonzero exit, report that pass unavailable. |
 
 Do not invite an LLM reviewer while a deterministic gate is red.
 
@@ -32,30 +41,25 @@ Give the reviewer only:
 - the exclusion list, when it has entries
   (`references/exclusions.md`), under the line "Do not report:".
 
-The reviewer chooses which files, callers, tests, and configuration to inspect.
-Inspection depth is the reviewer's judgment.
-Never restrict inspection to changed hunks: a historical miss hid in an
-unchanged invariant elsewhere in a changed file. Do not preselect or cap files
-without measured evidence that the constraint improves the review. Record files
-read and why each context expansion was relevant.
+The reviewer chooses which files to inspect. Inspection depth is the
+reviewer's judgment. Never restrict inspection to changed hunks: a historical
+miss hid in an unchanged invariant elsewhere in a changed file. Record files
+read.
 
-## Review Twice, Blind
+## Round 1: Review Twice, Blind
 
 1. Pick reviewer B's hunt classes FIRST, before either dispatch, from
    `~/.claude/skills/advice-refine-test-loop/references/hunt-classes.md`.
 2. Write both prompts before dispatching either, and never revise B's after A
    reports: a prompt composed once A's findings are in context is anchored on
-   them even when it quotes nothing. Keep both reviewers in flight at once. One
-   tool-use block always does that; a later message only where the dispatch
-   returns before the reviewer reports. If the tool result carries A's
-   findings, B in the next message is already anchored — so send both together
-   rather than assuming. Two fresh, read-only reviewers; neither sees the
-   other's prompt, findings, or existence.
+   them even when it quotes nothing. Keep both in flight at once: one
+   tool-use block, a later message only where the dispatch returns before the
+   reviewer reports. Two fresh, read-only reviewers; neither sees the other's
+   prompt, findings, or existence.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
 
-Two reviewers is the whole budget per round. Further rounds (see Rounds) and
-the escalation rule are the only ways to add reviewers.
+Only round 1 is a pair.
 
 Reviewer A, falsification:
 
@@ -69,7 +73,8 @@ pass: what else in this change breaks in production that no claim covers?
 Report only material defects. Each must name a file and line, state one
 falsifiable claim, and give a concrete test, request, or app interaction that
 would demonstrate it. Do not suggest cleanup or edits. Return no finding that
-lacks an observable failure. Record files read.
+lacks an observable failure. Report at most five, most severe first; if none
+qualifies, say `No findings.` Record files read.
 ```
 
 Reviewer B, targeted hunt: its prompt sits in that same file, above the
@@ -77,17 +82,13 @@ classes. Send only the classes whose trigger this diff satisfies — never the
 whole list — and keep B's two finding buckets, defect and design, apart as the
 file defines them.
 
-Use another vendor or specialist only when the user requests a deep audit, a
-review exposes unresolved contradictory evidence, or failure could cause
-irreversible security, privacy, or data loss.
+Beyond T3: only on the user's deep-audit request.
 
 ## Adjudicate, Then Act
 
 Every defect finding gets exactly one of three outcomes before any edit. Test
-the exact claimed path and record expected versus actual behaviour. Batch
-findings through one fresh verifier context — never the context that wrote
-the code under review. Do not create one agent or worktree per finding unless
-concurrent reproducers would mutate shared state.
+the exact claimed path; record expected versus actual. Batch findings through
+one fresh verifier context, never the one that wrote the code.
 
 - **Reproduced** — a test, request or app interaction shows the claimed
   failure.
@@ -100,53 +101,51 @@ concurrent reproducers would mutate shared state.
 
 Then:
 
+- First, append this round's rows to `<notes>/review-ledger.tsv`
+  (`references/ledger.md`; a `none` row per silent check).
+- Findings sharing one cause (any round, fixed or not):
+  `references/one-root-cause.md`.
 - Reproduced, and caused by the diff or violating its acceptance contract:
-  fix it now. The reproducer stays as a regression test.
-- Reproduced but pre-existing and unrelated: record it separately; do not
-  grow this branch.
-- Refuted: close it and record the reason in the ledger.
+  fix it now, as a class: the fixer searches the repository for every other
+  site with the same shape and fixes them in the same change (each extra
+  site gets a `variant` row). The reproducer stays as a regression test.
+- Reproduced, pre-existing and unrelated: record it; don't grow the branch.
+- Refuted: close it; the ledger records why.
 - Unconfirmed: never closed, never fixed blind, never dropped. List it for
   the user with what was tried; whether to ship with it open is their call.
 - Design finding (`unverifiable: true`): no reproducer applies. Surface it to
-  the user as a taste call with file and line. Never auto-fix it, and never
-  let it block the ship alone. Classes marked advisory in
+  the user as a taste call with file and line. Never auto-fix it or let it
+  block the ship alone. Classes marked advisory in
   `references/hunt-classes.md` are only listed in the report.
 
 ## Rounds
 
-A round is one blind pair over the current integrated diff. After a round's
-fixes, run each reproducer, the project gate, the acceptance scenarios and the
-deterministic gate again, then run another round. Every round after the
-first:
+After a round's fixes, run each
+reproducer, the project gate, the acceptance scenarios and the deterministic
+gate again. If anything new reproduced or newly unconfirmed, run the next:
 
-1. Covers the whole diff including the fix commits. A fix is new code and is
-   reviewed like the rest.
-2. Presents the changed files, and B's `Hunt` lines, in a different order
-   from every earlier round.
-3. Re-picks B's classes against the diff as it now stands, and adds one
-   sibling line per defect the previous round reproduced: "A defect of this
-   shape was confirmed at <file:line>: <the shape in one sentence>. Find
-   every other site with the same shape." Reviewer A never gets a sibling line.
-4. Is deduplicated by you after both reviewers report: a finding that matches
-   an earlier adjudicated one by meaning keeps the earlier outcome. Apart
-   from the sibling line, no reviewer is shown an earlier finding.
+1. One fresh reviewer with A's prompt verbatim, over the delta only: the commits since
+   the tree the previous round reviewed. A fix is new code; the reviewer may
+   read outside the delta to judge it.
+2. Its capsule adds each Unconfirmed finding as a claim to settle, and every
+   adjudicated finding's claim under "Do not report:". Deduplicate what it
+   returns by meaning; a match keeps the earlier outcome.
 
-Stop when two consecutive rounds are empty: nothing new reproduced and
-nothing new unconfirmed. Cap: four rounds. At the cap without two empty
-rounds, stop and report "not converged" with the count per round; the user
-decides what happens next.
+Stop at the first round with nothing new reproduced or unconfirmed. Cap:
+three rounds. A round-3 finding is not fixed in the loop: the fixes are not
+converging. Group the reproduced findings by area, name the area that kept
+producing them, research its standard design (CLAUDE.md, Build + review), and
+ask one closed question: redesign <area> (recommended), ship with the findings
+open, or one more round. Unattended: write it to `<notes>/pending_for_human.md`
+and stop with "not converged; redesign proposed".
 
 ## Report
 
-Return a compact ledger: rounds run and why the loop stopped, reviewer calls
-and model usage when available, B's hunt classes per round, files read,
+Report the tier, rounds run and why the loop stopped, B's hunt classes,
 findings proposed / reproduced / refuted / unconfirmed / fixed / deferred,
-design and advisory findings surfaced, commands run, and final gate status.
-List every unconfirmed finding with what was tried.
-
-Then append to `<notes>/review-ledger.tsv` (format:
-`references/ledger.md`): one row per finding, and one `none` row per check
-that ran and reported nothing.
+design and advisory findings, and final gate status. List every unconfirmed
+finding with what was tried. Append the close-out's row to
+`<notes>/review-runs.tsv` (`references/ledger.md`, Runs).
 
 End the report with the `ledger-tally.sh` line for each check that ran in
 this close-out. If a line says `drop` or `reword`, or an `exclude?` line
@@ -154,5 +153,5 @@ appears that `references/exclusion-decisions.tsv` does not already decide
 (by meaning, not wording; see `references/ledger.md`), put it to the user as
 one closed question. Change nothing yourself.
 
-Never claim broad audit coverage from this bounded close-out review. Two
-empty rounds are two samples, not proof.
+Never claim broad audit coverage from this close-out review. An
+empty round is one sample, not proof.
