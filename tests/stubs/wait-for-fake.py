@@ -23,15 +23,20 @@ import subprocess
 import sys
 import time
 
+# `wait-for unit` clears its environment; the files then sit beside the bin dir.
+_BESIDE = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0])))
+SCRIPT = os.environ.get("FAKE_SCRIPT", os.path.join(_BESIDE, "script.json"))
+LOG = os.environ.get("FAKE_LOG", os.path.join(_BESIDE, "calls.log"))
+
 
 def _state() -> tuple[dict, str]:
-    path = os.environ["FAKE_SCRIPT"]
+    path = SCRIPT
     with open(path, encoding="utf-8") as fh:
         return json.load(fh), path
 
 
 def _bump(key: str) -> int:
-    counter = os.environ["FAKE_SCRIPT"] + "." + key.replace(" ", "_") + ".n"
+    counter = SCRIPT + "." + key.replace(" ", "_") + ".n"
     n = int(open(counter).read()) if os.path.exists(counter) else 0
     with open(counter, "w") as fh:
         fh.write(str(n + 1))
@@ -39,7 +44,7 @@ def _bump(key: str) -> int:
 
 
 def _log(argv: list[str]) -> None:
-    with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as fh:
+    with open(LOG, "a", encoding="utf-8") as fh:
         fh.write(" ".join(argv) + "\n")
 
 
@@ -68,7 +73,7 @@ def fake_gh(argv: list[str]) -> int:
 
 
 def _counter_path(key: str) -> str:
-    return os.environ["FAKE_SCRIPT"] + "." + key.replace(" ", "_") + ".n"
+    return SCRIPT + "." + key.replace(" ", "_") + ".n"
 
 
 def _read_counter(key: str) -> int:

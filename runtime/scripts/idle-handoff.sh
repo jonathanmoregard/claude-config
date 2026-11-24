@@ -9,7 +9,7 @@
 #   for it (context >= 30% of the detected window; the threshold is a hardcoded
 #   constant at both ends, not a setting). The context path inherits this script's
 #   entire guard chain — fork ledger, per-cwd 24h budget, staleness
-#   DENY-when-uncheckable, live-cwd collision abort, ralph collision — rather than
+#   DENY-when-uncheckable, live-cwd collision abort — rather than
 #   rebuilding any of it. Those guards, not a switch, are what bound it: there is
 #   no on/off key for this path (USER DECISION 2026-08-16).
 #
@@ -40,20 +40,19 @@
 #      WORKSPACE". Overlap either way (inside, or an ancestor of) refuses the whole
 #      candidate: no write, no budget, no fork.
 #  10. live-project (rescanned just before spawn — see below)
-#  11. ralph collision guard
-#  12. mission.md fresh-dedupe (30 min)
-#  13. mission mode write; VERIFY manifest status=="complete" (not just rc)
-#  14. per-run + per-cwd 24h fork budget
-#  15. ## Next non-empty and not "(none)" / "- (none)"
-#  16. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
-#  17. RE-scan live cwds; abort spawn if any claude proc entered this cwd
-#  18. the fork's authority is restrictable (every required flag advertised, matched on
+#  11. mission.md fresh-dedupe (30 min)
+#  12. mission mode write; VERIFY manifest status=="complete" (not just rc)
+#  13. per-run + per-cwd 24h fork budget
+#  14. ## Next non-empty and not "(none)" / "- (none)"
+#  15. staleness gate: DENY (skip) when uncheckable; non-git cwd = skip
+#  16. RE-scan live cwds; abort spawn if any claude proc entered this cwd
+#  17. the fork's authority is restrictable (every required flag advertised, matched on
 #      a flag boundary), permissions.deny is PROVEN to be enforced by the installed
 #      binary (a real two-run probe, cached per CLI version), AND the settings file was
 #      written. None of the three is optional — see "THE FORK'S AUTHORITY" and "IS
 #      permissions.deny ACTUALLY ENFORCED" below. All fail CLOSED, and all run before
 #      the budget is charged or the request marker consumed.
-#  19. spawn as transient user service (systemd-run) so fork outlives oneshot
+#  18. spawn as transient user service (systemd-run) so fork outlives oneshot
 #
 # Stop mechanisms (in order of blast radius):
 #   pkill -f idle-handoff.sh                            # running instance
@@ -61,10 +60,6 @@
 #   systemctl --user disable claude-idle-handoff.timer  # persist through reboot
 set -uo pipefail
 umask 077
-
-# Ralph state lives in userspace and is keyed by session; `ralph_state_for_dir`
-# is the only sanctioned way to ask "is a loop armed in this cwd".
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ralph-loop-state.sh"
 
 # ---- Config with numeric validation (advisor MEDIUM: sharp-edges) -----------
 : "${REFLECT_ROOT:=$HOME/.claude/reflections}"
@@ -190,7 +185,7 @@ is_valid_sid() {
 # SELF_COMPACT_CONFIG path override. There is no replacement key, env var or
 # opt-in. What bounds this path is the guard chain that was already here: fork
 # ledger, per-run and per-cwd-24h fork budgets, staleness DENY-when-uncheckable,
-# live-cwd collision abort, ralph collision, and the producer's own per-session
+# live-cwd collision abort, and the producer's own per-session
 # loop bound. A flag shipping `false` protected nothing; it only meant the feature
 # was never exercised in the configuration that matters.
 #
@@ -1255,7 +1250,6 @@ count_skipped_no_next=0
 count_skipped_stale=0
 count_skipped_observer=0
 count_skipped_sdk_cli=0
-count_skipped_ralph=0
 count_skipped_git_stale=0
 count_skipped_fork_budget=0
 count_skipped_backoff=0
@@ -1309,7 +1303,7 @@ for project_dir in "$PROJECTS_DIR"/*/; do
 
   # ---- Trigger: idle window OR verified self-compact context request ---
   # Widening this gate is the whole of B7. Everything downstream — budgets,
-  # staleness, live-cwd rescan, ralph collision — is unchanged and still
+  # staleness, live-cwd rescan — is unchanged and still
   # applies, so the context path cannot reach anything the idle path could not.
   mtime=$(stat -c '%Y' "$transcript" 2>/dev/null || echo 0)
   idle=$(( now - mtime ))
@@ -1434,16 +1428,6 @@ for project_dir in "$PROJECTS_DIR"/*/; do
   # after the session exits.
   if is_live_project "$candidate_cwd"; then
     count_skipped_live=$((count_skipped_live + 1))
-    continue
-  fi
-
-  # ---- Ralph collision ---
-  # Ralph state is session-keyed in userspace, so this is a lookup on the
-  # `armed_in:` field rather than a file test inside the candidate's tree.
-  # Reading it out of the repo also means a planted file cannot suppress or
-  # trigger the skip.
-  if ralph_state_for_dir "$candidate_cwd" >/dev/null 2>&1; then
-    count_skipped_ralph=$((count_skipped_ralph + 1))
     continue
   fi
 
@@ -1993,4 +1977,4 @@ PROMPT
   count_forked=$((count_forked + 1))
 done
 
-log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=${SELF_COMPACT_FIRE_AT_TOKENS}tok) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next ralph=$count_skipped_ralph git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"
+log "seen=$count_seen wrote=$count_wrote forked=$count_forked context_triggered=$count_context_trigger self_compact=on(>=${SELF_COMPACT_FIRE_AT_TOKENS}tok) skipped(live=$count_skipped_live live_rescan=$count_skipped_live_rescan sdk-cli_or_unknown=$count_skipped_sdk_cli short=$count_skipped_short backoff=$count_skipped_backoff fresh=$count_skipped_fresh_mission no_cwd=$count_skipped_no_cwd stale=$count_skipped_stale observer=$count_skipped_observer no_next=$count_skipped_no_next git_stale=$count_skipped_git_stale fork_budget=$count_skipped_fork_budget mission_err=$count_mission_status_error mission_not_ours=$count_skipped_mission_not_ours mission_resolve_err=$count_mission_resolve_error fork_unrestrictable=$count_skipped_fork_unrestrictable deny_unproven=$count_skipped_deny_unproven control_plane_cwd=$count_skipped_control_plane)"

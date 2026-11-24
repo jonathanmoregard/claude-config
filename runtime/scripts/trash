@@ -1,0 +1,196 @@
+#!/run/current-system/sw/bin/python3 -I
+"""trash <path>... — move paths under ~/Repos or ~/worktrees into that root's .trash/.
+
+Runs inside the sandbox like any command, so the sandbox decides what may be
+moved. The home trash is out of reach there: each write root is its own mount
+and a rename across mounts fails. Entries older than 30 days are emptied on
+each run. To restore one, move it back from <root>/.trash/files/; its original
+path is in <root>/.trash/info/<name>.trashinfo.
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import pwd
+import shutil
+import stat
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+# Not $HOME: agent-e2e runs sessions with a staged one, on the same real roots.
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+ROOTS = ("Repos", "worktrees")
+KEEP_DAYS = 30
+DATE = "%Y-%m-%dT%H:%M:%S"
+
+
+def fail(msg: str) -> None:
+    print(f"trash: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def root_of(path: Path, home: Path) -> Path | None:
+    for name in ROOTS:
+        root = (home / name).resolve()
+        if path.parent.resolve().is_relative_to(root):
+            return root
+    return None
+
+
+def open_dir(name: str, dir_fd: int, create: bool) -> int:
+    if create:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, dir_fd=dir_fd)
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+
+
+def open_trash(root: Path, create: bool) -> tuple[int, int]:
+    """Descriptors, not paths: a sandboxed caller can make any of these a link, and an
+    unsandboxed run must not follow it."""
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        trash_fd = open_dir(".trash", root_fd, create)
+    finally:
+        os.close(root_fd)
+    try:
+        return open_dir("files", trash_fd, create), open_dir("info", trash_fd, create)
+    finally:
+        os.close(trash_fd)
+
+
+def lexists(name: str, dir_fd: int) -> bool:
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def reserve(files: int, info: int, name: str, original: Path) -> str:
+    """Claims a name under info/ first, as the FreeDesktop trash spec does."""
+    for n in range(1, 10_000):
+        unique = name if n == 1 else f"{name}.{n}"
+        try:
+            fd = os.open(f"{unique}.trashinfo", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                         dir_fd=info)
+        except FileExistsError:
+            continue
+        if lexists(unique, files):
+            os.close(fd)
+            os.unlink(f"{unique}.trashinfo", dir_fd=info)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(f"[Trash Info]\nPath={quote(os.fsencode(original))}\n"
+                    f"DeletionDate={time.strftime(DATE)}\n")
+        return unique
+    fail(f"no free name for {name}")
+    raise AssertionError
+
+
+def entry_name(arg: str) -> str:
+    return os.path.basename(arg.rstrip("/"))
+
+
+def target(arg: str) -> Path:
+    """The parent resolved as the filesystem does, so a link before '..' is followed
+    first (abspath collapses link/.. as text); the last component is kept as given,
+    so a final link is itself what moves. Strict: a parent that cannot be walked
+    (absent, not a directory, a link loop) is an error, never collapsed as text."""
+    head = os.path.dirname(arg.rstrip("/"))
+    return Path(head or ".").resolve(strict=True) / entry_name(arg)
+
+
+def move(arg: str, home: Path) -> None:
+    try:
+        path = target(arg)
+    except (OSError, RuntimeError):  # RuntimeError: a link loop before Python 3.13
+        fail(f"{arg}: no such file or directory")
+    if not os.path.lexists(path):
+        fail(f"{arg}: no such file or directory")
+    root = root_of(path, home)
+    if root is None:
+        fail(f"{arg} is not under ~/{' or ~/'.join(ROOTS)}; use rm")
+    trash = root / ".trash"
+    if path == trash or path.parent.resolve().is_relative_to(trash):
+        fail(f"{arg} is already in the trash")
+    try:
+        files, info = open_trash(root, create=True)
+    except OSError as e:
+        fail(f"cannot use {trash}: {e.strerror}")
+    unique = reserve(files, info, path.name, path)
+    try:
+        os.rename(path, unique, dst_dir_fd=files)
+    except OSError as e:
+        os.unlink(f"{unique}.trashinfo", dir_fd=info)
+        fail(f"cannot move {arg}: {e.strerror}")
+    os.close(files)
+    os.close(info)
+
+
+def deletion_time(record: str, info: int) -> float | None:
+    """Without a readable date (a killed run leaves the record empty) its mtime counts."""
+    try:
+        fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=info)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        return None
+    with os.fdopen(fd, "rb") as f:
+        lines = f.read().decode(errors="replace").splitlines()
+    for line in lines:
+        if line.startswith("DeletionDate="):
+            try:
+                return time.mktime(time.strptime(line.removeprefix("DeletionDate="), DATE))
+            except ValueError:
+                break
+    return st.st_mtime
+
+
+def empty_old(home: Path) -> None:
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for name in ROOTS:
+        try:
+            files, info = open_trash((home / name).resolve(), create=False)
+        except OSError:
+            continue
+        for record in os.listdir(info):
+            entry = record.removesuffix(".trashinfo")
+            if entry == record or entry in ("", ".", ".."):
+                continue
+            deleted = deletion_time(record, info)
+            if deleted is None or deleted >= cutoff:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                if stat.S_ISDIR(os.stat(entry, dir_fd=files, follow_symlinks=False).st_mode):
+                    shutil.rmtree(entry, dir_fd=files)
+                else:
+                    os.unlink(entry, dir_fd=files)
+            os.unlink(record, dir_fd=info)
+        os.close(files)
+        os.close(info)
+
+
+def main(args: list[str]) -> None:
+    if not args:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(64)
+    for arg in args:
+        if arg.startswith("-"):
+            print(f"trash: options are not accepted: {arg}", file=sys.stderr)
+            sys.exit(64)
+        # "" would be the working directory, "." or ".." a directory above the one named.
+        if entry_name(arg) in ("", ".", ".."):
+            print(f"trash: refusing to trash {arg!r}: it names no single entry", file=sys.stderr)
+            sys.exit(64)
+    home = HOME
+    for arg in args:
+        move(arg, home)
+    empty_old(home)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
