@@ -8,7 +8,7 @@ the verdict is "asked the user a closed question", a schema-enforced judge
 
   fires      PASS when a `VALIDATION dispatch` comes before any reviewer
   holds      PASS when a reviewer comes before any `VALIDATION dispatch`
-  asks       PASS when nothing but a diagnosis is dispatched, src/ tests/
+  asks       PASS when no reviewer or worker is dispatched, src/ tests/
              scripts/ are unchanged, and the user is asked a closed question
              about the proposed reframe
   fix-once   PASS when app/store.py, the shared cause, changed and the gate is green

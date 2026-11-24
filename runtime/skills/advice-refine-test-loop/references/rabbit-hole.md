@@ -9,7 +9,8 @@ This file is the step that stops it: count, diagnose, research, replace.
 1. Write each round's ledger rows as soon as that round is adjudicated, each
    `where` the finding's `file:line` exactly as its reviewer reported it
    (`ledger.md` rule 6).
-2. After adjudicating each round from the second on, the cap's included, run:
+2. After adjudicating each round from the second on, the cap's included, and
+   before that round's fixes or the next round's reviewers, run:
 
    ```bash
    node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts \
@@ -40,8 +41,9 @@ This file is the step that stops it: count, diagnose, research, replace.
 
 ## 2. Diagnosis
 
-1. Write one file per round holding that round's fix diff
-   (`<notes>/rabbit-hole/round-<N>.diff`); the advisor has no shell.
+1. Write one file per fixed round holding that round's fix diff
+   (`<notes>/rabbit-hole/round-<N>.diff`); the advisor has no shell. The
+   round just adjudicated has no fixes yet: don't patch it to make one.
 2. Dispatch a fresh `advisor`, never one of this close-out's reviewers, and
    never reuse it as a reviewer afterwards: it has seen every finding.
 3. The prompt opens with `VALIDATION dispatch` and carries:

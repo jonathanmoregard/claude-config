@@ -75,7 +75,7 @@ def edit(run, path, old, new, count=0):
 @pytest.mark.parametrize("mode,calls,want", [
     ("fires", [(V, "advisor"), (R, "advisor")], "PASS"),
     ("fires", [("CONSULT dispatch\nq", "advisor"), ("x", "worker-hard"), (V, "advisor")], "PASS"),
-    ("fires", [(R, "Explore", "toolu_1"), (V, "advisor")], "PASS"),  # a subagent's own call
+    ("fires", [(R, "advisor", "toolu_1"), (V, "advisor")], "PASS"),  # a subagent's own call
     ("fires", [("find the ledger", "Explore"), (V, "advisor")], "PASS"),  # not a reviewer
     ("fires", [(R, "advisor"), (V, "advisor")], "FAIL"),
     ("fires", [(R, "general-purpose"), (V, "advisor")], "FAIL"),
