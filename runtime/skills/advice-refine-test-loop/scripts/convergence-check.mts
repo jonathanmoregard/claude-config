@@ -8,8 +8,13 @@
 // any run not named are ignored, so a re-invoked close-out counts its own.
 //
 // c(N) is round N's new defect findings: rows with outcome `reproduced` or
-// `unconfirmed`, except check `reframe`, counted once per `where` (two rows on
-// one file:line in one round are the same finding written twice).
+// `unconfirmed`, except check `reframe`, one per row (ledger.md: one row per
+// finding). Two findings on one `where` are two; only a row repeated verbatim,
+// same `where` and claim, is one finding written twice and counts once.
+//
+// Every row of a named run carries one of ledger.md's outcomes (or `design`,
+// on older rows). Anything else, such as the sweep's `confirmed` or a typo,
+// exits 2 naming the row: it would otherwise drop out of c unseen.
 //
 // `where` must be the finding's verdict-schema file and line, `/abs/path:<int>`,
 // on every row of a named run except `none` and `reframe` rows. Anything else
@@ -26,13 +31,15 @@
 //          file. The reason names the closest pair per file.
 //
 // Exit: 0 hold, 1 fire, 2 input error (usage, unreadable ledger, a repeated
-// run, a run with no rows, a row of a named run without ten fields),
+// run, a run with no rows, a row of a named run without ten fields or with an
+// unknown outcome),
 // 3 a malformed `where` in a named run.
 
 import { readFileSync } from "node:fs";
 import process, { argv, exit, stderr, stdout } from "node:process";
 
 const COUNTED: ReadonlySet<string> = new Set(["reproduced", "unconfirmed"]);
+const OUTCOMES: ReadonlySet<string> = new Set([...COUNTED, "refuted", "advisory", "none", "design"]);
 const NEAR = 50;
 
 interface Finding {
@@ -45,7 +52,7 @@ interface Finding {
 interface Round {
   readonly run: string;
   rows: number;
-  // One entry per distinct `where`.
+  // One entry per finding, keyed by `where` and claim.
   readonly sites: Map<string, Finding>;
 }
 
@@ -85,13 +92,16 @@ function readRounds(ledger: string, runs: readonly string[]): Round[] {
     if (round === undefined) return;
     if (f.length !== 10) die(`${ledger}:${i + 1}: not ten fields`);
     round.rows++;
-    const [, , , check, , where = "", , outcome = ""] = f;
+    const [, , , check, , where = "", claim = "", outcome = ""] = f;
+    if (!OUTCOMES.has(outcome)) {
+      die(`${ledger}:${i + 1}: outcome ${JSON.stringify(outcome)} is not one of ${[...OUTCOMES].join(", ")}`);
+    }
     if (check === "reframe" || outcome === "none") return;
     const finding = parseWhere(where);
     if (finding === null) {
       die(`${ledger}:${i + 1}: where ${JSON.stringify(where)} is not /abs/path:<line>`, 3);
     }
-    if (COUNTED.has(outcome)) round.sites.set(where, finding);
+    if (COUNTED.has(outcome)) round.sites.set(`${where}\t${claim}`, finding);
   });
   for (const round of rounds.values()) {
     if (round.rows === 0) die(`no ledger rows for run ${round.run}`);

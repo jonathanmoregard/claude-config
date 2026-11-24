@@ -8,7 +8,7 @@ inside a field, `-` for an empty field.
 |---|---|---|
 | 1 | date | `YYYY-MM-DD` |
 | 2 | source | `artl` or `sweep` |
-| 3 | run | short commit, then round or lens: `a1b2c3d/r2`, `a1b2c3d/races` |
+| 3 | run | short commit, then round or lens: `a1b2c3d/r2`, `a1b2c3d/races`. Never reused: when the ledger already holds `<commit>/r1` (a close-out re-invoked at the same commit), every round label of this close-out takes the next free letter, `a1b2c3d/r1b`, `e4f5a6b/r2b` |
 | 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a finding raised by a sibling line, `reframe` for a rabbit-hole thread (`rabbit-hole.md`), or a lens name |
 | 5 | trigger | what made the check run: the part of the diff that met its `When`; `always` for A; for a sweep, why it was run |
 | 6 | where | the finding's schema `file` and `line` verbatim, `/abs/path:<int>` (0 = whole file); `-` on a `none` row |

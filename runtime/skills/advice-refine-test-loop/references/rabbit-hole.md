@@ -17,14 +17,16 @@ This file is the step that stops it: count, diagnose, research, replace.
    ```
 
    Pass the run labels of this close-out only, in round order. A re-invoked
-   close-out starts its own count; earlier close-outs' runs are never passed.
+   close-out starts its own count, under labels of its own (`ledger.md`,
+   column 3); earlier close-outs' runs are never passed.
 3. It prints `c` per round, each file with findings in two or more rounds
    (`recur`), and a last line `fire` or `hold` with the reason. Exit 0 hold,
-   1 fire, 2 input error, 3 a finding row of these runs whose `where` is not
-   `/abs/path:<line>` (the row is named). On 2 or 3, fix the arguments or the
-   rows and rerun. Never count by hand instead.
-4. `c(N)` is round N's `reproduced` and `unconfirmed` rows, one per `where`,
-   `reframe` rows excluded. It fires at round N ≥ 2 when `c(N) > 0` and either:
+   1 fire, 2 input error (an outcome not in `ledger.md` is one), 3 a finding
+   row of these runs whose `where` is not `/abs/path:<line>` (the row is
+   named). On 2 or 3, fix the arguments or the rows and rerun. Never count by
+   hand instead.
+4. `c(N)` is round N's `reproduced` and `unconfirmed` rows, one per finding
+   (a row repeated verbatim counts once), `reframe` rows excluded. It fires at round N ≥ 2 when `c(N) > 0` and either:
    1. `c(N) ≥ c(N−1)` (count); or
    2. a round-N finding lies in the same file as a round N−1 finding and
       within 50 lines of it, even while the total shrinks (near). Line 0, the
@@ -49,8 +51,8 @@ This file is the step that stops it: count, diagnose, research, replace.
       each thread: is the code trying to decide something that cannot be
       decided by this kind of mechanism, so every fix opens the next bypass?
       Judge the mechanism, not the individual bugs. A thread is not
-      tractable only if findings in two or more rounds land on code a
-      previous round's fix wrote.";
+      tractable only if it spans two or more rounds and a later round's
+      findings land on code an earlier round's fix wrote.";
    6. the output shape below, as the entire response.
 4. Output: a JSON array, one object per thread:
 

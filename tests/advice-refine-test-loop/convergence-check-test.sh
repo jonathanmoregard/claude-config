@@ -2,8 +2,8 @@
 # Fixture harness for convergence-check.mts. fixtures/convergence-ledger.tsv
 # holds real review-ledger slices, copied verbatim except `where`, rewritten
 # to the verdict-schema form /abs/path:<line> (its first line says how):
-#   afb78c3/r1-r4   grep-over-sed regex grader      c=4,3,3,6
-#   4c469b4..f041646 codex-render text grader       c=4,5,2,3
+#   afb78c3/r1-r4   grep-over-sed regex grader      c=5,3,3,6
+#   4c469b4..f041646 codex-render text grader       c=4,5,2,4
 #   c4726a9..9e1a08a idle toast, converging         c=4,3,1,0
 #   4b4fbf1/r8..2eb6bc1/r10 idle-alarm grader       c=9,6,4, one file each round
 #   e1836c3/r3, be216cc/r3, a8c1e99/r8              outcome mix, other files, none
@@ -70,10 +70,11 @@ run "$LEDGER" 4c469b4/r1
 expect "one round exits 0" 0 "$rc"
 expect "one round holds" hold "$(verdict)"
 
-# design (r3) is not a defect finding; the repeated check.sh:13 (r4) is one
+# design (r3) is not a defect finding; the two check.sh:13 rows (r4) are two
+# findings (a false pass and a false fail), so both count
 run "$LEDGER" 4c469b4/r1 fab7dcc/r2 8e63172/r3 f041646/r4
 has "codex r3 c excludes design" "round 3${T}8e63172/r3${T}c=2"
-has "codex r4 c merges a repeated site" "round 4${T}f041646/r4${T}c=3"
+has "codex r4: two findings on one line count twice" "round 4${T}f041646/r4${T}c=4"
 has "codex recurrence of the grader" "recur${T}$CR${T}1,2,3,4"
 
 # --- rounds are the labels in the order given, not their r-suffix -------
@@ -82,9 +83,9 @@ has "reversed: round 1 is the first label" "round 1${T}fab7dcc/r2${T}c=5"
 has "reversed: round 2 is the second label" "round 2${T}4c469b4/r1${T}c=4"
 lacks "reversed: 4 after 5 is no count fire" '^fire.*count'
 
-# --- grep-over-sed: merged duplicates count once; >= fires on a flat count
+# --- grep-over-sed: one row per finding; >= fires on a flat count --------
 run "$LEDGER" afb78c3/r1 afb78c3/r2
-has "grep r1: the G9 'same as A' row counts once" "round 1${T}afb78c3/r1${T}c=4"
+has "grep r1: a row per finding, the G9 row on A's line included" "round 1${T}afb78c3/r1${T}c=5"
 has "grep r2 c" "round 2${T}afb78c3/r2${T}c=3"
 run "$LEDGER" afb78c3/r2 afb78c3/r3
 expect "flat 3,3 fires" fire "$(verdict)"
@@ -94,8 +95,8 @@ has "grep r4: unconfirmed findings count" "round 4${T}afb78c3/r4${T}c=6"
 
 # --- outcome mix: refuted, advisory and none never count ------------------
 run "$LEDGER" e1836c3/r3
-has "e1836c3: 8 reproduced rows on 6 sites; refuted/advisory/none out" \
-  "round 1${T}e1836c3/r3${T}c=6"
+has "e1836c3: 8 reproduced rows; refuted/advisory/none out" \
+  "round 1${T}e1836c3/r3${T}c=8"
 run "$LEDGER" be216cc/r3
 has "be216cc r3: two advisory rows out" "round 1${T}be216cc/r3${T}c=3"
 
@@ -237,6 +238,44 @@ cp "$LEDGER" "$TMP/other.tsv"
 printf 'not a ledger row\n' >> "$TMP/other.tsv"
 run "$TMP/other.tsv" 4c469b4/r1 fab7dcc/r2
 expect "short row in another run is skipped" 1 "$rc"
+
+# --- every outcome is one of ledger.md's: anything else is an input error --
+# `confirmed` (the sweep's word), a capitalised value or a typo would
+# otherwise drop out of c without a word.
+for bad in confirmed Reproduced reprodcued; do
+  { srow o/r1 $X:1; srow o/r2 $X:2 "$bad"; } > "$TMP/outcome.tsv"
+  run "$TMP/outcome.tsv" o/r1 o/r2
+  expect "outcome $bad: exits 2" 2 "$rc"
+  expect "outcome $bad: prints no verdict" "" "$out"
+  grep -qF "outcome.tsv:2" <<< "$err" || { echo "FAIL: outcome $bad: the row is named"; fails=$((fails + 1)); }
+done
+
+# --- c counts findings, one row each: distinct findings on one `where` ----
+# (a line, or a whole file at :0) are each counted; only a row repeated
+# verbatim (same where and claim) is the same finding written twice.
+crow() { printf '2026-11-24\tartl\t%s\tA\talways\t%s\t%s\treproduced\tyes\t-\n' "$1" "$2" "$3"; }
+{
+  crow d/r1 /a.py:1 "a breaks"
+  crow d/r1 /b.py:1 "b breaks"
+  crow d/r2 /other.py:0 "no header"
+  crow d/r2 /other.py:0 "no license"
+  crow d/r2 /other.py:0 "no license"
+} > "$TMP/same.tsv"
+run "$TMP/same.tsv" d/r1 d/r2
+has "two findings at one where count twice; a verbatim repeat once" "round 2${T}d/r2${T}c=2"
+expect "2 >= 2 across one shared where: fires" fire "$(verdict)"
+
+# --- a close-out re-invoked at the same commit counts only its own rows ----
+# ledger.md column 3: its labels take a letter (S/r1b), never S/r1 again.
+{
+  crow S/r1 /p.py:10 "earlier close-out, left open"
+  crow S/r1 /q.py:10 "earlier close-out, left open too"
+  crow S/r1b /z.py:300 "this close-out"
+  crow T/r2b /z.py:900 "this close-out, round 2"
+} > "$TMP/again.tsv"
+run "$TMP/again.tsv" S/r1b T/r2b
+has "re-invoked: round 1 is its own row only" "round 1${T}S/r1b${T}c=1"
+expect "re-invoked: 1 >= 1 fires on its own count" fire "$(verdict)"
 
 if ((fails)); then
   echo "$fails failure(s)"
