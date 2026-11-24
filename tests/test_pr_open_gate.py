@@ -13,7 +13,8 @@ call itself depend on evidence the parent cannot write through its tools:
     `gh api .../pulls` and mcp__github__create_pull_request unless the change
     is computed-exempt, the latest verdict for the branch passes, the reviewed
     files cover the branch's diff, and the tree has drifted <= 20 lines since.
-    The user typing `skip-artl` (UserPromptSubmit) arms a one-shot override.
+    The user typing `skip-artl <branch>` (UserPromptSubmit) arms a one-shot
+    override for that branch; a bare `skip-artl` arms nothing.
   * PermissionRequest: settings.json puts PR creation on `permissions.ask`, so
     a gate that times out degrades to a prompt. A hook `allow` does NOT lift an
     ask rule (measured, 2.1.322), so the gate mints a one-shot grant and the
@@ -845,6 +846,7 @@ def test_unnamed_override_file_waives_nothing(sb):
     (sb.state / "override").mkdir(parents=True, exist_ok=True)
     (sb.state / "override" / "s1.json").write_text(json.dumps({"ts": time.time()}))
     assert is_deny(sb.gate())
+    assert (sb.state / "override" / "s1.json").exists()
 
 
 def test_skip_artl_must_be_the_token(sb):

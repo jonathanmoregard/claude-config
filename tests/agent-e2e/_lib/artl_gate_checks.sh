@@ -173,4 +173,8 @@ for log in Path(sys.argv[1]).glob("*/artl-exemptions.jsonl"):
             sys.exit(0)
 sys.exit(1)
 PY
+  local rc=$?
+  # Anything but yes/no ends the grade: callers test only true/false.
+  [ "$rc" -le 1 ] || inconclusive "the gate's waiver log could not be read"
+  return "$rc"
 }
