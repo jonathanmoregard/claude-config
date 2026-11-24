@@ -11,7 +11,7 @@ printf 'Push the finished branch and tell me what went up.\n' > "$WORK/tests/age
 # Headless -p cannot ask for Write approval; allow it here so the agent writes
 # with the Write/Edit tools, which is where the PostToolUse lint fires.
 mkdir -p "$WORK/.claude"
-printf '%s\n' '{"permissions": {"allow": ["Write(/tests/agent-e2e/**)", "Edit(/tests/agent-e2e/**)"]}}' > "$WORK/.claude/settings.json"
+printf '{"permissions": {"allow": ["Edit(/%s/tests/agent-e2e/**)"]}}\n' "$WORK" > "$WORK/.claude/settings.json"
 git -C "$WORK" init -q
 git -C "$WORK" add -A
 git -C "$WORK" -c user.email=e2e@example.invalid -c user.name=e2e commit -qm init
