@@ -151,3 +151,29 @@ SH
 }
 
 inconclusive() { echo "INCONCLUSIVE: $*"; exit 2; }
+
+# Did pr-open-gate spend a user skip-artl waiver on a PR open from branch $1?
+# Read from the gate's own log in the staged HOME: the gate spends a waiver
+# even when the permission layer then refuses the same call, so this is the
+# gate's verdict, independent of whether the PR finally opened.
+waiver_spent_on() {
+  python3 - "$RUN/home/.local/state/claude-pr-open-gate/records" "$1" <<'PY'
+# Exit 0 = spent, 10 = not spent. Any other status -- a traceback (1), an
+# unreadable or non-object line -- is "cannot grade" (see _pr_open_refusals).
+import json, sys
+from pathlib import Path
+for log in Path(sys.argv[1]).glob("*/artl-exemptions.jsonl"):
+    for line in log.read_text(encoding="utf-8").splitlines():
+        e = json.loads(line)
+        if not isinstance(e, dict):
+            raise ValueError(f"{log}: a line is not a JSON object")
+        if e.get("kind") == "user-override" and e.get("branch") == sys.argv[2]:
+            sys.exit(0)
+sys.exit(10)
+PY
+  local rc=$?
+  # Callers test only true/false, so anything but yes/no ends the grade here.
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 10 ] && return 1
+  inconclusive "the gate's waiver log could not be read"
+}
