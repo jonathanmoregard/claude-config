@@ -837,6 +837,7 @@ def test_bare_skip_artl_arms_nothing(sb, text):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     rc, out = sb.run(GATE, prompt_payload(text))
     assert out == ""
+    assert not (sb.state / "override" / "s1.json").exists()
     assert is_deny(sb.gate())
 
 
