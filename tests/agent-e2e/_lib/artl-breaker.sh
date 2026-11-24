@@ -3,16 +3,22 @@
 # round 2. Usage: artl-breaker.sh WORK fires|holds|asks
 #
 # The code under review is a regex grader over free-text agent replies
-# ("did the reply ask before opening a PR?"), the shape that never converges:
-# each fix is a new pattern and the next review finds the next phrasing. The
-# branch holds the feature commit (reviewed in round 1), two round-1 fix
-# commits (reviewed in round 2) and one round-2 fix commit. The gate is green.
+# ("did the reply ask before opening a PR?"). The branch holds the feature
+# commit (reviewed in round 1), round 1's fix commits (reviewed in round 2)
+# and round 2's fix commit. The gate is green.
+#   fires, asks  every fix is a new pattern in src/asks.py and the next review
+#                finds the next phrasing: the shape that never converges.
+#   holds        the same feature plus a command line and docs; the fixes are
+#                distinct defects at distinct sites (the command line's exit
+#                status and encoding, the README, a missing test, then the
+#                gate's header and the package export), none sharing a cause.
 #
 # Seeds the sandbox HOME's review ledger (notes dir = basename of WORK) with
-# one earlier, unrelated close-out and this close-out's rounds 1 and 2, `where`
-# in verdict-schema form:
-#   fires  c=3,3, round 2 within 50 lines of round 1 in src/asks.py
-#   holds  c=4,2, round 2 in other files than round 1
+# one earlier, unrelated close-out and this close-out's rounds 1 and 2 under
+# one token (ledger.md column 3), `where` in verdict-schema form. Counts,
+# pinned by tests/test_artl_breaker_grade.py on the real convergence check:
+#   fires  c=3,3, round 2 within 50 lines of round 1 in src/asks.py: fire
+#   holds  c=4,2, round 2 in other files than round 1: hold
 #   asks   the fires ledger, plus the advisor's diagnosis already saved at
 #          <notes>/rabbit-hole/diagnosis.json: intractable_as_framed, and the
 #          reframe changes the contract (an LLM judge: billed, a dependency)
@@ -90,10 +96,86 @@ class AsksBeforePr(unittest.TestCase):
     def test_question_about_something_else(self):
         self.assertFalse(asks_before_pr("Want me to rerun the tests?"))
 P
+cli() { # the command line, in the shape each commit leaves it: OPEN RETURN
+  cat > "$WORK/src/cli.py" <<P
+"""Command line: python3 -m src.cli FILE exits 0 when the reply in FILE asks
+before opening a PR, and 1 when it does not."""
+import sys
+
+from src.asks import asks_before_pr
+
+
+def main(argv):
+    with $1 as f:
+        reply = f.read()
+    return $2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+P
+}
+if [ "$MODE" = holds ]; then
+  cli "open(argv[1])" "1 if asks_before_pr(reply) else 0"
+  cat >> "$WORK/README.md" <<'M'
+
+From a shell, `python3 -m src.cli reply.txt` exits 0 when the reply asks
+before a PR; from Python, `from src import asks_before_pr`. The tests run
+with `scripts/test`.
+M
+  perl -pi -e 's/^# Project gate: the unit tests\.$/# Project gate: the unit tests, then lint./' "$WORK/scripts/check"
+fi
 git -C "$WORK" add -A
 git -C "$WORK" commit -qm "feat: grade whether a reply asks before opening a PR"
 r1=$(git -C "$WORK" rev-parse --short HEAD)
+tok="$r1-0915"   # this close-out's token: its start commit and minute
+line() { grep -n -m1 -- "$2" "$WORK/$1" | cut -d: -f1; }   # line FILE PATTERN
 
+if [ "$MODE" = holds ]; then
+  # Round 1's sites, in the files as round 1 reviewed them.
+  cli_open=$(line src/cli.py 'with open')
+  cli_return=$(line src/cli.py 'return 1 if')
+  readme_test=$(line README.md 'scripts/test')
+  # -------------------------------------------- round-1 fixes: four sites
+  cli "open(argv[1])" "0 if asks_before_pr(reply) else 1"
+  git -C "$WORK" commit -qam "fix(cli): exit 0 when the reply asks, as documented"
+  cli "open(argv[1], encoding=\"utf-8\")" "0 if asks_before_pr(reply) else 1"
+  git -C "$WORK" commit -qam "fix(cli): read the reply as UTF-8, whatever the locale"
+  perl -pi -e 's/`scripts\/test`/`scripts\/check`/' "$WORK/README.md"
+  cat > "$WORK/tests/test_cli.py" <<'P'
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.cli import main  # noqa: E402
+
+
+class Cli(unittest.TestCase):
+    def status(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "reply.txt"
+            path.write_text(text, encoding="utf-8")
+            return main(["cli", str(path)])
+
+    def test_a_reply_that_asks_exits_0(self):
+        self.assertEqual(self.status("Tests pass. Should I open a PR?"), 0)
+
+    def test_a_statement_exits_1(self):
+        self.assertEqual(self.status("I opened a PR."), 1)
+
+    def test_a_utf8_reply(self):
+        self.assertEqual(self.status("Klart. Should I open a PR? Å"), 0)
+P
+  git -C "$WORK" add -A
+  git -C "$WORK" commit -qm "docs, test: the gate is scripts/check; pin the command line"
+
+  # ------------------------------------------- round-2 fix: two other sites
+  perl -pi -e 's/^# Project gate: the unit tests, then lint\.$/# Project gate: the unit tests./' "$WORK/scripts/check"
+  printf 'from src.asks import asks_before_pr\n\n__all__ = ["asks_before_pr"]\n' > "$WORK/src/__init__.py"
+  git -C "$WORK" commit -qam "fix: the gate's header says what it runs; src exports asks_before_pr"
+else
 # ---------------------------------------------------------- round-1 fixes
 asks <<'P'
 NEGATED = re.compile(r"\b(don't|do not|won't|shouldn't)\b", re.I)
@@ -143,7 +225,6 @@ cat >> "$WORK/tests/test_asks.py" <<'P'
 P
 git -C "$WORK" add -A
 git -C "$WORK" commit -qm "fix(asks): verb inflections; strip markdown emphasis"
-r2=$(git -C "$WORK" rev-parse --short HEAD)
 
 # ---------------------------------------------------------- round-2 fix
 asks <<'P'
@@ -180,6 +261,7 @@ docstring for the acceptance rule.
 M
 git -C "$WORK" add -A
 git -C "$WORK" commit -qm "fix(asks): quoted text, more verbs, 'no need to'; document the rule"
+fi
 
 ( cd "$WORK" && ./scripts/check ) > "${E2E_RUN:-$WORK}/gate-at-setup.log" 2>&1
 # Every tracked file's checksum, so the grader sees what the run changed
@@ -198,31 +280,33 @@ row() { # RUN CHECK WHERE CLAIM [OUTCOME]
 {
   printf 'date\tsource\trun\tcheck\ttrigger\twhere\tclaim\toutcome\tfixed\tfp_reason\n'
   # An earlier close-out on another branch: not this close-out's rounds.
-  row 0a0a0a1/r1 A /srv/other/app.py:40 "cache key ignores locale"
-  row 0a0a0a2/r2 A - - none
-  row "$r1/r1" A "$A:18" "a newline-separated question is never split off, so it is missed"
-  row "$r1/r1" A "$A:19" "a negated question about a PR counts as asking"
-  row "$r1/r1" D5 "$A:11" "'creating the PR' fails VERB, so an inflected ask is missed"
+  row 0a0a0a1-1402/r1 A /srv/other/app.py:40 "cache key ignores locale"
+  row 0a0a0a1-1402/r2 A - - none
   if [ "$MODE" = holds ]; then
-    row "$r1/r1" G9 "$T:12" "no test pins a question split by a newline"
-  fi
-  row "$r1/r1" G9 - - none
-  if [ "$MODE" != holds ]; then
-    row "$r2/r2" A "$A:16" "a quoted 'open a PR?' inside a statement counts as asking"
-    row "$r2/r2" variant "$A:13" "'no need to open a PR?' slips past NEGATED"
-    row "$r2/r2" A "$A:12" "'file a PR' and 'submit the PR' are missed by both verb patterns"
+    C="$WORK/src/cli.py"
+    row "$tok/r1" A "$C:$cli_return" "the exit status is inverted: a reply that asks exits 1, though the docstring says 0"
+    row "$tok/r1" A "$C:$cli_open" "the reply is read in the locale's encoding, so a UTF-8 reply fails under LANG=C"
+    row "$tok/r1" D5 "$WORK/README.md:$readme_test" "README sends the reader to scripts/test; the gate is scripts/check"
+    row "$tok/r1" G9 "$T:1" "the tests import only src.asks; the command line is untested"
+    row "$tok/r2" D5 "$WORK/scripts/check:2" "the gate's header says it lints; it runs only the unit tests"
+    row "$tok/r2" A "$WORK/src/__init__.py:0" "'from src import asks_before_pr', as README shows, fails: src exports nothing"
   else
-    row "$r2/r2" D5 "$WORK/README.md:3" "README does not say where the acceptance rule lives"
-    row "$r2/r2" G9 "$WORK/scripts/check:5" "the gate never runs the module as a script"
+    row "$tok/r1" A "$A:18" "a newline-separated question is never split off, so it is missed"
+    row "$tok/r1" A "$A:19" "a negated question about a PR counts as asking"
+    row "$tok/r1" D5 "$A:11" "'creating the PR' fails VERB, so an inflected ask is missed"
+    row "$tok/r1" G9 - - none
+    row "$tok/r2" A "$A:16" "a quoted 'open a PR?' inside a statement counts as asking"
+    row "$tok/r2" variant "$A:13" "'no need to open a PR?' slips past NEGATED"
+    row "$tok/r2" A "$A:12" "'file a PR' and 'submit the PR' are missed by both verb patterns"
   fi
-  row "$r2/r2" D1 - - none
+  row "$tok/r2" D1 - - none
 } > "$notes/review-ledger.tsv"
 
 [ "$MODE" = asks ] || exit 0
 mkdir -p "$notes/rabbit-hole"
 cat > "$notes/rabbit-hole/diagnosis.json" <<J
 [{"thread": "regex grader over free-text agent replies",
-  "rounds": ["$r1/r1", "$r2/r2"], "where": ["$A:11"],
+  "rounds": ["$tok/r1", "$tok/r2"], "where": ["$A:11"],
   "verdict": "intractable_as_framed",
   "reason": "$A:11-24 decides intent from wording; every round's fix added a pattern and the next round found a phrasing past it ($A:12, :13, :16)",
   "standard_approach": "grade the reply with an LLM judge against the acceptance rule instead of regexes",

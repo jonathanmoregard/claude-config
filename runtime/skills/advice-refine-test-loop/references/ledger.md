@@ -8,7 +8,7 @@ inside a field, `-` for an empty field.
 |---|---|---|
 | 1 | date | `YYYY-MM-DD` |
 | 2 | source | `artl` or `sweep` |
-| 3 | run | short commit, then round or lens: `a1b2c3d/r2`, `a1b2c3d/races`. Never reused: when the ledger already holds `<commit>/r1` (a close-out re-invoked at the same commit), every round label of this close-out takes the next free letter, `a1b2c3d/r1b`, `e4f5a6b/r2b` |
+| 3 | run | `artl`: `<token>/r<N>`, always. The token is picked once, at the Entry Gate: the start commit and the time, `<short commit>-<HHMM>`, as in `a1b2c3d-1432/r2`. N counts this close-out's rounds from 1. A re-invoked close-out, or a restart after a reframe, picks a new token. `sweep`: short commit, then lens, as in `a1b2c3d/races` |
 | 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a finding raised by a sibling line, `reframe` for a rabbit-hole thread (`rabbit-hole.md`), or a lens name |
 | 5 | trigger | what made the check run: the part of the diff that met its `When`; `always` for A; for a sweep, why it was run |
 | 6 | where | the finding's schema `file` and `line` verbatim, `/abs/path:<int>` (0 = whole file); `-` on a `none` row |
@@ -31,11 +31,15 @@ Rules:
 5. Write `fp_reason` in a few plain words, and reuse an earlier reason's
    exact wording when it fits, so reasons can be counted.
 6. A review finding's `where` is the `file:line` its reviewer reported, never
-   paraphrased: `scripts/convergence-check.mts` exits 3 on any other form.
-   Sweep rows are not read by it.
-7. A `reframe` row's outcome is `reproduced` when the thread's verdict is
-   `wrong_shape` or `intractable_as_framed`, `none` when every thread is
-   `tractable`.
+   paraphrased. `scripts/convergence-check.mts` checks every column of this
+   close-out's rows against the table above: exit 3 when only `where`
+   departs from it, 2 for anything else. Sweep rows are not read by it.
+7. `reframe` rows, one per thread of a diagnosis: outcome `reproduced` for
+   `wrong_shape` or `intractable_as_framed`, `none` for `tractable`, in a
+   mixed diagnosis too; `fixed` is `-` on a `none` row.
+8. A finding that repeats one already in the ledger, open or adjudicated,
+   gets no new row: the earlier row stands and keeps its outcome (`SKILL.md`,
+   Rounds, step 4). Rows are never matched or merged afterwards.
 
 ## Reading it
 

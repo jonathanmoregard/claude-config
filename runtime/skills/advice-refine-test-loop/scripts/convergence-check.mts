@@ -1,24 +1,33 @@
 // Rabbit-hole trigger for advice-refine-test-loop (../references/rabbit-hole.md).
 //
-// Usage: node convergence-check.mts <ledger.tsv> <run>...
+// Usage: node convergence-check.mts <ledger.tsv> <token>/r1 ... <token>/rN
 //
-// Each <run> is one round of THIS close-out, as written in the ledger's run
-// column (../references/ledger.md), in round order: round 1's label first.
-// Rounds are numbered by that order, never by a label's r-suffix, and rows of
-// any run not named are ignored, so a re-invoked close-out counts its own.
+// The labels are this close-out's rounds as the ledger's run column holds them
+// (../references/ledger.md, column 3): one token, `<commit>-<HHMM>`, picked
+// once at the Entry Gate, then r1..rN in order. Anything else exits 2: two
+// tokens, a gap, a round out of place, a token without its minute. Rows of any
+// other run are ignored, so a re-invoked close-out, under its own token, counts
+// its own rounds.
+//
+// Every row of a named run is checked against ledger.md's ten columns in one
+// pass, and every problem is listed on stderr (`<ledger>:<line>: ...`) before
+// the exit: 3 when the only problems are in `where`, 2 otherwise.
+//   date       YYYY-MM-DD
+//   source     artl
+//   check      A, a class id (D3, G12), variant or reframe
+//   trigger    set
+//   where      /abs/path:<int> (0 = whole file); `-` on a none row; set on a
+//              reframe row (copied from its thread, not parsed)
+//   claim      set
+//   outcome    reproduced, unconfirmed, refuted, advisory or none
+//   fixed      yes, no, deferred, open or -
+//   fp_reason  set on a refuted row, `-` on any other
 //
 // c(N) is round N's new defect findings: rows with outcome `reproduced` or
-// `unconfirmed`, except check `reframe`, one per row (ledger.md: one row per
-// finding). Two findings on one `where` are two; only a row repeated verbatim,
-// same `where` and claim, is one finding written twice and counts once.
-//
-// Every row of a named run carries one of ledger.md's outcomes (or `design`,
-// on older rows). Anything else, such as the sweep's `confirmed` or a typo,
-// exits 2 naming the row: it would otherwise drop out of c unseen.
-//
-// `where` must be the finding's verdict-schema file and line, `/abs/path:<int>`,
-// on every row of a named run except `none` and `reframe` rows. Anything else
-// exits 3 naming the row, with no verdict. Line 0 is a whole-file finding.
+// `unconfirmed`, except check `reframe`, one per row. Two findings on one
+// `where` are two; only a row repeated verbatim, same `where` and claim, counts
+// once. A re-report of an earlier finding gets no row at all (ledger.md rule
+// 8), so nothing here matches findings by meaning.
 //
 // Output, tab-separated:
 //   round <N> <run> c=<c>    one line per round
@@ -30,16 +39,19 @@
 //          and within 50 lines of it; a line-0 finding matches its whole
 //          file. The reason names the closest pair per file.
 //
-// Exit: 0 hold, 1 fire, 2 input error (usage, unreadable ledger, a repeated
-// run, a run with no rows, a row of a named run without ten fields or with an
-// unknown outcome),
-// 3 a malformed `where` in a named run.
+// Exit: 0 hold, 1 fire, 2 input error (usage, unreadable ledger, the labels,
+// a run with no rows, a row of a named run without ten fields or with a bad
+// column), 3 a malformed `where` and nothing else wrong.
 
 import { readFileSync } from "node:fs";
 import process, { argv, exit, stderr, stdout } from "node:process";
 
 const COUNTED: ReadonlySet<string> = new Set(["reproduced", "unconfirmed"]);
-const OUTCOMES: ReadonlySet<string> = new Set([...COUNTED, "refuted", "advisory", "none", "design"]);
+const OUTCOMES: ReadonlySet<string> = new Set([...COUNTED, "refuted", "advisory", "none"]);
+const FIXED: ReadonlySet<string> = new Set(["yes", "no", "deferred", "open", "-"]);
+const LABEL = /^([0-9a-f]{7,40}-\d{4})\/r([1-9]\d*)$/;
+const CHECK = /^(A|[A-Z]\d+|variant|reframe)$/;
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const NEAR = 50;
 
 interface Finding {
@@ -62,8 +74,13 @@ interface Pair {
   readonly apart: number | null;
 }
 
-function die(message: string, code = 2): never {
-  stderr.write(`convergence-check: ${message}\n`);
+interface Problem {
+  readonly column: string;
+  readonly text: string;
+}
+
+function die(lines: readonly string[], code = 2): never {
+  stderr.write(lines.map((l) => `convergence-check: ${l}\n`).join(""));
   exit(code);
 }
 
@@ -73,38 +90,81 @@ function parseWhere(where: string): Finding | null {
   return { where, file: m[1], line: Number(m[2]) };
 }
 
-function readRounds(ledger: string, runs: readonly string[]): Round[] {
-  const rounds = new Map<string, Round>();
-  for (const run of runs) {
-    if (rounds.has(run)) die(`run ${run} given twice`);
-    rounds.set(run, { run, rows: 0, sites: new Map() });
+function checkLabels(runs: readonly string[]): void {
+  const problems: string[] = [];
+  let token: string | undefined;
+  runs.forEach((run, i) => {
+    const m = LABEL.exec(run);
+    if (m === null || m[1] === undefined) {
+      problems.push(`${run}: not <commit>-<HHMM>/r<N> (ledger.md, column 3)`);
+      return;
+    }
+    token ??= m[1];
+    if (m[1] !== token) problems.push(`${run}: token ${m[1]} is not ${token}; one close-out, one token`);
+    if (Number(m[2]) !== i + 1) problems.push(`${run}: given as round ${i + 1}; pass r1..rN in order`);
+  });
+  if (problems.length > 0) die(problems);
+}
+
+function rowProblems(f: readonly string[]): Problem[] {
+  const [date = "", source = "", , check = "", trigger = "", where = "", claim = "", outcome = "",
+    fixed = "", fp = ""] = f;
+  const out: Problem[] = [];
+  const bad = (column: string, value: string, want: string): void => {
+    out.push({ column, text: `${column} ${JSON.stringify(value)} is not ${want}` });
+  };
+  if (!DATE.test(date)) bad("date", date, "YYYY-MM-DD");
+  if (source !== "artl") bad("source", source, "artl");
+  if (!CHECK.test(check)) bad("check", check, "A, a class id, variant or reframe");
+  if (trigger === "") bad("trigger", trigger, "set");
+  if (claim === "") bad("claim", claim, "set");
+  if (!OUTCOMES.has(outcome)) bad("outcome", outcome, `one of ${[...OUTCOMES].join(", ")}`);
+  if (!FIXED.has(fixed)) bad("fixed", fixed, `one of ${[...FIXED].join(", ")}`);
+  if (outcome === "refuted" && (fp === "" || fp === "-")) bad("fp_reason", fp, "a reason, on a refuted row");
+  if (outcome !== "refuted" && fp !== "-") bad("fp_reason", fp, "-, on a row that is not refuted");
+  if (check === "reframe") {
+    if (where === "") bad("where", where, "set");
+  } else if (outcome === "none") {
+    if (where !== "-") bad("where", where, "-, on a none row");
+  } else if (parseWhere(where) === null) {
+    bad("where", where, "/abs/path:<line>");
   }
+  return out;
+}
+
+function readRounds(ledger: string, runs: readonly string[]): Round[] {
+  const rounds = new Map<string, Round>(runs.map((run) => [run, { run, rows: 0, sites: new Map() }]));
   let text: string;
   try {
     text = readFileSync(ledger, "utf8");
   } catch (e) {
-    die(`cannot read ${ledger}: ${e instanceof Error ? e.message : String(e)}`);
+    die([`cannot read ${ledger}: ${e instanceof Error ? e.message : String(e)}`]);
   }
+  const problems: Problem[] = [];
   text.split("\n").forEach((line, i) => {
     if (line === "") return;
     const f = line.split("\t");
     const round = rounds.get(f[2] ?? "");
     if (round === undefined) return;
-    if (f.length !== 10) die(`${ledger}:${i + 1}: not ten fields`);
     round.rows++;
+    const at = `${ledger}:${i + 1}`;
+    if (f.length !== 10) {
+      problems.push({ column: "row", text: `${at}: not ten fields` });
+      return;
+    }
+    const found = rowProblems(f);
+    problems.push(...found.map((p) => ({ column: p.column, text: `${at}: ${p.text}` })));
     const [, , , check, , where = "", claim = "", outcome = ""] = f;
-    if (!OUTCOMES.has(outcome)) {
-      die(`${ledger}:${i + 1}: outcome ${JSON.stringify(outcome)} is not one of ${[...OUTCOMES].join(", ")}`);
-    }
-    if (check === "reframe" || outcome === "none") return;
     const finding = parseWhere(where);
-    if (finding === null) {
-      die(`${ledger}:${i + 1}: where ${JSON.stringify(where)} is not /abs/path:<line>`, 3);
+    if (found.length === 0 && check !== "reframe" && COUNTED.has(outcome) && finding !== null) {
+      round.sites.set(`${where}\t${claim}`, finding);
     }
-    if (COUNTED.has(outcome)) round.sites.set(`${where}\t${claim}`, finding);
   });
+  if (problems.length > 0) {
+    die(problems.map((p) => p.text), problems.every((p) => p.column === "where") ? 3 : 2);
+  }
   for (const round of rounds.values()) {
-    if (round.rows === 0) die(`no ledger rows for run ${round.run}`);
+    if (round.rows === 0) die([`no ledger rows for run ${round.run}`]);
   }
   return [...rounds.values()];
 }
@@ -130,8 +190,9 @@ function nearPairs(now: Round, before: Round): Pair[] {
 function main(args: readonly string[]): number {
   const [ledger, ...runs] = args;
   if (ledger === undefined || runs.length === 0) {
-    die("usage: convergence-check.mts <ledger.tsv> <run>...");
+    die(["usage: convergence-check.mts <ledger.tsv> <token>/r1 ... <token>/rN"]);
   }
+  checkLabels(runs);
   const rounds = readRounds(ledger, runs);
   const out: string[] = rounds.map((r, i) => `round ${i + 1}\t${r.run}\tc=${r.sites.size}`);
 

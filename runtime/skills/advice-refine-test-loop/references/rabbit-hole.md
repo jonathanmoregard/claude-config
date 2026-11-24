@@ -13,17 +13,18 @@ This file is the step that stops it: count, diagnose, research, replace.
 
    ```bash
    node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts \
-     <notes>/review-ledger.tsv <run of round 1> <run of round 2> ...
+     <notes>/review-ledger.tsv <token>/r1 <token>/r2 ...
    ```
 
-   Pass the run labels of this close-out only, in round order. A re-invoked
-   close-out starts its own count, under labels of its own (`ledger.md`,
-   column 3); earlier close-outs' runs are never passed.
+   Pass this close-out's labels, r1 up to the last round, in order
+   (`ledger.md`, column 3). A re-invoked close-out has its own token, so
+   earlier close-outs' rounds are never passed.
 3. It prints `c` per round, each file with findings in two or more rounds
    (`recur`), and a last line `fire` or `hold` with the reason. Exit 0 hold,
-   1 fire, 2 input error (an outcome not in `ledger.md` is one), 3 a finding
-   row of these runs whose `where` is not `/abs/path:<line>` (the row is
-   named). On 2 or 3, fix the arguments or the rows and rerun. Never count by
+   1 fire, 2 input error (labels that are not one token's r1..rN in order, or
+   a row that departs from `ledger.md` in any column), 3 a finding row whose
+   `where` is not `/abs/path:<line>` and nothing else wrong. Every bad row is
+   named. On 2 or 3, fix the arguments or the rows and rerun. Never count by
    hand instead.
 4. `c(N)` is round N's `reproduced` and `unconfirmed` rows, one per finding
    (a row repeated verbatim counts once), `reframe` rows excluded. It fires at round N ≥ 2 when `c(N) > 0` and either:
@@ -69,7 +70,8 @@ This file is the step that stops it: count, diagnose, research, replace.
 5. `wrong_shape`: solvable, but only structurally (one choke point instead
    of patched call sites). It takes the same path as `intractable_as_framed`.
 6. `tractable` threads keep their fixes and the loop continues unchanged.
-   Mixed verdicts: reframe only the flagged threads.
+   Mixed verdicts: reframe only the flagged threads; the tractable ones go
+   on through the rounds as before (their ledger rows: section 7).
 
 ## 3. Research
 
@@ -113,12 +115,14 @@ This file is the step that stops it: count, diagnose, research, replace.
 3. This overrides "the reproducer stays" only for reproducers of removed
    code.
 4. "Document the limit and stop patching" is a valid outcome. Close the
-   thread's remaining rows `fixed=no` with that reason.
+   thread's remaining rows `fixed=no`; the reason is in the `reframe` row's
+   claim.
 
 ## 6. Bounds and restart
 
-1. After a reframe, run the Entry Gate again. The round count restarts at 1
-   with a fresh cap of four, and the check reads only the new rounds' runs.
+1. After a reframe, run the Entry Gate again and pick a new token
+   (`ledger.md`, column 3). The round count restarts at 1 with a fresh cap
+   of four, and the check reads only the new token's rounds.
 2. At most one reframe per close-out. If the check fires again after it,
    stop with "not converged after reframe"; the user decides.
 3. A diagnosis that comes back all `tractable` leaves the count alone. At
@@ -130,7 +134,8 @@ One row per thread, in the ten columns of `ledger.md`:
 
 1. check `reframe`; trigger the counts, such as `c=3,3`; where the
    thread's first site, copied from its finding row; claim the verdict plus
-   the approach. The script neither counts nor parses `reframe` rows.
+   the approach. The script does not count `reframe` rows or parse their
+   `where`.
 2. outcome `reproduced` for `wrong_shape` or `intractable_as_framed`, `none`
-   when every thread is `tractable`.
-3. fixed `yes`, `no` or `open`.
+   for `tractable`, in a mixed diagnosis too.
+3. fixed `yes`, `no` or `open`; `-` on a `none` row.
