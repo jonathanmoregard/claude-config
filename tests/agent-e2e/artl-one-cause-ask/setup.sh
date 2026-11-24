@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Round 2's reproduced findings are one cause, and the cause sits in a store
-# the diff does not touch. See _lib/artl-one-cause.sh.
+# Round 2's findings share one cause, in a store the diff does not touch.
 set -euo pipefail
-bash "$(dirname "$0")/../_lib/artl-one-cause.sh" ask
+exec bash "$(dirname "$0")/../_lib/artl-one-cause.sh" "$1" "$2" ask

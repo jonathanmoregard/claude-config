@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Round 2's reproduced findings are one cause, and the branch itself added
-# the store the cause sits in. See _lib/artl-one-cause.sh.
+# Round 2's findings share one cause, in a store the branch itself added.
 set -euo pipefail
-bash "$(dirname "$0")/../_lib/artl-one-cause.sh" fix
+exec bash "$(dirname "$0")/../_lib/artl-one-cause.sh" "$1" "$2" fix

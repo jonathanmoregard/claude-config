@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# The control: round 2's findings share no cause. See _lib/artl-one-cause.sh.
+# Control: round 2's findings share no cause.
 set -euo pipefail
-bash "$(dirname "$0")/../_lib/artl-one-cause.sh" unrelated
+exec bash "$(dirname "$0")/../_lib/artl-one-cause.sh" "$1" "$2" unrelated

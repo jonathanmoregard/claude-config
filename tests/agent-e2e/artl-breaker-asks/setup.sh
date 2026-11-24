@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The breaker already fired and the advisor's diagnosis is saved: the reframe
-# it proposes changes the contract (an LLM judge, billed, a new dependency).
+# The check fired and the advisor's diagnosis is saved; its reframe (an LLM
+# judge: billed, a new dependency) changes the contract.
 set -euo pipefail
-bash "$(dirname "$0")/../_lib/artl-breaker.sh" "${E2E_WORK:?}" asks
+exec bash "$(dirname "$0")/../_lib/artl-breaker.sh" "$1" "$2" asks

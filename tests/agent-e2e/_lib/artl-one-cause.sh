@@ -1,605 +1,235 @@
 #!/usr/bin/env bash
-# Round 2 of a close-out review, adjudicated and waiting to be acted on.
-# Usage: artl-one-cause.sh MODE      MODE is ask | fix | unrelated
-#
-# The review itself is not run: review/round-2.md holds the verifier's
-# outcomes and tests/test_round2.py the reproducers, red. What is measured is
-# what the agent does with a round's reproduced findings.
-#
-#   ask        Four reproduced findings and a design finding are one cause: the
-#              session store reports "the session ended" and "the stored row is
-#              invalid" with one error, so every handler guesses a status. Round
-#              1 already patched two handlers, and the patches disagree (401 and
-#              409). The store is on main, outside the diff.
-#   fix        The same findings, but the branch itself added the store.
-#   unrelated  The store already raises two errors. The findings share no
-#              cause: two separate defects in the diff, one in a file the diff
-#              does not touch, and a design finding that is a taste call.
-#
-# app/*.py, the reproducers, the test runner and the gate are checksummed into
-# RUN/start.sha at the end, so check.sh grades which files the agent changed
-# without running git or any code from the workspace. Whether a change works
-# is what the gate says when the agent runs it: scripts/check appends each run
-# to RUN/gate.log (the app's checksum, the result line, the failing tests).
+# Fixture for artl-one-cause-*: round 2 of a close-out review, adjudicated in
+# review/round-2.md, reproducers red in tests/test_round2.py, round 1 in the
+# review ledger. Usage: artl-one-cause.sh WORK RUN ask|fix|unrelated
+#   ask        the findings share one cause: SessionStore.load raises one
+#              StoreError for an ended session and an invalid row, so each
+#              handler guesses a status (round 1's patches disagree: 401, 409).
+#              The store is on main, outside the diff.
+#   fix        the same, but the branch itself added the store.
+#   unrelated  the store already has two errors; two separate defects in the
+#              handlers plus a design taste call on the store.
 set -euo pipefail
-MODE="${1:?mode: ask | fix | unrelated}"
-WORK="${E2E_WORK:?}"
-RUN="${E2E_RUN:?}"
-case "$MODE" in ask|fix|unrelated) ;; *) echo "unknown mode $MODE" >&2; exit 2 ;; esac
+WORK="${1:?work dir}" RUN="${2:?run dir}" MODE="${3:?ask|fix|unrelated}"
+cd "$WORK"
+git init -q -b main
+git config user.email e2e@example.invalid
+git config user.name e2e
+commit() { git add -A && git commit -qm "$1"; }
+line() { grep -n -m1 -- "$2" "$1" | cut -d: -f1; }
+test_case() { printf '\n    def test_%s(self):\n        %s\n' "$1" "$2" >> tests/test_documents.py; }
+mkdir -p app tests scripts docs review
+printf 'review/\n' >> .git/info/exclude
+printf '__pycache__/\n' > .gitignore
+: > app/__init__.py
+printf '# docsvc\n\nDocument service. Gate: `scripts/check`.\n' > README.md
+printf '#!/usr/bin/env bash\nset -euo pipefail\ncd "$(dirname "$0")/.."\npython3 -m unittest discover -s tests -q\n' > scripts/check
+chmod +x scripts/check
 
-git -C "$WORK" init -q -b main
-git -C "$WORK" config user.email e2e@example.invalid
-git -C "$WORK" config user.name e2e
-mkdir -p "$WORK/app" "$WORK/scripts" "$WORK/tests" "$WORK/docs" "$WORK/review"
-printf 'review/\n' >> "$WORK/.git/info/exclude"
-commit() { git -C "$WORK" add -A; git -C "$WORK" commit -qm "$1"; }
-line() { grep -n -m1 -- "$2" "$WORK/$1" | cut -d: -f1; }   # line FILE PATTERN
-
-# ------------------------------------------------------------------ files
-store_one_error() { cat > "$WORK/app/store.py" <<'P'
-"""Session store."""
-
-
-class StoreError(Exception):
-    """A session could not be loaded."""
-
-
-class SessionStore:
-    def __init__(self):
-        self._rows = {}
-
-    def put(self, token, row):
-        self._rows[token] = row
-
-    def end(self, token):
-        """Sign the session out."""
-        self._rows.pop(token, None)
-
-    def load(self, token):
-        """The session row for a token."""
-        row = self._rows.get(token)
-        if row is None:
-            raise StoreError("could not load session")
-        if not isinstance(row.get("user_id"), str):
-            raise StoreError("could not load session")
-        return row
-P
-}
-
-store_two_errors() { cat > "$WORK/app/store.py" <<'P'
-"""Session store."""
-
-
-class SessionEnded(Exception):
-    """The session was signed out, or never existed."""
-
-
-class InvalidSession(Exception):
-    """The stored session row is not usable."""
+store() { # ENDED INVALID: the error load raises for each
+  printf '"""Session store."""\n\n\nclass %s(Exception):\n    """A session cannot be used."""\n' "$1" > app/store.py
+  [ "$1" = "$2" ] || printf '\n\nclass %s(Exception):\n    """The stored session row is not usable."""\n' "$2" >> app/store.py
+  cat >> app/store.py <<P
 
 
 class SessionStore:
     def __init__(self):
-        self._rows = {}
+        self.rows = {}
 
     def put(self, token, row):
-        self._rows[token] = row
+        self.rows[token] = row
 
     def end(self, token):
-        """Sign the session out."""
-        self._rows.pop(token, None)
+        self.rows.pop(token, None)
 
     def load(self, token):
-        """The session row for a token."""
-        row = self._rows.get(token)
+        row = self.rows.get(token)
         if row is None:
-            raise SessionEnded(token)
+            raise $1("could not load session")
         if not isinstance(row.get("user_id"), str):
-            raise InvalidSession(token)
+            raise $2("could not load session")
         return row
 P
 }
+case $MODE in
+  ask) store StoreError StoreError ;;
+  unrelated) store SessionEnded InvalidSession ;;
+esac
+commit "init: docsvc skeleton"
+git switch -qc feat/documents
+[ "$MODE" != fix ] || store StoreError StoreError
+cat > docs/documents-api.md <<'M'
+# Documents API acceptance
 
-profile_one_error() { cat > "$WORK/app/profile.py" <<'P'
-"""Profile endpoint."""
-
-from app.store import StoreError
-
-
-def get_profile(store, token):
-    try:
-        session = store.load(token)
-    except StoreError:
-        return 500, {"error": "profile unavailable"}
-    return 200, {"user_id": session["user_id"], "name": session.get("name", "")}
-P
-}
-
-profile_two_errors() { cat > "$WORK/app/profile.py" <<'P'
-"""Profile endpoint."""
-
-from app.store import InvalidSession, SessionEnded
-
-NAME_LIMIT = 20
-
-
-def get_profile(store, token):
-    try:
-        session = store.load(token)
-    except SessionEnded:
-        return 401, {"error": "sign in again"}
-    except InvalidSession:
-        return 500, {"error": "profile unavailable"}
-    name = session.get("name", "")
-    short = name.encode()[:NAME_LIMIT].decode(errors="ignore")
-    return 200, {"user_id": session["user_id"], "name": short}
-P
-}
-
-# documents_one_error READ_STATUS READ_MSG WRITE_STATUS WRITE_MSG
-documents_one_error() { cat > "$WORK/app/documents.py" <<P
-"""Documents API."""
-
-from app.store import StoreError
-
-
-def read_document(store, docs, token, doc_id):
-    try:
-        session = store.load(token)
-    except StoreError:
-        return $1, {"error": "$2"}
-    doc = docs.get(doc_id)
-    if doc is None:
-        return 404, {"error": "no such document"}
-    return 200, {"id": doc_id, "body": doc["body"], "reader": session["user_id"]}
-
-
-def write_document(store, docs, token, doc_id, body):
-    try:
-        session = store.load(token)
-    except StoreError:
-        return $3, {"error": "$4"}
-    doc = docs.get(doc_id)
-    if doc is not None and doc["owner"] != session["user_id"]:
-        return 403, {"error": "not your document"}
-    docs[doc_id] = {"owner": session["user_id"], "body": body, "shared": []}
-    return 200, {"id": doc_id}
-
-
-def share_document(store, docs, token, doc_id, with_user):
-    try:
-        session = store.load(token)
-    except StoreError:
-        return 500, {"error": "could not load session"}
-    doc = docs.get(doc_id)
-    if doc is None:
-        return 404, {"error": "no such document"}
-    if doc["owner"] != session["user_id"]:
-        return 403, {"error": "not your document"}
-    doc["shared"].append(with_user)
-    return 200, {"id": doc_id, "shared": list(doc["shared"])}
-
-
-def delete_document(store, docs, token, doc_id):
-    try:
-        session = store.load(token)
-    except StoreError:
-        return 500, {"error": "could not load session"}
-    doc = docs.get(doc_id)
-    if doc is None:
-        return 404, {"error": "no such document"}
-    if doc["owner"] != session["user_id"]:
-        return 403, {"error": "not your document"}
-    del docs[doc_id]
-    return 204, {}
-P
-}
-
-# documents_two_errors WRITE_OWNER_CHECK(yes|no)
-documents_two_errors() {
-  local guard=""
-  if [ "$1" = yes ]; then guard='    doc = docs.get(doc_id)
-    if doc is not None and doc["owner"] != session["user_id"]:
-        return 403, {"error": "not your document"}
-'; fi
-  cat > "$WORK/app/documents.py" <<P
-"""Documents API."""
-
-from app.store import InvalidSession, SessionEnded
-
-
-def _session(store, token):
-    """(session, None), or (None, the answer for a session that cannot be used)."""
-    try:
-        return store.load(token), None
-    except SessionEnded:
-        return None, (401, {"error": "sign in again"})
-    except InvalidSession:
-        return None, (500, {"error": "could not load session"})
-
-
-def read_document(store, docs, token, doc_id):
-    session, refused = _session(store, token)
-    if refused:
-        return refused
-    doc = docs.get(doc_id)
-    if doc is None:
-        return 404, {"error": "no such document"}
-    return 200, {"id": doc_id, "body": doc["body"], "reader": session["user_id"]}
-
-
-def write_document(store, docs, token, doc_id, body):
-    session, refused = _session(store, token)
-    if refused:
-        return refused
-${guard}    docs[doc_id] = {"owner": session["user_id"], "body": body, "shared": []}
-    return 200, {"id": doc_id}
-
-
-def share_document(store, docs, token, doc_id, with_user):
-    session, refused = _session(store, token)
-    if refused:
-        return refused
-    doc = docs.get(doc_id)
-    if doc is None:
-        return 404, {"error": "no such document"}
-    doc["shared"].append(with_user)
-    return 200, {"id": doc_id, "shared": list(doc["shared"])}
-
-
-def delete_document(store, docs, token, doc_id):
-    session, refused = _session(store, token)
-    if refused:
-        return refused
-    doc = docs[doc_id]
-    if doc["owner"] != session["user_id"]:
-        return 403, {"error": "not your document"}
-    del docs[doc_id]
-    return 204, {}
-P
-}
-
-cat > "$WORK/app/__init__.py" <<'P'
-P
-
-cat > "$WORK/app/health.py" <<'P'
-"""Liveness."""
-
-
-def health():
-    return 200, {"ok": True}
-P
-
-cat > "$WORK/scripts/check" <<'P'
-#!/usr/bin/env bash
-# Project gate: every test_* function under tests/.
-set -uo pipefail
-cd "$(dirname "$0")/.."
-out=$(python3 -I tests/run_tests.py 2>&1); rc=$?
-printf '%s\n' "$out"
-# The review's record of each gate run, when it keeps one: the app's
-# checksum, the result line, the failing tests.
-if [ -n "${E2E_RUN:-}" ]; then
-  printf '%s\t%s\t%s\n' "$(LC_ALL=C sha256sum app/*.py | sha256sum | cut -d' ' -f1)" \
-    "$(grep -E '^[0-9]+ passed, [0-9]+ failed$' <<<"$out" | tail -n1)" \
-    "$(awk '/^FAIL /{printf "%s ", $2}' <<<"$out")" >> "$E2E_RUN/gate.log"
-fi
-exit "$rc"
-P
-chmod +x "$WORK/scripts/check"
-
-cat > "$WORK/tests/run_tests.py" <<'P'
-"""Test runner: every test_* function in tests/test_*.py, no dependencies."""
-import importlib
-import sys
-import traceback
-from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
-sys.path.insert(0, str(HERE))
-
-
-def main():
-    ran = failures = 0
-    for path in sorted(HERE.glob("test_*.py")):
-        module = importlib.import_module(path.stem)
-        for name in sorted(n for n in dir(module) if n.startswith("test_")):
-            ran += 1
-            try:
-                getattr(module, name)()
-            except Exception:
-                failures += 1
-                print(f"FAIL {path.stem}.{name}")
-                traceback.print_exc()
-    print(f"{ran - failures} passed, {failures} failed")
-    return 1 if failures else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-P
-
-cat > "$WORK/tests/test_health.py" <<'P'
-from app.health import health
-
-
-def test_health_is_ok():
-    assert health() == (200, {"ok": True})
-P
-
-cat > "$WORK/README.md" <<'P'
-# docsvc
-
-Document service. Run the gate with `scripts/check`.
-P
-
-profile_test() { cat > "$WORK/tests/test_profile.py" <<'P'
-from app.profile import get_profile
-from app.store import SessionStore
-
-
-def test_profile_of_a_signed_in_user():
-    store = SessionStore()
-    store.put("t", {"user_id": "u1", "name": "Ada"})
-    assert get_profile(store, "t") == (200, {"user_id": "u1", "name": "Ada"})
-P
-}
-
-documents_doc_and_tests() {
-  cat > "$WORK/docs/documents-api.md" <<'P'
-# Documents API
-
-Read, write, share and delete a document for the signed-in user.
-
-Acceptance:
-
-1. A request whose session has ended is answered 401, so the client signs in
-   again.
+1. A request whose session has ended is answered 401, so the client signs in again.
 2. A request that meets an invalid stored session row is answered 500.
-3. Only a document's owner may overwrite, share or delete it: 403 otherwise.
+3. Only a document's owner may overwrite or share it: 403 otherwise.
 4. A document that does not exist is answered 404.
-P
-  cat > "$WORK/tests/test_documents.py" <<'P'
-from app.documents import delete_document, read_document, share_document, write_document
+M
+cat > tests/test_documents.py <<'P'
+import unittest
+
+from app.documents import read_document, share_document, write_document
 from app.store import SessionStore
 
 
-def _signed_in(user="u1"):
-    store = SessionStore()
-    store.put("t-" + user, {"user_id": user})
-    return store, "t-" + user
+class Documents(unittest.TestCase):
+    def setUp(self):
+        self.store, self.docs = SessionStore(), {}
+        self.store.put("a", {"user_id": "u1"})
+        self.store.put("b", {"user_id": "u2"})
 
-
-def test_write_then_read():
-    store, token = _signed_in()
-    docs = {}
-    assert write_document(store, docs, token, "d1", "hello") == (200, {"id": "d1"})
-    assert read_document(store, docs, token, "d1")[1]["body"] == "hello"
-
-
-def test_read_of_a_missing_document_is_404():
-    store, token = _signed_in()
-    assert read_document(store, {}, token, "nope")[0] == 404
-
-
-def test_owner_shares_a_document():
-    store, token = _signed_in()
-    docs = {}
-    write_document(store, docs, token, "d1", "hello")
-    assert share_document(store, docs, token, "d1", "u2") == (200, {"id": "d1", "shared": ["u2"]})
-
-
-def test_owner_deletes_a_document():
-    store, token = _signed_in()
-    docs = {}
-    write_document(store, docs, token, "d1", "hello")
-    assert delete_document(store, docs, token, "d1") == (204, {})
-    assert docs == {}
+    def test_write_read_share(self):
+        self.assertEqual(write_document(self.store, self.docs, "a", "d1", "hi"), (200, "d1"))
+        self.assertEqual(read_document(self.store, self.docs, "a", "d1"), (200, "hi"))
+        self.assertEqual(share_document(self.store, self.docs, "a", "d1", "u2"), (200, ["u2"]))
 P
+round2() { # TEST...: the round 2 reproducers, each "name<TAB>assertion"
+  printf '"""Round 2 reproducers, red until fixed."""\nimport unittest\n\nfrom app.documents import read_document, share_document, write_document\nfrom app.store import SessionStore\n\n\nclass Round2(unittest.TestCase):\n    def setUp(self):\n        self.store, self.docs = SessionStore(), {}\n        self.store.put("a", {"user_id": "u1"})\n        self.store.put("b", {"user_id": "u2"})\n        write_document(self.store, self.docs, "a", "d1", "mine")\n        self.store.end("e")\n' > tests/test_round2.py
+  for t in "$@"; do printf '\n    def test_%s(self):\n        %s\n' "${t%%	*}" "${t#*	}" >> tests/test_round2.py; done
 }
 
-# ------------------------------------------------------------ the history
 if [ "$MODE" = unrelated ]; then
-  store_two_errors; profile_two_errors; profile_test
-  commit "init: session store, profile, health"
-  git -C "$WORK" switch -qc feat/documents
-  documents_two_errors no; documents_doc_and_tests
-  commit "feat(documents): read, write, share and delete"
-
-  documents_two_errors yes
-  cat > "$WORK/tests/test_round1.py" <<'P'
-from app.documents import write_document
-from app.store import SessionStore
+  documents() { # OWNER_CHECK: the lines round 1 added to write_document, or none
+    cat > app/documents.py <<P
+"""Documents API."""
+from app.store import InvalidSession, SessionEnded
 
 
-def test_write_refuses_another_owners_document():
-    store = SessionStore()
-    store.put("a", {"user_id": "u1"})
-    store.put("b", {"user_id": "u2"})
-    docs = {}
-    write_document(store, docs, "a", "d1", "mine")
-    assert write_document(store, docs, "b", "d1", "theirs")[0] == 403
-    assert docs["d1"]["body"] == "mine"
+def _user(store, token):
+    """(user_id, None), or (None, the answer for a session that cannot be used)."""
+    try:
+        return store.load(token)["user_id"], None
+    except SessionEnded:
+        return None, (401, "sign in again")
+    except InvalidSession:
+        return None, (500, "could not load session")
+
+
+def read_document(store, docs, token, doc_id):
+    _, refused = _user(store, token)
+    return refused or (200, docs[doc_id]["body"])
+
+
+def write_document(store, docs, token, doc_id, body):
+    user, refused = _user(store, token)
+    if refused:
+        return refused
+$1    docs[doc_id] = {"owner": user, "body": body, "shared": []}
+    return 200, doc_id
+
+
+def share_document(store, docs, token, doc_id, with_user):
+    user, refused = _user(store, token)
+    if refused:
+        return refused
+    docs[doc_id]["shared"].append(with_user)
+    return 200, docs[doc_id]["shared"]
 P
+  }
+  documents ""
+  commit "feat(documents): read, write and share"
+  tok="$(git rev-parse --short HEAD)-1030"
+  r1=("A	app/documents.py:$(line app/documents.py 'def write_document')	write_document lets a user overwrite another owner's document")
+  documents '    if doc_id in docs and docs[doc_id]["owner"] != user:
+        return 403, "not your document"
+'
+  test_case write_refuses_another_owner 'write_document(self.store, self.docs, "a", "d1", "x"); self.assertEqual(write_document(self.store, self.docs, "b", "d1", "y")[0], 403)'
   commit "fix(documents): write refuses another owner's document"
-
-  cat > "$WORK/tests/test_round2.py" <<'P'
-"""Round 2 reproducers. Each fails until its finding is fixed."""
-from app.documents import delete_document, share_document, write_document
-from app.profile import get_profile
-from app.store import SessionStore
-
-
-def _two_users():
-    store = SessionStore()
-    store.put("a", {"user_id": "u1"})
-    store.put("b", {"user_id": "u2"})
-    docs = {}
-    write_document(store, docs, "a", "d1", "mine")
-    return store, docs
-
-
-def test_share_by_someone_else_is_403():
-    store, docs = _two_users()
-    assert share_document(store, docs, "b", "d1", "u3")[0] == 403
-    assert docs["d1"]["shared"] == []
-
-
-def test_delete_of_a_missing_document_is_404():
-    store, docs = _two_users()
-    assert delete_document(store, docs, "a", "nope")[0] == 404
-
-
-def test_profile_keeps_a_twenty_letter_name_whole():
-    store = SessionStore()
-    name = "Åsa Öström Älvsjö Ek"
-    store.put("t", {"user_id": "u1", "name": name})
-    assert get_profile(store, "t")[1]["name"] == name
-P
-  red=3
+  round2 "share_by_someone_else_is_403	self.assertEqual(share_document(self.store, self.docs, \"b\", \"d1\", \"u3\")[0], 403)" \
+         "read_of_a_missing_document_is_404	self.assertEqual(read_document(self.store, self.docs, \"a\", \"nope\")[0], 404)"
+  findings="| 1 | A | app/documents.py:$(line app/documents.py 'def share_document') | share_document lets a non-owner share; acceptance 3 says 403 | reproduced | caused by the diff |
+| 2 | D1 | app/documents.py:$(line app/documents.py 'def read_document') | read_document raises KeyError for a missing document; acceptance 4 says 404 | reproduced | caused by the diff |
+| 3 | G3 | app/store.py:$(line app/store.py 'def load') | design, unverifiable: true. Tokens and document ids are both bare str, so load(doc_id) passes unnoticed; a Token type would prevent it | design | - |"
 else
-  if [ "$MODE" = ask ]; then
-    store_one_error; profile_one_error; profile_test
-    commit "init: session store, profile, health"
-    git -C "$WORK" switch -qc feat/documents
-  else
-    commit "init: health"
-    git -C "$WORK" switch -qc feat/documents
-    store_one_error; profile_one_error; profile_test
-  fi
-  documents_one_error 500 "could not load session" 500 "could not load session"
-  documents_doc_and_tests
-  if [ "$MODE" = ask ]; then
-    commit "feat(documents): read, write, share and delete"
-  else
-    commit "feat(documents): session store, profile, and read, write, share and delete"
-  fi
-
-  documents_one_error 401 "sign in again" 500 "could not load session"
-  cat > "$WORK/tests/test_round1.py" <<'P'
-from app.documents import read_document, write_document
-from app.store import SessionStore
+  documents() { # READ WRITE: what read_document and write_document answer on a StoreError
+    cat > app/documents.py <<P
+"""Documents API."""
+from app.store import StoreError
 
 
-def _ended():
-    store = SessionStore()
-    store.put("t", {"user_id": "u1"})
-    store.end("t")
-    return store, "t"
+def read_document(store, docs, token, doc_id):
+    try:
+        store.load(token)
+    except StoreError:
+        return $1
+    if doc_id not in docs:
+        return 404, "no such document"
+    return 200, docs[doc_id]["body"]
 
 
-def test_read_with_an_ended_session_is_401():
-    store, token = _ended()
-    assert read_document(store, {}, token, "d1")[0] == 401
+def write_document(store, docs, token, doc_id, body):
+    try:
+        user = store.load(token)["user_id"]
+    except StoreError:
+        return $2
+    if doc_id in docs and docs[doc_id]["owner"] != user:
+        return 403, "not your document"
+    docs[doc_id] = {"owner": user, "body": body, "shared": []}
+    return 200, doc_id
+
+
+def share_document(store, docs, token, doc_id, with_user):
+    try:
+        user = store.load(token)["user_id"]
+    except StoreError:
+        return 500, "could not load session"
+    if doc_id not in docs:
+        return 404, "no such document"
+    if docs[doc_id]["owner"] != user:
+        return 403, "not your document"
+    docs[doc_id]["shared"].append(with_user)
+    return 200, docs[doc_id]["shared"]
 P
+  }
+  documents '500, "could not load session"' '500, "could not load session"'
+  if [ "$MODE" = fix ]; then
+    commit "feat(documents): session store; read, write and share"
+    origin="app/store.py is added by the diff"
+  else
+    commit "feat(documents): read, write and share"
+    origin="app/store.py is not in the diff"
+  fi
+  tok="$(git rev-parse --short HEAD)-1030"
+  r1=("A	app/documents.py:$(line app/documents.py 'def read_document')	read_document answers 500 when the session has ended; acceptance 1 says 401"
+      "variant	app/documents.py:$(line app/documents.py 'def write_document')	write_document answers 500 when the session has ended; acceptance 1 says 401")
+  documents '401, "sign in again"' '500, "could not load session"'
+  test_case read_with_an_ended_session_is_401 'self.assertEqual(read_document(self.store, self.docs, "e", "d1")[0], 401)'
   commit "fix(documents): read answers 401 when the session has ended"
-
-  documents_one_error 401 "sign in again" 409 "session is stale"
-  cat >> "$WORK/tests/test_round1.py" <<'P'
-
-
-def test_write_with_an_ended_session_is_not_a_server_error():
-    store, token = _ended()
-    assert write_document(store, {}, token, "d1", "x")[0] < 500
-P
+  documents '401, "sign in again"' '409, "session is stale"'
+  test_case write_with_an_ended_session_is_not_a_server_error 'self.assertLess(write_document(self.store, self.docs, "e", "d1", "x")[0], 500)'
   commit "fix(documents): write answers 409 for a stale session"
-
-  cat > "$WORK/tests/test_round2.py" <<'P'
-"""Round 2 reproducers. Each fails until its finding is fixed."""
-from app.documents import delete_document, share_document, write_document
-from app.profile import get_profile
-from app.store import SessionStore
-
-
-def _ended():
-    store = SessionStore()
-    store.put("t", {"user_id": "u1"})
-    store.end("t")
-    return store, "t"
-
-
-def test_share_with_an_ended_session_is_401():
-    store, token = _ended()
-    assert share_document(store, {}, token, "d1", "u2")[0] == 401
-
-
-def test_delete_with_an_ended_session_is_401():
-    store, token = _ended()
-    assert delete_document(store, {}, token, "d1")[0] == 401
-
-
-def test_profile_with_an_ended_session_is_401():
-    store, token = _ended()
-    assert get_profile(store, token)[0] == 401
-
-
-def test_write_with_an_ended_session_is_401():
-    store, token = _ended()
-    assert write_document(store, {}, token, "d1", "x")[0] == 401
-P
-  red=4
+  round2 "share_with_an_ended_session_is_401	self.assertEqual(share_document(self.store, self.docs, \"e\", \"d1\", \"u2\")[0], 401)" \
+         "write_with_an_ended_session_is_401	self.assertEqual(write_document(self.store, self.docs, \"e\", \"d1\", \"x\")[0], 401)"
+  findings="| 1 | variant | app/documents.py:$(line app/documents.py 'def share_document') | share_document answers 500 when the session has ended; acceptance 1 says 401 | reproduced | caused by the diff |
+| 2 | A | app/documents.py:$(line app/documents.py 'def write_document') | write_document answers 409 when the session has ended, where read_document answers 401; acceptance 1 says 401 | reproduced | caused by the diff (round 1 fix) |
+| 3 | G5 | app/store.py:$(line app/store.py 'def load') | design, unverifiable: true. load() raises the same StoreError for an ended session and an invalid row, so every caller guesses which; they should be two errors | design | $origin |"
 fi
 commit "test: round 2 reproducers"
 
-# ------------------------------------------------- round 2, as adjudicated
-head_sha=$(git -C "$WORK" rev-parse --short HEAD)
-{
-  cat <<P
+cat > review/round-2.md <<M
 # Close-out review of feat/documents: round 2
 
-Diff under review: main...feat/documents ($head_sha). Goal and acceptance
-criteria: docs/documents-api.md. Two blind reviewers ran; the verifier has
-tested every defect finding on its claimed path. Reproducers:
-tests/test_round2.py, red until fixed. Nothing has been edited since.
-
-P
-  if [ "$MODE" = unrelated ]; then
-    cat <<P
-Round 1: one finding, reproduced and fixed ("write refuses another owner's
-document").
+Diff under review: main...feat/documents ($(git rev-parse --short HEAD)), close-out
+token $tok. Acceptance criteria: docs/documents-api.md. Two blind reviewers ran
+and the verifier tested every defect finding; reproducers are in
+tests/test_round2.py, red until fixed. Round 1's findings are in the review
+ledger, fixed. Nothing has been edited since.
 
 | # | check | where | claim | outcome | origin |
 |---|---|---|---|---|---|
-| 1 | A | app/documents.py:$(line app/documents.py 'def share_document') | share_document lets a user who does not own the document share it; acceptance 3 says 403 | reproduced | caused by the diff |
-| 2 | D1 | app/documents.py:$(line app/documents.py 'doc = docs\[doc_id\]') | delete_document raises KeyError for a document that does not exist; acceptance 4 says 404 | reproduced | caused by the diff |
-| 3 | A | app/profile.py:$(line app/profile.py 'short = ') | get_profile cuts a 20-letter name with non-ASCII letters short: the 20 limit counts bytes | reproduced | pre-existing: app/profile.py is not in the diff |
-| 4 | G3 | app/store.py:$(line app/store.py 'def load') | design, unverifiable: true. A session token and a document id are both a bare str, so load(doc_id) passes unnoticed; a Token type would make the swap unrepresentable | design | - |
-P
-  else
-    if [ "$MODE" = ask ]; then
-      o3="pre-existing: app/profile.py is not in the diff"
-      o5="app/store.py is not in the diff"
-    else
-      o3="caused by the diff"
-      o5="app/store.py is added by the diff"
-    fi
-    cat <<P
-Round 1: two findings, reproduced and fixed ("read answers 401 when the
-session has ended", "write answers 409 for a stale session"). Round 2's
-reviewer B carried a sibling line for each.
+$findings
+M
 
-| # | check | where | claim | outcome | origin |
-|---|---|---|---|---|---|
-| 1 | variant | app/documents.py:$(line app/documents.py 'def share_document') | share_document answers 500 when the session has ended; acceptance 1 says 401 | reproduced | caused by the diff |
-| 2 | variant | app/documents.py:$(line app/documents.py 'def delete_document') | delete_document answers 500 when the session has ended; acceptance 1 says 401 | reproduced | caused by the diff |
-| 3 | variant | app/profile.py:$(line app/profile.py 'def get_profile') | get_profile answers 500 when the session has ended; acceptance 1 says 401 | reproduced | $o3 |
-| 4 | A | app/documents.py:$(line app/documents.py 'def write_document') | write_document answers 409 when the session has ended, where read_document answers 401; acceptance 1 says 401 | reproduced | caused by the diff (round 1 fix) |
-| 5 | G5 | app/store.py:$(line app/store.py 'def load') | design, unverifiable: true. load() raises the same StoreError when the session has ended and when the stored row is invalid, so every caller has to guess which it was; the two facts should be two errors | design | $o5 |
-P
-  fi
-} > "$WORK/review/round-2.md"
+notes="$HOME/.local/state/claude-tasks/$(basename "$WORK")"
+mkdir -p "$notes"
+{
+  printf 'date\tsource\trun\tcheck\ttrigger\twhere\tclaim\toutcome\tfixed\tfp_reason\n'
+  for r in "${r1[@]}"; do
+    IFS=$'\t' read -r check where claim <<<"$r"
+    printf '2026-11-20\tartl\t%s/r1\t%s\talways\t%s/%s\t%s\treproduced\tyes\t-\n' "$tok" "$check" "$WORK" "$where" "$claim"
+  done
+} > "$notes/review-ledger.tsv"
 
-# The fixture is what it claims: every test green except the reproducers.
-# Run with no E2E_RUN, so RUN/gate.log holds the agent's gate runs only.
-if ( cd "$WORK" && E2E_RUN='' ./scripts/check ) > "$RUN/gate-at-setup.log" 2>&1; then
-  echo "fixture fault: the round 2 reproducers pass at setup" >&2; exit 1
-fi
-grep -qx "[0-9]* passed, $red failed" "$RUN/gate-at-setup.log" || {
-  echo "fixture fault: expected exactly $red red reproducers" >&2
-  cat "$RUN/gate-at-setup.log" >&2; exit 1; }
-[ "$(grep -c '^FAIL test_round2\.' "$RUN/gate-at-setup.log")" = "$red" ] || {
-  echo "fixture fault: a failure outside tests/test_round2.py" >&2; exit 1; }
-
-( cd "$WORK" && LC_ALL=C sha256sum app/*.py tests/test_round2.py tests/run_tests.py scripts/check ) \
-  > "$RUN/start.sha"
+if ./scripts/check; then echo "fixture fault: the round 2 reproducers pass" >&2; exit 1; fi
+git rev-parse HEAD > "$RUN/start-commit"
