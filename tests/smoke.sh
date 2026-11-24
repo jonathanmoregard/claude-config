@@ -2944,7 +2944,7 @@ t1=$(date +%s%N)
 b2_ms=$(( (t1 - t0) / 1000000 ))
 (( rc == 0 )) || fail "22: trigger rc=$rc (a Stop hook exiting non-zero BLOCKS the stop)"
 [[ -z "$B2_OUT" ]] \
-  || fail "22: trigger wrote to stdout ('$B2_OUT'); a Stop hook emitting a decision would race ralph-loop"
+  || fail "22: trigger wrote to stdout ('$B2_OUT'); a Stop hook emitting a decision can block the stop"
 (( b2_ms < 20000 )) || fail "22: trigger held the Stop hook for ${b2_ms}ms (60s cap is hard)"
 
 sc_wait_marker "$B2_SID" || fail "22: the trigger produced no request marker or state"

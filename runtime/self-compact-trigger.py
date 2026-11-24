@@ -5,7 +5,7 @@ At FIRE_AT_TOKENS (350k, 35% of a 1M window) this writes a durable
 mission handoff and records a self-compact *request*. `scripts/idle-handoff.sh`
 consumes the request and does the reset+resume with its existing guard chain (fork
 ledger, per-cwd 24h budget, staleness DENY-when-uncheckable, live-cwd collision
-abort, ralph collision).
+abort).
 
 WHY `Stop`
     Stop is the only hook event that recurs WITHOUT a human turn, and autonomy
@@ -15,15 +15,13 @@ WHY `Stop`
     usually hands off instead). PostToolUse recurs but fires tens of times per
     turn for no extra signal. So: Stop, once per assistant turn.
 
-HOW IT COMPOSES WITH ralph-loop's Stop HOOK
-    ralph-loop registers its own Stop hook, which emits
-    {"decision":"block","reason":<prompt>} to keep a loop running. Claude Code
-    merges the outputs of all Stop hooks and a `block` wins. This hook therefore
-    NEVER writes to stdout, NEVER emits a `decision`, and NEVER exits non-zero
-    (exit 2 on Stop is itself a block). It can only add side effects on disk, so
-    it cannot race, veto, or short-circuit ralph-loop's decision in either
-    direction. When ralph IS looping, the fork is separately refused downstream
-    by idle-handoff.sh's ralph-collision guard.
+HOW IT COMPOSES WITH OTHER Stop HOOKS
+    A Stop hook can emit {"decision":"block","reason":<prompt>} to keep the
+    session going; Claude Code merges the outputs of all Stop hooks and a
+    `block` wins. This hook therefore NEVER writes to stdout, NEVER emits a
+    `decision`, and NEVER exits non-zero (exit 2 on Stop is itself a block). It
+    can only add side effects on disk, so it can never keep a session running
+    or veto another hook's decision.
 
 WHAT "RESET" MEANS HERE
     NOT /compact and NOT /clear. Standing decision, on measured grounds ($3-10

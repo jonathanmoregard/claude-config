@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# SessionStart(startup|compact|clear) hook: when a ralph loop is armed in this
-# project dir, re-inject the autonomy contract — doctrine decays after compaction.
-# Design constraints (advisor-reviewed):
-# - NEVER print the literal sigil (parroting footgun; plugin systemMessage
-#   already shows it each iteration; also avoids the null-promise nonsense case).
-# - State-file values are DATA: iteration is regex-validated before heredoc
-#   interpolation so a corrupted file cannot execute via $(…) expansion.
+# SessionStart(startup|compact|clear) hook: when this session has a live mission
+# handoff in this project dir, remind it to re-read the handoff from disk —
+# context decays after compaction, the files do not.
 set -euo pipefail
 
 # A notes-dir mission*.md only counts as THIS session's live work if touched within
@@ -20,17 +16,6 @@ HOOK_SESSION=""
 if [[ ! -t 0 ]] && command -v jq >/dev/null 2>&1; then
   HOOK_SESSION="$(jq -r '.session_id // "" | strings' 2>/dev/null || true)"
 fi
-
-# Resolved relative to THIS script, never via $HOME: the tests redirect HOME to
-# a fake home to assert the no-notes-anywhere cases, and a $HOME-anchored source
-# path would vanish under them.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../scripts" && pwd)/ralph-loop-state.sh"
-
-# Ralph state is keyed by SESSION and lives in userspace, so "is a loop armed in
-# this project" is a lookup on the `armed_in:` field, not a file test on a
-# repo-relative path. `|| true` because no armed loop is the common case and
-# `set -e` would otherwise abort the hook before the mission reminder runs.
-STATE="$(ralph_state_for_dir "$PWD" || true)"
 
 # Working notes live in userspace (`~/.local/state/claude-tasks/<repo>/`) per CLAUDE.md, because
 # repo-relative notes get auto-committed and published. A project may symlink
@@ -86,38 +71,12 @@ if [[ -n "$HOOK_SESSION" && ( -x "$RESOLVE" || -f "$RESOLVE" ) ]]; then
   fi
 fi
 
-# Two independent reminders. Neither depends on the other; exit 0 if neither
-# applies. Order: ralph doctrine first (more constraining), mission second.
+mission_exists || exit 0
 
-if [[ ! -f "$STATE" ]] && ! mission_exists; then
-  exit 0
-fi
-
-if [[ ! -f "$STATE" ]]; then
-  # Mission-only reminder: any project with a mission artifact gets a re-read
-  # nudge after compact/clear. Compaction is documented to invalidate the
-  # cached prefix that held CLAUDE.md and mission context; disk beats
-  # in-context memory once compaction has fired.
-  cat <<EOF
-[context-lifecycle] A mission handoff exists in this project ($MISSION). Context was just compacted, cleared, or restarted — re-read that file now, plus $NOTES_SHOWN/session-constraints.md if present. Do not rely on your memory of the pre-compact conversation for state that lives on disk.
-EOF
-  exit 0
-fi
-
-ITER=$(awk '/^iteration:/{sub(/^iteration: */,""); print; exit}' "$STATE")
-[[ "$ITER" =~ ^[0-9]+$ ]] || ITER="?"
-
-AGE_NOTE=""
-STARTED=$(awk '/^started_at:/{sub(/^started_at: */,""); gsub(/"/,""); print; exit}' "$STATE")
-START_EPOCH=$(date -d "${STARTED:-invalid}" +%s 2>/dev/null || echo 0)
-if [[ "$START_EPOCH" -gt 0 ]] && (( $(date +%s) - START_EPOCH > 172800 )); then
-  AGE_NOTE=$'\n- WARNING: this loop was armed over 48h ago. If the mission is dead, cancel it: /cancel-ralph (state file: '"$STATE"$'). A stale armed loop blocks the session that armed it, wherever it stops.'
-fi
-
+# Any project with a live mission artifact gets a re-read nudge after
+# compact/clear. Compaction is documented to invalidate the cached prefix that
+# held CLAUDE.md and mission context; disk beats in-context memory once
+# compaction has fired.
 cat <<EOF
-[autonomous-orchestration] Ralph loop ACTIVE (iteration ${ITER}). Context was just compacted, cleared, or restarted — re-arm the doctrine:
-- Re-read $MISSION, $NOTES_SHOWN/progress.md, and $NOTES_SHOWN/session-constraints.md NOW. Constraints are the first thing compaction kills — the file is authoritative. Trust files and git log over any memory of this conversation.
-- You are the orchestrator: dispatch subagents for all reads/edits/tests; hold no code context yourself.
-- Bias to action. Never end a turn with only a plan, a summary, or a question that mission.md or the dangerous-ops manifest already answers.
-- Stop ONLY via the completion sigil recorded in $MISSION, emitted ONLY when literally TRUE: verifier freshly green AND fresh-context reviewer confirmed. Never emit a false sigil. If no sigil is configured, the loop ends only at max-iterations.${AGE_NOTE}
+[context-lifecycle] A mission handoff exists in this project ($MISSION). Context was just compacted, cleared, or restarted — re-read that file now, plus $NOTES_SHOWN/session-constraints.md if present. Do not rely on your memory of the pre-compact conversation for state that lives on disk.
 EOF

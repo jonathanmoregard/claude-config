@@ -14,8 +14,8 @@ if (( words > 1000 )); then
 fi
 
 required=(
-  "ralph-loop-setup.sh"
-  "completion promise"
+  "completion notification"
+  "end the turn"
   "tasks/mission.md"
   "tasks/progress.md"
   "tasks/session-constraints.md"
@@ -23,13 +23,11 @@ required=(
   "targeted check"
   "full gate"
   "visual-verify"
-  "advice-refine-test-loop once"
+  '`advice-refine-test-loop` once'
   "finishing-up"
   "readiness checks"
   "durable follow-up"
-  "ralph-loop-cancel.sh"
   "Use judgment"
-  "a fresh-context reviewer confirmed the diff"
 )
 for phrase in "${required[@]}"; do
   grep -Fq "$phrase" "$skill" || {
@@ -46,9 +44,16 @@ obsolete=(
   "multi-lens parallel reviewers"
   "Waiting PRs"
   "report cap ~15 lines"
+  # The Ralph stop-hook loop is removed: it re-prompted the session every few
+  # seconds while a background subagent ran, burning iterations on nothing.
+  "Ralph"
+  "ralph-loop"
+  "completion promise"
+  "sigil"
+  "MAX_ITERATIONS"
 )
 for phrase in "${obsolete[@]}"; do
-  if grep -Fq -- "$phrase" "$skill"; then
+  if grep -Fqi -- "$phrase" "$skill"; then
     echo "FAIL: obsolete mandatory machinery remains: $phrase"
     exit 1
   fi
