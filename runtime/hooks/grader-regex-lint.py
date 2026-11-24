@@ -3,7 +3,7 @@
 
 An agent's free text (its final message, a dispatch prompt, a file it wrote)
 is graded through the schema-enforced judge in
-`tests/agent-e2e/_lib/structured_judge.py` (skill: parsing-subagent-output),
+`tests/agent-e2e/_lib/structured_judge.py` (skill: fix-the-producer),
 or by its actions. A regex over prose grows a bypass per patch and never
 converges.
 
@@ -75,7 +75,7 @@ def main() -> None:
     shown = "\n".join(f"  {h[:160]}" for h in hits[:8])
     msg = (f"grader-regex-lint: {path} gained {len(hits)} regex/grep line(s):\n{shown}\n"
            "In agent-e2e graders, an agent's free text is graded with "
-           "tests/agent-e2e/_lib/structured_judge.py (skill: parsing-subagent-output), "
+           "tests/agent-e2e/_lib/structured_judge.py (skill: fix-the-producer), "
            "or the grader reads the agent's actions. A line whose regex reads an action "
            "record (commands.txt, git output, a ledger column) is silenced by a "
            "`regex-ok: <reason>` comment on that line.")
