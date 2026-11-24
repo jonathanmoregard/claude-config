@@ -198,17 +198,38 @@ def on_read(payload: dict, session: str) -> None:
         g.write_json(half(base, "reads"), {"ts": time.time(), "paths": paths})
 
 
-def on_handback(payload: dict, session: str) -> None:
-    """The advisor's own SubagentHandback call: its verdict, as sent.
+def handback_message(payload: dict, agent: str) -> str | None:
+    """The verdict a subagent sent with SubagentHandback, from its transcript.
 
-    Measured 2026-11-24: a background advisor can end its run with this tool
-    call instead of a closing text turn, so SubagentStop's
-    last_assistant_message carries no verdict. The handback's `message` is
-    the same reply, so it takes the SubagentStop path.
+    Measured 2026-11-24 (PR #118): a background advisor can end its run with a
+    SubagentHandback tool call, input {"message": <its reply>}, instead of a
+    closing text turn, so last_assistant_message carries no verdict. The call
+    is the last tool_use in the agent's own transcript, which lives at
+    <dir of transcript_path>/<session>/subagents/agent-<agent_id>.jsonl
+    (the layout completion-check.py reads too). Unreadable -> None.
     """
-    tool_input = payload.get("tool_input")
-    message = tool_input.get("message") if isinstance(tool_input, dict) else None
-    on_stop({**payload, "last_assistant_message": message}, session)
+    main, session = payload.get("transcript_path"), g.safe_id(payload.get("session_id"))
+    if not isinstance(main, str) or not session:
+        return None
+    path = Path(main).parent / session / "subagents" / f"agent-{agent}.jsonl"
+    found = None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"SubagentHandback"' not in line:
+                    continue
+                try:
+                    content = json.loads(line).get("message", {}).get("content")
+                except (ValueError, AttributeError):
+                    continue
+                for b in content if isinstance(content, list) else []:
+                    if (isinstance(b, dict) and b.get("type") == "tool_use"
+                            and b.get("name") == "SubagentHandback"
+                            and isinstance(b.get("input"), dict)):
+                        found = b["input"].get("message")
+    except OSError:
+        return None
+    return found if isinstance(found, str) else None
 
 
 def on_stop(payload: dict, session: str) -> None:
@@ -216,6 +237,8 @@ def on_stop(payload: dict, session: str) -> None:
         return
     agent = g.safe_id(payload.get("agent_id"))
     text = payload.get("last_assistant_message")
+    if agent and not (isinstance(text, str) and g.parse_verdict(text)):
+        text = handback_message(payload, agent)
     if not agent or not isinstance(text, str) or not g.parse_verdict(text):
         return
     base = f"{session}.{agent}"
@@ -261,8 +284,6 @@ def main() -> int:
         on_send(payload, session)
     elif event == "PostToolUse" and tool == "Read":
         on_read(payload, session)
-    elif event == "PostToolUse" and tool == "SubagentHandback":
-        on_handback(payload, session)
     elif event == "SubagentStop":
         on_stop(payload, session)
     return 0

@@ -488,7 +488,7 @@
         ]
       },
       {
-        "matcher": "^(Agent|Read|SendMessage|SubagentHandback)$",
+        "matcher": "^(Agent|Read|SendMessage)$",
         "hooks": [
           {
             "type": "command",

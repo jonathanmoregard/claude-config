@@ -162,16 +162,19 @@ class Sandbox:
         if order == "handback":
             # Measured 2026-11-24 (Claude Code, background advisor): the
             # advisor's last turn is a SubagentHandback tool call carrying the
-            # verdict, so SubagentStop has no verdict text of its own.
+            # verdict, so SubagentStop has no verdict text of its own. The call
+            # sits in the agent's transcript, <dir>/<session>/subagents/.
             launch["tool_response"] = {"isAsync": True, "status": "async_launched",
                                        "agentId": agent, "prompt": prompt}
-            handback = {"session_id": session, "hook_event_name": "PostToolUse",
-                        "cwd": str(self.work), "tool_name": "SubagentHandback",
-                        "tool_input": {"message": result},
-                        "tool_response": {"success": True},
-                        "agent_id": agent, "agent_type": "advisor"}
+            main = self.work.parent / "projects" / f"{session}.jsonl"
+            sub = main.parent / session / "subagents" / f"agent-{agent}.jsonl"
+            sub.parent.mkdir(parents=True, exist_ok=True)
+            sub.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "SubagentHandback",
+                 "input": {"message": result}}]}}) + "\n")
             stop["last_assistant_message"] = ""
-            steps = [launch, *read_steps, handback, stop]
+            stop["transcript_path"] = str(main)
+            steps = [launch, *read_steps, stop]
         elif order == "async":
             launch["tool_response"] = {"isAsync": True, "status": "async_launched",
                                        "agentId": agent, "prompt": prompt}
@@ -991,7 +994,7 @@ def test_every_gate_event_is_wired_to_an_existing_script():
     assert _registered("PreToolUse", "pr-open-gate.py") == ["^(Bash|mcp__github__create_pull_request)$"]
     assert _registered("PermissionRequest", "pr-open-gate.py")
     assert _registered("UserPromptSubmit", "pr-open-gate.py")
-    assert _registered("PostToolUse", "artl-evidence.py") == ["^(Agent|Read|SendMessage|SubagentHandback)$"]
+    assert _registered("PostToolUse", "artl-evidence.py") == ["^(Agent|Read|SendMessage)$"]
     assert _registered("SubagentStop", "artl-evidence.py")
 
 
