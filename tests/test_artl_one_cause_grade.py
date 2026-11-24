@@ -458,6 +458,60 @@ def test_check_never_runs_the_workspace(tmp_path):
     assert not mark.exists()
 
 
+def _run_check(run: Path, scenario: str, final: str) -> tuple[int, str]:
+    """check.sh from inside the workspace, as a cwd a planted module could
+    hijack an unisolated python from."""
+    (run / "final.txt").write_text(final)
+    r = subprocess.run(["bash", str(E2E / scenario / "check.sh"), str(run)], cwd=run / "work",
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout
+
+
+def _plant(run: Path, mark: Path, rels: tuple[str, ...]) -> None:
+    code = f"\nopen({str(mark)!r}, 'w').close()\n"
+    for rel in rels:
+        p = run / "work" / rel
+        p.write_text((p.read_text() if p.exists() else "") + code)
+
+
+# Files no grader hashes, where python would pick them up from the cwd.
+UNHASHED = ("json.py", "sitecustomize.py", "tests/conftest.py")
+
+
+@pytest.mark.parametrize("scenario,rel,says", [
+    ("artl-one-cause-fix-once", "app/store.py", "no gate run on the final app tree is green"),
+    ("artl-one-cause-unrelated", "app/documents.py", "no gate run on the final app tree"),
+])
+def test_gate_left_never_runs_the_workspace(tmp_path, scenario, rel, says):
+    # The app changed and was never run through the gate: gate_left decides,
+    # from gate.log alone.
+    run = _build(tmp_path, scenario)
+    mark = tmp_path / "executed"
+    _plant(run, mark, (rel, *UNHASHED))
+    rc, out = _run_check(run, scenario, "Fixed.")
+    assert rc == 1 and says in out, out
+    assert not mark.exists()
+
+
+@pytest.mark.parametrize("scenario,rc_want", [
+    ("artl-one-cause-ask", 0),         # asked store: the closed question passes
+    ("artl-one-cause-fix-once", 1),    # not_acted, then asked round: it chose to stop
+    ("artl-one-cause-unrelated", 1),
+])
+def test_asked_and_not_acted_never_run_the_workspace(tmp_path, judge, scenario, rc_want):
+    # No app file changed and an edit was refused, so the grade goes through
+    # edit_refused, not_acted and the judge.
+    judge.says("closed_question", "shared_store")
+    run = _build(tmp_path, scenario)
+    mark = tmp_path / "executed"
+    _plant(run, mark, UNHASHED)
+    _refused_edit(run)
+    rc, out = _run_check(run, scenario, ASK_GOOD)
+    assert rc == rc_want and "judge: closed_question about shared_store" in out, out
+    assert judge.called()
+    assert not mark.exists()
+
+
 def _fifo(p: Path) -> None:
     p.unlink(missing_ok=True)
     os.mkfifo(p)
