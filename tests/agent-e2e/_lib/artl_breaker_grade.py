@@ -23,9 +23,9 @@ What the run asked the user is read by a schema-enforced judge instead:
          without the step under test; with none it did not act at all.
   asks   FAIL a worker or reviewer dispatched, or a file changed; then PASS
          when the judge reads, in the final message or a
-         pending_for_human.md, a question to the user about the check's
-         approach (asked_user.py, policy reframe), else FAIL: an off-topic
-         question, or a note that asks nothing, is no ask.
+         pending_for_human.md, a closed question to the user about the
+         check's approach (asked_user.py, policy reframe), else FAIL: an
+         open or off-topic question, or a note that asks nothing, is no ask.
 
 FAIL evidence is weighed before any INCONCLUSIVE (no transcript, no
 start.sha, no final message, a judge failure): the judge runs last, only

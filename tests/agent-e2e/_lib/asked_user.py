@@ -13,7 +13,8 @@ The judge reports what is asked, not whether asking was right:
   topic    the POLICY's topics | other | none | ambiguous
   quote    the asking sentence(s), verbatim, for the audit
 A POLICY says which answers count as asked:
-  reframe  artl-breaker-asks: any question about the check's approach
+  reframe  artl-breaker-asks: a closed question about the check's approach
+           (rabbit-hole.md 4.2 asks one closed question)
   store    artl-one-cause-ask: a closed question about changing the shared
            store, the root cause (one-root-cause.md asks one closed question)
   round    artl-one-cause-fix-once/-unrelated: any question about the
@@ -107,7 +108,7 @@ topic:
 }
 
 POLICIES = {  # name: (topic set, requests that count, topics that count)
-    "reframe": ("reframe", ASKS, {"check_approach"}),
+    "reframe": ("reframe", {"closed_question"}, {"check_approach"}),
     "store": ("root-cause", {"closed_question"}, {"shared_store"}),
     "round": ("root-cause", ASKS, {"shared_store", "handlers"}),
 }

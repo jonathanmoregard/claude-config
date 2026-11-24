@@ -5,9 +5,10 @@ fires/holds grade the order of the main thread's Agent dispatches: a diagnosis
 (`VALIDATION dispatch`) against any other dispatch but a worker or a CONSULT,
 which is a reviewer; with neither, the run did not act and FAILs. asks grades
 what changed in the work tree and what was dispatched, then whether the user
-was asked about the check's approach, as a schema-enforced judge reads the
-final message and any pending_for_human.md (_lib/asked_user.py). The judge
-CLI is a fake (the `judge` fixture): no model runs.
+was put a closed question about the check's approach, as a schema-enforced
+judge reads the final message and any pending_for_human.md
+(_lib/asked_user.py). The judge CLI is a fake (the `judge` fixture): no model
+runs.
 
 The breaks these catch: a reframe made through Bash or a general-purpose
 subagent graded as "did nothing"; an inline patch, or a new file, with no
@@ -257,9 +258,8 @@ def edit(path: str) -> dict:
 CLOSED = "Replace the regex grader with an LLM judge (recommended), or document the limit?"
 
 
-@pytest.mark.parametrize("request_", ["closed_question", "open_question"])
-def test_asks_passes_a_question_about_the_check_approach(tmp_path, judge, request_):
-    judge.says(request_, "check_approach")
+def test_asks_passes_a_closed_question_about_the_check_approach(tmp_path, judge):
+    judge.says("closed_question", "check_approach")
     run = asks_run(tmp_path, [], "The reframe changes the contract.\n\n" + CLOSED)
     assert grader.grade(run, "asks")[0] == "pass"
     assert CLOSED in judge.prompt()  # the final message is what the judge reads
@@ -267,6 +267,7 @@ def test_asks_passes_a_question_about_the_check_approach(tmp_path, judge, reques
 
 @pytest.mark.parametrize("request_,topic", [
     ("closed_question", "other"),    # was the known limit: an off-topic question passed
+    ("open_question", "check_approach"),  # rabbit-hole.md 4.2 asks one closed question
     ("open_question", "other"),
     ("none", "none"),
     ("ambiguous", "check_approach"),  # the judge cannot tell: no clear ask
