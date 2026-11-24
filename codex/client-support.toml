@@ -33,7 +33,7 @@ notes = "Claude agents render as native Codex role TOML. Read-only tool whitelis
 
 [hooks]
 status = "codex-adapted"
-unsupported_events = ["ConfigChange", "CwdChanged", "InstructionsLoaded", "PermissionDenied", "StopFailure"]
+unsupported_events = ["ConfigChange", "CwdChanged", "InstructionsLoaded", "PermissionDenied", "PostToolUseFailure", "StopFailure"]
 notes = "Supported Claude hook events are rendered as active Codex hooks, subject to Codex native hook trust. Unsupported events remain in the source manifest and report."
 
 [settings.skillListingBudgetFraction]

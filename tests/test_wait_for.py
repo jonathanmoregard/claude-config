@@ -6,12 +6,17 @@ whole wait finishes in well under a second.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 # `runtime/` once the layout migration has landed, the repository root
@@ -46,6 +51,16 @@ def run_wait_for(
         link = bin_dir / name
         if not link.exists():
             link.symlink_to(FAKE)
+    # The failure records live under the passwd home, not $HOME.
+    getent = bin_dir / "getent"
+    getent.write_text(f'#!/bin/sh\necho "u:x:0:0::{tmp_path / "home"}:/bin/sh"\n')
+    getent.chmod(0o755)
+    if args[:1] == ("unit",):
+        source, n = re.subn(r"\bPATH=/run/current-system/sw/bin:",
+                            f"PATH={bin_dir}:/run/current-system/sw/bin:", wait_for.read_text())
+        assert n == 1
+        wait_for = tmp_path / "wait-for"
+        wait_for.write_text(source)
     state = tmp_path / "script.json"
     scripted = json.loads(json.dumps(script))
     scripted.setdefault("gh", {}).setdefault("auth token", [{"rc": 0}])
@@ -60,6 +75,7 @@ def run_wait_for(
         "FAKE_LOG": str(log),
         **TEST_TZ,
     }
+    env.pop("SANDBOX_RUNTIME", None)
     env.update(extra_env or {})
     (tmp_path / "home").mkdir(exist_ok=True)
     argv = list(args)
@@ -486,6 +502,74 @@ def test_success_keeps_a_failure_record_it_cannot_account_for(tmp_path: Path) ->
         )
         assert rc == 0, out
         assert record.exists(), f"{body} was cleared: {out}"
+
+
+FAILED_UNIT = {**SUCCEEDED_UNIT, "ActiveState": "failed", "SubState": "failed",
+               "Result": "exit-code", "ExecMainStatus": "1"}
+
+
+def test_unit_wait_deletes_nothing_through_a_linked_record_dir(tmp_path: Path) -> None:
+    project = tmp_path / "decoy-project"
+    (project / ".claude").mkdir(parents=True)
+    settings = project / ".claude" / "settings.json"
+    settings.write_text("{}")
+    state = tmp_path / "home" / ".local" / "state"
+    state.mkdir(parents=True)
+    (state / "claude-unit-failures").symlink_to(project / ".claude")
+    rc, out, _ = run_wait_for(tmp_path, {"systemctl": [FAILED_UNIT]},
+                              "unit", "settings.service", "--user")
+    assert rc == 1, out
+    assert settings.exists(), out
+
+
+def test_unit_wait_refuses_a_unit_name_with_a_slash(tmp_path: Path) -> None:
+    rc, out, calls = run_wait_for(tmp_path, {"systemctl": [FAILED_UNIT]}, "unit",
+                                  "../../.claude/settings", "--user")
+    assert (rc, calls) == (64, []), out
+
+
+def test_unit_wait_deletes_nothing_the_callers_home_names(tmp_path: Path) -> None:
+    caller_home = tmp_path / "caller-home"
+    planted = caller_home / ".local/state/claude-unit-failures/settings.json"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("{}")
+    rc, out, _ = run_wait_for(tmp_path, {"systemctl": [FAILED_UNIT]}, "unit",
+                              "settings.service", "--user",
+                              extra_env={"HOME": str(caller_home)})
+    assert rc == 1, out
+    assert planted.exists(), out
+
+
+def test_unit_wait_verdict_is_not_the_callers_jq_library(tmp_path: Path) -> None:
+    caller_home = tmp_path / "caller-home"
+    caller_home.mkdir()
+    (caller_home / ".jq").write_text('def last: {"USER_INVOCATION_ID": "0123abcd"};\n')
+    gone = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead"}
+    rc, out, _ = run_wait_for(tmp_path, {"systemctl": [gone], "journalctl": [{"stdout": []}]},
+                              "unit", "gate", "--user", extra_env={"HOME": str(caller_home)})
+    assert rc == 3, out
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ((), {}), (("--user",), {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
+], ids=["system", "user"])
+def test_unit_wait_gives_systemctl_none_of_the_callers_environment(
+    tmp_path: Path, scope: tuple[str, ...], expected: dict[str, str]
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    dump = tmp_path / "systemctl-env"
+    (bin_dir / "systemctl").write_text(f'#!/bin/sh\nenv -0 >"{dump}"\necho LoadState=not-found\n')
+    (bin_dir / "systemctl").chmod(0o755)
+    run_wait_for(tmp_path, {"journalctl": [{"stdout": []}]}, "unit", "gate", *scope,
+                 extra_env={"SYSTEMD_UNIT_PATH": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path),
+                            "DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={tmp_path}/sys",
+                            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={tmp_path}/bus",
+                            "UID": "0"})
+    seen = dict(p.split("=", 1) for p in dump.read_text().split("\0") if p)
+    for name in ("PWD", "SHLVL", "_", "SHELLOPTS", "BASHOPTS", "PATH"):
+        seen.pop(name, None)
+    assert seen == expected
 
 
 def test_since_after_launch_waits_for_a_newer_run(tmp_path: Path) -> None:
@@ -965,3 +1049,224 @@ def test_sandbox_refuses_symlinked_report_marker(tmp_path: Path) -> None:
     assert rc == 1, out
     assert "must not report" not in out
     assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def sandboxed_job(tmp_path: Path, slug: str, script: str, **kwargs):
+    return run_wait_for(tmp_path, {}, "job", slug, "--", "bash", "-c", script,
+                        extra_env={"SANDBOX_RUNTIME": "1"}, **kwargs)
+
+
+@pytest.fixture
+def slug():
+    name = f"sandboxed-job-{os.getpid()}-{time.monotonic_ns()}"
+    yield name
+    for suffix in ("log", "lock", "status"):
+        Path(f"/tmp/{name}.{suffix}").unlink(missing_ok=True)
+
+
+def test_sandboxed_job_runs_in_this_call_without_a_unit(tmp_path: Path, slug: str) -> None:
+    rc, out, calls = sandboxed_job(tmp_path, slug, "echo ran; exit 0")
+    assert rc == 0, out
+    assert f"job {slug} ran inside the sandbox result=success" in out, out
+    assert Path(f"/tmp/{slug}.log").read_text().splitlines() == ["ran", "MARKER_OK"]
+    assert not any(c.startswith(("systemd-run", "systemctl")) for c in calls), calls
+
+
+def test_sandboxed_job_failure_is_reported_with_its_status(tmp_path: Path, slug: str) -> None:
+    rc, out, _ = sandboxed_job(tmp_path, slug, "echo bad; exit 7")
+    assert rc == 1, out
+    assert "status=7" in out, out
+    assert Path(f"/tmp/{slug}.log").read_text().splitlines() == ["bad", "MARKER_FAILED rc=7"]
+
+
+def test_sandboxed_job_that_exits_124_is_not_called_a_timeout(tmp_path: Path, slug: str) -> None:
+    rc, out, _ = sandboxed_job(tmp_path, slug, "exit 124")
+    assert rc == 1, out
+    assert "status=124" in out and "timed out" not in out, out
+
+
+def test_sandboxed_job_past_its_deadline_times_out(tmp_path: Path, slug: str) -> None:
+    rc, out, _ = sandboxed_job(tmp_path, slug, "exec python3 -c \"import time; time.sleep(8)\"", timeout="3")
+    assert rc == 124, out
+    assert "timed out" in out, out
+
+
+def test_sandboxed_job_ignoring_sigterm_is_killed_soon_after_its_deadline(
+    tmp_path: Path, slug: str
+) -> None:
+    pid_file = tmp_path / "pid"
+    child = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(40)")
+    started = time.monotonic()
+    rc, out, _ = sandboxed_job(tmp_path, slug, f"exec python3 -c {json.dumps(child)}",
+                               timeout="5")
+    elapsed = time.monotonic() - started
+    assert rc == 124 and "timed out" in out, out
+    assert elapsed < 20, elapsed
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+def test_stopping_a_sandboxed_wait_stops_its_job_before_freeing_the_slug(
+    tmp_path: Path, slug: str, sig: signal.Signals
+) -> None:
+    pid_file = tmp_path / "pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    proc = subprocess.Popen(["bash", str(WAIT_FOR), "job", slug, "--timeout", "120", "--",
+                             "python3", "-c", child],
+                            env={**os.environ, "SANDBOX_RUNTIME": "1"},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = time.monotonic()
+    while not (pid_file.exists() and pid_file.read_text()):
+        assert proc.poll() is None and time.monotonic() - started < 20
+        time.sleep(0.05)
+    job = int(pid_file.read_text())
+    try:
+        proc.send_signal(sig)
+        assert proc.wait(timeout=20) != 0
+        with pytest.raises(ProcessLookupError):
+            os.kill(job, 0)
+        assert subprocess.run(["flock", "-n", f"/tmp/{slug}.lock", "true"]).returncode == 0
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(job, signal.SIGKILL)
+
+
+def test_a_stop_landing_before_the_job_pid_is_known_still_stops_the_job(
+    tmp_path: Path, slug: str
+) -> None:
+    gate = tmp_path / "forked"
+    source = WAIT_FOR.read_text()
+    anchor = "  child=$!\n"
+    assert source.count(anchor) == 1
+    staged = tmp_path / "wait-for"
+    staged.write_text(source.replace(anchor, f"  : >{gate}; sleep 2\n{anchor}"))
+    pid_file = tmp_path / "pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    proc = subprocess.Popen(["bash", str(staged), "job", slug, "--timeout", "120", "--",
+                             "python3", "-c", child],
+                            env={**os.environ, "SANDBOX_RUNTIME": "1"},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = time.monotonic()
+    while not gate.exists():
+        assert proc.poll() is None and time.monotonic() - started < 20
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=20) == 128 + signal.SIGTERM
+    while not (pid_file.exists() and pid_file.read_text()) and time.monotonic() - started < 10:
+        time.sleep(0.05)
+    if pid_file.exists() and pid_file.read_text():
+        job = int(pid_file.read_text())
+        try:
+            with pytest.raises(ProcessLookupError):
+                os.kill(job, 0)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(job, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("suffix", ["lock", "log"])
+def test_a_fifo_at_a_sandboxed_jobs_lock_or_log_does_not_outlast_the_deadline(
+    tmp_path: Path, slug: str, suffix: str
+) -> None:
+    planted = Path(f"/tmp/{slug}.{suffix}")
+    os.mkfifo(planted)
+    ran = tmp_path / "ran"
+    started = time.monotonic()
+    proc = subprocess.run(["bash", str(WAIT_FOR), "job", slug, "--timeout", "3", "--",
+                           "touch", str(ran)],
+                          env={**os.environ, "SANDBOX_RUNTIME": "1"},
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=20, check=False)
+    assert time.monotonic() - started < 10
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert not ran.exists()
+
+
+def test_repeating_a_sandboxed_wait_adopts_the_finished_run(tmp_path: Path, slug: str) -> None:
+    counter = tmp_path / "count"
+    script = f"echo x >>{counter}"
+    assert sandboxed_job(tmp_path, slug, script)[0] == 0
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 0, out
+    assert "already ran" in out, out
+    assert counter.read_text() == "x\n"
+
+    Path(f"/tmp/{slug}.status").write_text("MARKER_FAILED rc=7\n")
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 1 and "status=7" in out, out
+    assert counter.read_text() == "x\n"
+
+
+def test_a_timed_out_job_whose_output_ends_in_the_marker_is_run_again(
+    tmp_path: Path, slug: str
+) -> None:
+    # The job's own last line was MARKER_OK when the deadline killed it; read
+    # from the log, the retry adopted that as success (reproduced at 84c00e9).
+    counter = tmp_path / "count"
+    rc, out, _ = sandboxed_job(
+        tmp_path, slug,
+        f"echo x >>{counter}; echo MARKER_OK; exec python3 -c \"import time; time.sleep(30)\"",
+        timeout="3")
+    assert rc == 124, out
+    rc, out, _ = sandboxed_job(tmp_path, slug, f"echo x >>{counter}")
+    assert rc == 0 and "already ran" not in out, out
+    assert counter.read_text() == "x\nx\n"
+
+
+def test_a_log_ending_in_the_marker_without_a_status_is_not_adopted(
+    tmp_path: Path, slug: str
+) -> None:
+    counter = tmp_path / "count"
+    Path(f"/tmp/{slug}.log").write_text("MARKER_OK\n")
+    rc, out, _ = sandboxed_job(tmp_path, slug, f"echo x >>{counter}")
+    assert rc == 0 and "already ran" not in out, out
+    assert counter.read_text() == "x\n"
+
+
+def test_sandboxed_job_output_without_a_final_newline_is_still_adopted(
+    tmp_path: Path, slug: str
+) -> None:
+    counter = tmp_path / "count"
+    script = f"echo x >>{counter}; printf 'unterminated\\0'"
+    assert sandboxed_job(tmp_path, slug, script)[0] == 0
+    rc, out, _ = sandboxed_job(tmp_path, slug, script)
+    assert rc == 0 and "already ran" in out, out
+    assert counter.read_text() == "x\n"
+
+
+def test_target_that_looks_like_an_option_is_refused(tmp_path: Path) -> None:
+    rc, _, calls = run_wait_for(tmp_path, {}, "unit", "--host=example.invalid", "--user")
+    assert rc == 64
+    assert calls == []
+
+
+@pytest.mark.parametrize("args", [("unit", "x", "--bogus"), ("unit", "a/b"),
+                                  ("unit", "x", "--timeout", "soon")])
+def test_unit_usage_runs_no_caller_path_binary(tmp_path: Path, args: tuple[str, ...]) -> None:
+    marker = tmp_path / "sed-ran"
+    fake = tmp_path / "fake-bin"
+    fake.mkdir()
+    (fake / "sed").write_text(f"#!/bin/sh\n: >{marker}\ncat >/dev/null\n")
+    (fake / "sed").chmod(0o755)
+    proc = subprocess.run([shutil.which("bash"), "-p", str(WAIT_FOR), *args],
+                          capture_output=True, text=True, timeout=30,
+                          env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"},
+                          check=False)
+    assert proc.returncode == 64
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("value, expected", [("08", 1), ("86400", 1), ("0086400", 1),
+                                             ("86401", 64), ("18446744073709551615", 64)])
+def test_unit_timeout_that_bash_cannot_add_is_not_an_instant_timeout(
+    tmp_path: Path, value: str, expected: int
+) -> None:
+    running = {**SUCCEEDED_UNIT, "SubState": "running"}
+    rc, out, calls = run_wait_for(tmp_path, {"systemctl": [running, running, FAILED_UNIT]},
+                                  "unit", "gate", "--user", timeout=value)
+    assert rc == expected, out
+    assert not re.search(r"line \d+:", out), out
+    if expected == 64:
+        assert calls == []

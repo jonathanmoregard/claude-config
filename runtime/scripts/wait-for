@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/run/current-system/sw/bin/bash -p
 # wait-for — block until something outside the session settles, then print one
 # summary line and exit with a status that says how it settled.
 #
@@ -28,13 +28,15 @@
 #   wait-for job <slug> [--timeout <s>] -- <cmd> [args...]
 #                                          launch once as a retained user unit,
 #                                          or adopt its recorded run, then wait
+#                                          (inside the Claude Code sandbox: run
+#                                          it in this call; it ends with the call)
 #   wait-for agent <agent-id> [--idle <s>] a background subagent went quiet (5):
 #                                          neither its transcript nor its meta
 #                                          file changed for --idle seconds
 #                                          (default $WAIT_FOR_AGENT_IDLE or 7200)
-#   common: --timeout <seconds> (default 3600; job default 14400 so a
-#                                          90-minute job does not time out;
-#                                          agent default 86400, 24 h)
+#   common: --timeout <seconds> (default 3600, at most 86400; job default
+#                                          14400 so a 90-minute job does not
+#                                          time out; agent default 86400, 24 h)
 #
 # `agent` finds the subagent's agent-<id>.jsonl and agent-<id>.meta.json under
 # ~/.claude/projects/*/*/subagents/ and only compares their modification times
@@ -67,6 +69,13 @@
 # call, never in a foreground turn.
 # END USAGE
 set -uo pipefail
+# The Claude Code sandbox runs `wait-for unit` outside itself without a prompt,
+# so nothing of the caller's environment may steer it: not PATH, not a bus or
+# manager (DBUS_*, XDG_RUNTIME_DIR), not jq's $HOME/.jq. Even $UID is the caller's.
+if [ "${1:-}" = unit ]; then
+  unset $(compgen -e) 2>/dev/null
+  export PATH=/run/current-system/sw/bin:/usr/bin:/bin
+fi
 
 usage() {
   sed -n '2,/^# END USAGE$/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
@@ -76,6 +85,7 @@ usage() {
 [ $# -ge 2 ] || usage
 mode=$1 target=$2
 shift 2
+case $target in -*) usage ;; esac
 repo=() repo_name="" user=() since="" job_cmd=() idle=${WAIT_FOR_AGENT_IDLE:-7200} timeout_set=""
 if [ "$mode" = job ]; then timeout=14400; else timeout=3600; fi
 if [ "$mode" = job ]; then
@@ -108,8 +118,13 @@ if [ "$mode" = agent ]; then
   idle=$(( 10#$idle ))  # "08" is eight seconds, not a bad octal number
   [ -n "$timeout_set" ] || timeout=86400
 fi
-case $timeout in ''|*[!0-9]*) usage ;; esac
-timeout=$(( 10#$timeout ))  # "08" is eight seconds, not a bad octal number
+# Base 10 and bounded before any arithmetic: bash reads 08 as octal and wraps past 2^63.
+[[ $timeout =~ ^0*[0-9]{1,5}$ ]] && (( 10#$timeout <= 86400 )) || usage
+timeout=$(( 10#$timeout ))
+if [ "$mode" = unit ]; then
+  case $target in */*) usage ;; esac
+  [ "${user[*]:-}" = --user ] && export XDG_RUNTIME_DIR=/run/user/$(id -u)
+fi
 deadline=$(( $(date +%s) + timeout ))
 left() { echo $(( deadline - $(date +%s) )); }
 # nap <step>: sleep up to <step> seconds, never past the deadline.
@@ -424,11 +439,15 @@ unreadable_manager() {
 }
 
 failure_record() {
-  local key=${target%.service}
+  local key=${target%.service} home dir
   [ "${user[*]:-}" = --user ] || return 1
   [[ $key =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-  [ -n "${HOME:-}" ] || return 1
-  printf '%s/.local/state/claude-unit-failures/%s.json\n' "$HOME" "$key"
+  home=$(getent passwd "$(id -u)" | cut -d: -f6)
+  [ -n "$home" ] || return 1
+  dir=$home/.local/state/claude-unit-failures
+  # The record is deleted by name: through a link that would be some other file.
+  [ ! -L "$dir" ] && [ ! -L "$dir/$key.json" ] || return 1
+  printf '%s/%s.json\n' "$dir" "$key"
 }
 
 clear_reported_failure() {
@@ -642,6 +661,76 @@ wait_unit() {
   exit 1
 }
 
+# The Claude Code sandbox hides the user bus on purpose (a transient unit would
+# run outside it), so there the job is a child of this call and ends with it.
+# /tmp/<slug>.status stands in for the retained unit: a finished run is adopted,
+# never repeated, until that file is removed. It is written only once the job's
+# exit is seen, by rename, so a run cut off by the deadline or a stop leaves
+# none; the log's last line cannot stand in, as the job writes the log too.
+stop_job() {
+  trap '' TERM INT HUP
+  kill -TERM "$child" 2>/dev/null
+  wait "$child"
+  exit $(( 128 + $(kill -l "$1") ))
+}
+
+run_job_in_sandbox() {
+  local log=/tmp/$target.log status=/tmp/$target.status rc last="" remaining sig pending tmp
+  # Opened read-write, a FIFO does not block; each is then used only through
+  # its descriptor, so nothing swapped in under the name later is opened.
+  exec 9<>"/tmp/$target.lock" && [ -f /dev/fd/9 ] || {
+    echo "wait-for: cannot use /tmp/$target.lock as a lock file" >&2; exit 3;
+  }
+  flock -n 9 || flock -w "$(left)" 9 || timed_out
+  exec 8<>"$log" && [ -f /dev/fd/8 ] || { echo "wait-for: cannot use $log as a log file" >&2; exit 3; }
+  # Only a regular file counts, and reading it is bounded by the deadline.
+  if [ -f "$status" ] && [ ! -L "$status" ]; then
+    last=$(command timeout "$(left)" head -n 1 -- "$status" 2>/dev/null)
+  fi
+  case $last in
+    MARKER_OK)
+      echo "job $target already ran inside the sandbox result=success status=0 log=$log (remove $status to run it again)"
+      exit 0 ;;
+    "MARKER_FAILED rc="*)
+      echo "job $target already ran inside the sandbox result=exit-code status=${last#MARKER_FAILED rc=} log=$log (remove $status to run it again)"
+      exit 1 ;;
+  esac
+  rm -f -- "$status" && [ ! -e "$status" ] && [ ! -L "$status" ] || {
+    echo "wait-for: cannot use $status as a status file" >&2; exit 3;
+  }
+  : >/dev/fd/8 || { echo "wait-for: cannot write $log" >&2; exit 3; }
+  # `timeout 0` would mean no limit at all.
+  remaining=$(left)
+  [ "$remaining" -gt 0 ] || timed_out
+  # Bash runs a trap only once a foreground child exits, so the child runs in
+  # the background; `<&0` keeps its stdin, which `&` would make /dev/null.
+  # A stop arriving before $! is known is held until it is.
+  pending=""
+  for sig in TERM INT HUP; do trap "pending=\${pending:-$sig}" "$sig"; done
+  command timeout --kill-after=5 "$remaining" "${job_cmd[@]}" <&0 >>/dev/fd/8 2>&1 8>&- 9>&- &
+  child=$!
+  for sig in TERM INT HUP; do trap "stop_job $sig" "$sig"; done
+  [ -z "$pending" ] || stop_job "$pending"
+  wait "$child"; rc=$?
+  trap - TERM INT HUP
+  # 137 is how GNU timeout reports the KILL after the grace period.
+  case $rc in 124|137) [ "$(left)" -gt 0 ] || timed_out ;; esac
+  [ "$(tail -c 1 -- /dev/fd/8 | od -An -tx1 | tr -d ' ')" = 0a ] || echo >>/dev/fd/8
+  if [ "$rc" = 0 ]; then last=MARKER_OK; else last="MARKER_FAILED rc=$rc"; fi
+  echo "$last" >>/dev/fd/8
+  # Whole or absent: a reader never sees half a record.
+  if ! { tmp=$(mktemp "$status.XXXXXX") && echo "$last" >"$tmp" && mv -fT -- "$tmp" "$status"; }; then
+    [ -z "${tmp:-}" ] || rm -f -- "$tmp"
+    echo "wait-for: could not record the result in $status; a repeat will run the job again" >&2
+  fi
+  if [ "$rc" = 0 ]; then
+    echo "job $target ran inside the sandbox result=success status=0 log=$log"
+    exit 0
+  fi
+  echo "job $target ran inside the sandbox result=exit-code status=$rc log=$log"
+  exit 1
+}
+
 wait_job() {
   [[ $target =~ ^[A-Za-z0-9._-]+$ && $target != . && $target != .. ]] || {
     echo "wait-for: invalid job slug '$target' (use only letters, digits, dot, underscore and hyphen)" >&2
@@ -658,6 +747,7 @@ wait_job() {
       exit 64
     fi
   done
+  [ "${SANDBOX_RUNTIME:-}" != 1 ] || run_job_in_sandbox
   user=(--user)
   probe=$(unit_snapshot LoadState ActiveState SubState) || unreadable_manager
   if [ "$(snapshot_field "$probe" LoadState)" != loaded ]; then
