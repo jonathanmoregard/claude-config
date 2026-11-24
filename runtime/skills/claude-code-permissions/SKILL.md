@@ -96,6 +96,13 @@ So `Read(/secrets/**)` in user settings guards `~/.claude/secrets/**` and nothin
 in any project. This repo hit exactly that: commit `602e6e4` re-anchored every path
 rule at `//` after finding the single-slash forms inert. That change was correct.
 
+**Home paths: `~/` for allows, both forms for denies and asks.** `~/` follows the
+HOME the CLI started with; `//home/jonathan/` does not. Under another HOME (CI's
+`/home/runner`, a wrapper, sudo) a `~/`-only deny stops guarding the real file and
+a `//home/jonathan/` allow turns into a prompt. So write each home-path `Read`/`Edit`
+deny or ask twice (`~/x` and `//home/jonathan/x`), and each allow as `~/x` only.
+`tests/test_permission_anchors.py` enforces this.
+
 Symlinks are checked on both link and target: **allow** needs both to match, **deny**
 fires if either does. **[docs]**
 
