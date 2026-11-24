@@ -99,7 +99,13 @@ concurrent reproducers would mutate shared state.
 
 Then:
 
-- First: findings (any round, fixed or not) sharing one cause? Don't
+- First, append this round's rows to `<notes>/review-ledger.tsv`
+  (`references/ledger.md`; a `none` row per silent check). From round 2,
+  resumed too, run
+  `node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
+  (this close-out's). Nonzero → `references/rabbit-hole.md`; at the cap,
+  report-only.
+- Next: findings (any round, fixed or not) sharing one cause? Don't
   haphazardly patch the unaddressed root cause: `references/one-root-cause.md`.
 - Reproduced, and caused by the diff or violating its acceptance contract:
   fix it now. The reproducer stays as a regression test.
@@ -117,7 +123,7 @@ Then:
 
 A round is one blind pair over the current integrated diff. After a round's
 fixes, run each reproducer, the project gate, the acceptance scenarios and the
-deterministic gate again, then run another round. Every round after the
+deterministic gate again; then, if the convergence check held, run another round. Every round after the
 first:
 
 1. Covers the whole diff including the fix commits. A fix is new code and is
@@ -131,13 +137,6 @@ first:
 4. Is deduplicated by you after both reviewers report: a finding that matches
    an earlier adjudicated one by meaning keeps the earlier outcome. Apart
    from the sibling line, no reviewer is shown an earlier finding.
-
-Append each adjudicated round's rows to `<notes>/review-ledger.tsv`
-(`references/ledger.md`; a `none` row per silent check). After adjudicating
-round 2 onward, before fixes or next reviewers (resumed too):
-`node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
-(this close-out's). Nonzero → `references/rabbit-hole.md`,
-before `one-root-cause.md`; at the cap, report-only.
 
 Stop when two consecutive rounds are empty (nothing new reproduced or
 unconfirmed). Cap: four rounds. At the cap without them, report "not
