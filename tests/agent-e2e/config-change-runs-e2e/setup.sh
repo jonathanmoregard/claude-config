@@ -38,3 +38,7 @@ git -C "$cfg" push -q -u origin master
 git -C "$cfg" fetch -q origin
 rmdir "$WORK"
 git -C "$cfg" worktree add -q -b feat/english-replies "$WORK" origin/master
+# git wrote the staged dir's path into the worktree's .git; the agent's git
+# reaches that repository through its own HOME (E2E_HOME), the only name the
+# staged HOME has inside the sandbox.
+sed -i "s|^gitdir: $HOME/|gitdir: ${E2E_HOME:-$HOME}/|" "$WORK/.git"

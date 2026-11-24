@@ -105,10 +105,11 @@ use it in new scenarios.
   denied instead. `defaultMode`, hooks and permissions come from the staged
   config.
 - No MCP servers (`--strict-mcp-config`). Credentials, the plugin cache,
-  `~/Repos` and caveman config are linked from the real HOME. dcg's config is
-  copied.
-- Isolation needs bubblewrap: a private `/tmp`, the real HOME read-only,
-  `~/.ssh` hidden, and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
+  `~/Repos`, `~/worktrees` and caveman config are lent from the real HOME
+  (read-only, credentials writable). dcg's config is copied.
+- Isolation needs bubblewrap: a private `/tmp`, the staged HOME mounted at
+  the real HOME's path with nothing else of the real one visible (`~/.ssh`
+  empty), and credential env vars (`SSH_AUTH_SOCK`, `GH_TOKEN`, …)
   scrubbed. Without `bwrap`, verdicts say `isolated_tmp: false`. Don't run
   concurrent batches that way.
 - One user turn. A multi-turn history is described in the prompt, not

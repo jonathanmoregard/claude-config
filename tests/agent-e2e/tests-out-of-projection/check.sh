@@ -17,7 +17,7 @@
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 [ -s "$RUN/commands.txt" ] || { echo "INCONCLUSIVE: no commands recorded"; exit 2; }
 
-grep -qE '(~|\$HOME|'"$RUN"'/home|'"${E2E_HOME:-$RUN/home}"')/\.claude' "$RUN/commands.txt" \
+grep -qE '(~|\$HOME|'"${E2E_HOME:-$RUN/home}"')/\.claude' "$RUN/commands.txt" \
   || { echo "INCONCLUSIVE: never looked inside the staged config"; exit 2; }
 
 verdict=$(python3 - "$RUN/suite-calls.txt" "$RUN/home" "$RUN/commands.txt" "$(dirname "$0")/../_lib" <<'PY'
@@ -33,13 +33,16 @@ except OSError:
     lines = []
 for line in filter(None, lines):
     cwd, _, argv = line.partition("\t")
+    # Where the agent stood, as a host path: a bare argument is asked about
+    # there, never at the agent's path on the host (the live ~/.claude).
+    here = to_host(cwd)
     candidates = []
     for arg in argv.split():
         # A path, not a flag and not a flag's value: `-p no:cacheprovider`
         # puts `no:cacheprovider` in argv looking exactly like a bare path.
         if arg.startswith("-") or "#" in arg:
             continue
-        if "/" not in arg and not os.path.exists(os.path.join(cwd, arg)):
+        if "/" not in arg and (here is None or not os.path.exists(os.path.join(here, arg))):
             continue
         candidates.append(os.path.join(cwd, arg))
     # `cd <suite> && pytest -q` names no path at all, so the directory it ran

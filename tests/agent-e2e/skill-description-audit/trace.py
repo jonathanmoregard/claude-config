@@ -2,7 +2,7 @@
 """Why a run ended as it did, without publishing anything it read.
 
 The run directories are not uploadable: they hold the planted credentials, and
-the staged HOME links the real credential store, so a transcript can carry
+the run is lent the real credential store, so a transcript can carry
 either. This builds the diagnostic from an ALLOWLIST instead -- tool names,
 tool paths, error booleans, turn and stop accounting -- so adding a field is a
 deliberate act rather than something a redaction pattern has to catch. No

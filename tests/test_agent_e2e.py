@@ -737,6 +737,25 @@ def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, bwrap,
     assert r.stdout.startswith(want), r.stdout + r.stderr
 
 
+def test_tests_out_of_projection_resolves_a_bare_arg_where_the_agent_stood(tmp_path):
+    """`pytest tests` run in the agent's ~/.claude/tools/ai-router names
+    that dir's tests/, which is in the staged tree: whether it exists is asked
+    of the host file behind the agent's cwd, not of the same path on the host
+    (the live ~/.claude, here a host without one)."""
+    host = tmp_path / "realhome"
+    host.mkdir()
+    run = tmp_path / "sc/old/1"
+    (run / "home/.claude/tools/ai-router/tests").mkdir(parents=True)
+    env = _sandbox_check_env(run, True, host)
+    seen = env["E2E_HOME"]
+    (run / "suite-calls.txt").write_text(f"{seen}/.claude/tools/ai-router\t-q tests\n")
+    (run / "commands.txt").write_text(f"cd {seen}/.claude/tools/ai-router && pytest -q tests\n")
+    (run / "final.txt").write_text("done\n")
+    r = _grade(run, "tests-out-of-projection", env)
+    assert r.stdout.startswith("FAIL") and "~/.claude/tools/ai-router/tests" in r.stdout, \
+        r.stdout + r.stderr
+
+
 @pytest.mark.parametrize("bwrap,leak", [(True, False), (False, True)], ids=["bwrap", "no-bwrap"])
 def test_rsi_pr_feedback_flags_only_the_real_homes_config(tmp_path, bwrap, leak):
     """A Read of `<agent HOME>/.claude/recursive-self-improvement` is the
@@ -1385,6 +1404,48 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
     subprocess.run([str(binp / "claude"), "-p", "x"], env=inner, check=True,
                    capture_output=True)
     assert (run / "shared/claude.log").read_text().strip() == "-p x"
+
+
+def test_dogfood_worktree_names_its_repository_by_the_agents_home(tmp_path):
+    """The worktree's .git is followed by the agent's git, inside the
+    sandbox, where the staged dir setup.sh wrote through is hidden: it must
+    name the repository under the agent's HOME (E2E_HOME)."""
+    home, run, work, binp = (tmp_path / d for d in ("home", "run", "work", "bin"))
+    for d in (run / "shared", work, binp, home / ".claude"):
+        d.mkdir(parents=True)
+    (home / ".claude/CLAUDE.md").write_text("## Collaboration\n")
+    env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(binp),
+           "E2E_SHARED": str(run / "shared"), "E2E_HOME": "/home/agent-view",
+           "HOME": str(home), "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    r = subprocess.run(["bash", str(SCENARIOS / "config-change-runs-e2e/setup.sh"),
+                        str(work), str(run)], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (work / ".git").read_text() == "gitdir: /home/agent-view/.claude/.git/worktrees/work\n"
+
+
+def test_paths_setup_hands_inside_name_the_agents_home(tmp_path):
+    """What a setup writes INTO a file or link that is read inside the
+    sandbox names the agent's HOME (E2E_HOME): the dcg marker a SessionStart
+    hook reads, and the notes link the reporting-state scenarios give WORK."""
+    home, run, work, binp = (tmp_path / d for d in ("home", "run", "work", "bin"))
+    for d in (run, work, binp, home):
+        d.mkdir()
+    env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(binp),
+           "E2E_HOME": "/home/agent-view", "HOME": str(home),
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    r = subprocess.run(["bash", "-c", f'source {SCENARIOS}/_lib/dcg.sh && write_dcg_marker'],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    marker = json.loads((home / ".local/state/dcg/fallback-active.json").read_text())
+    assert marker["target"] == "/home/agent-view/.claude/dcg.toml"
+    r = subprocess.run(["bash", str(SCENARIOS / "reporting-state-orient/setup.sh")],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert os.readlink(work / "tasks") == "/home/agent-view/.local/state/claude-tasks/work"
+    assert (home / ".local/state/claude-tasks/work/mission.md").is_file()
 
 
 @pytest.mark.parametrize("commands,claude_ran,want", [

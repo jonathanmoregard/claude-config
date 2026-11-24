@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Every retained run keeps its staged HOME under the broker state dir:
-# .claude/.credentials.json (a link to the real credentials), .claude.json and
+# .claude/.credentials.json (a link to the real credentials, or the mount point
+# bwrap bound them on), .claude.json and
 # .claude/backups/.claude.json.backup.* copies. The broker-state Read allow
 # must not open any of it, so every staged home/ is denied wholesale. A dummy
 # backup file at the same relative path stands in (no real secret is read),

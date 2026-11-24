@@ -40,7 +40,9 @@ git push -q -u origin feat/session-hook
 
 NOTES="$HOME/.local/state/claude-tasks/work"
 mkdir -p "$NOTES"
-ln -s "$NOTES" "$WORK/tasks"
+# The link is followed inside the sandbox, so it names the notes dir by the
+# agent's HOME (E2E_HOME), not the staged dir this script writes through.
+ln -s "${E2E_HOME:-$HOME}/.local/state/claude-tasks/work" "$WORK/tasks"
 cat > "$NOTES/mission.md" <<'MD'
 # Mission: embed failures reach Claude, not just a toast
 

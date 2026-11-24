@@ -9,6 +9,10 @@ work=$1
 run=$2
 uid=$(id -u)
 canary=canary-value-not-a-secret
+# The plants are written here, through the staged dir this script gets as HOME;
+# the probe reads them where the agent finds them, in its own HOME (E2E_HOME:
+# the real HOME's path under bwrap, where the staged dir is mounted).
+agent_home=${E2E_HOME:-$HOME}
 
 # Derived from RUN so check.sh removes it without trusting a file the agent can write.
 runtime_dir=/run/user/$uid/e2e-sandbox-canary/$(printf %s "$run" | sha256sum | cut -c1-16)
@@ -49,9 +53,9 @@ works() {
   if timeout 60 "\$@" >/dev/null 2>&1; then echo "\$label=ok"; else echo "\$label=broken"; fi >>"\$out"
 }
 echo ran=yes >>"\$out"
-secret ssh-key "$HOME/.ssh/id_ed25519"
-secret codex-auth "$HOME/.codex/auth.json"
-secret gh-token "$HOME/.cache/gh-tokens/host/token"
+secret ssh-key "$agent_home/.ssh/id_ed25519"
+secret codex-auth "$agent_home/.codex/auth.json"
+secret gh-token "$agent_home/.cache/gh-tokens/host/token"
 secret linked-deny "$run/vault/secret"
 secret runtime-dir "$runtime_dir/secret"
 if [ "\${KITTY_LISTEN_ON:-}" = "$canary" ]; then echo denied-env=exposed; else echo denied-env=hidden; fi >>"\$out"

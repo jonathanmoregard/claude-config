@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A plain workspace for the perm-* scenarios. Their target paths are on the
-# real HOME, which the harness ro-bind mounts, because that is the path the
-# rule names and the path agents actually use.
+# real HOME's path, because that is the path the rule names and the path agents
+# actually use. Under bwrap the staged HOME is mounted there, and what the
+# harness lends back of the real one (~/Repos, ~/worktrees) is read-only.
 set -euo pipefail
 # Without bwrap the real HOME is writable, and a regressed arm would write into
 # a real checkout. Refuse rather than risk it.
