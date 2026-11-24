@@ -41,8 +41,9 @@ EVENTS (one script, dispatched on hook_event_name):
          PASS_WITH_FIXES and not from a suspect prompt, every changed file's
          latest review (by an advisor that READ it) passed and has drifted at
          most 20 lines since, and the whole tree at most 20 lines; OR
-      4. the user waived it in this session with `skip-artl` (consumed by this
-         one PR open, logged; see UserPromptSubmit).
+      4. the user waived it for this branch in this session with
+         `skip-artl <branch>` (consumed by this one PR open, logged; see
+         UserPromptSubmit).
     Fail -> permissionDecision "deny" with every reason. Pass -> no output, and
     a one-shot grant for the PermissionRequest below.
     When the same Bash command runs `git commit` before the PR open, the gate
@@ -67,10 +68,10 @@ EVENTS (one script, dispatched on hook_event_name):
 
   UserPromptSubmit
     The user arms a one-shot override for this session by sending a message
-    in which `skip-artl` stands alone on a line of its own (or is the whole
-    message), optionally followed by a branch (`skip-artl feat/x`): a named
-    waiver is spent only by a PR open from that branch, and a PR open from
-    any other branch leaves it armed. A mention inside a sentence -- "what does skip-artl do?", or a
+    in which `skip-artl <branch>` stands alone on a line of its own (or is the
+    whole message). The waiver is spent only by a PR open from that branch; a
+    PR open from any other branch leaves it armed. A bare `skip-artl`, naming
+    no branch, arms nothing. A mention inside a sentence -- "what does skip-artl do?", or a
     pasted refusal from this gate, which names the word -- arms nothing.
     A prompt carrying any agent-authored wrapper never arms it: a
     task-notification (subagent and background-job output, a resumed
@@ -97,7 +98,7 @@ from pathlib import Path
 import artl_gate as g
 
 SKIP_TOKEN = "skip-artl"
-SKIP_LINE = re.compile(rf"{SKIP_TOKEN}(?:\s+(\S+))?")
+SKIP_LINE = re.compile(rf"{SKIP_TOKEN}\s+(\S+)")
 # Text written by an agent, not the user, reaches UserPromptSubmit wrapped in
 # one of these (Claude Code 2.1.322's own list of agent/untrusted wrappers,
 # plus the framing lines it puts around a peer message). MEASURED for a peer
@@ -118,8 +119,9 @@ REMEDY = (
     "automatically), its findings fixed, then the same PR open again, as its own "
     "command. Edits of up to 20 lines after that review still count. "
     "If the advisor is unavailable, only the user can waive the review: their own "
-    "message with the waiver word (skip-artl) standing alone on a line of its own. "
-    "The waiver covers one PR open and is logged."
+    "message with the waiver word followed by the branch this PR opens from "
+    "(skip-artl <branch>) standing alone on a line of its own. "
+    "The waiver covers one PR open from that branch and is logged."
 )
 
 
@@ -177,16 +179,15 @@ def on_prompt(payload: dict) -> None:
     g.write_json(override_path(session), {"ts": time.time(), "prompt_sha256": g.sha256(prompt),
                                           "branch": branch})
     out({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": (
-        "pr-open-gate: the user typed skip-artl. The next PR open in this session "
-        + (f"from branch {branch} " if branch else "")
-        + "that lacks advice-refine-test-loop evidence is allowed once, and the waiver "
-        "is logged to artl-exemptions.jsonl.")}})
+        f"pr-open-gate: the user typed skip-artl {branch}. The next PR open in this "
+        f"session from branch {branch} that lacks advice-refine-test-loop evidence is "
+        "allowed once, and the waiver is logged to artl-exemptions.jsonl.")}})
 
 
 def take_override(session: str, now: float, branch: str | None) -> bool:
     path = override_path(session)
     data = g.read_json(path)
-    if not data or data.get("branch") not in (None, branch):
+    if not data or not branch or data.get("branch") != branch:
         return False
     try:
         path.unlink()
