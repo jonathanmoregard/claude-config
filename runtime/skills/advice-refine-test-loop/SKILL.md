@@ -137,11 +137,11 @@ nothing new unconfirmed. Cap: four rounds. At the cap without two empty
 rounds, stop and report "not converged" with the count per round; the user
 decides what happens next.
 
-After adjudication, append each round's rows to `<notes>/review-ledger.tsv`
-(`references/ledger.md`; a `none` row per silent check). Before rounds 3–4, run
+Append each adjudicated round's rows to `<notes>/review-ledger.tsv`
+(`references/ledger.md`; a `none` row per silent check); from round 2, run
 `node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
-(this close-out's, in order). `fire` → `references/rabbit-hole.md`
-first; at the cap, report-only.
+(this close-out's). Nonzero exit → `references/rabbit-hole.md`,
+before `one-root-cause.md`; at the cap, report-only.
 
 ## Report
 

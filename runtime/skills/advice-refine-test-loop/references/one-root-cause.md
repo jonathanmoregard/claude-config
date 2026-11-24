@@ -65,6 +65,8 @@ In this situation, this file wins over:
 The count-based breaker (`rabbit-hole.md`) is separate: it fires on counts and
 asks an advisor about the mechanism. This rule needs neither; you see the
 shape while adjudicating. A cause already removed here is not a thread for it.
+When the breaker has fired, it goes first: follow `rabbit-hole.md`, and come
+back here only while adjudicating a later round.
 
 ## 5. Ledger and report
 

@@ -9,7 +9,7 @@ This file is the step that stops it: count, diagnose, research, replace.
 1. Write each round's ledger rows as soon as that round is adjudicated, each
    `where` the finding's `file:line` exactly as its reviewer reported it
    (`ledger.md` rule 6).
-2. Before every round after the second, run:
+2. After adjudicating each round from the second on, the cap's included, run:
 
    ```bash
    node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts \

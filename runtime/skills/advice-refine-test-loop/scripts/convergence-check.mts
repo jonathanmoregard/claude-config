@@ -142,6 +142,7 @@ function rowProblems(f: readonly string[]): Problem[] {
 
 function readRounds(ledger: string, runs: readonly string[]): Round[] {
   const rounds = new Map<string, Round>(runs.map((run) => [run, { run, rows: 0, sites: new Map() }]));
+  const tokens = new Set(runs.map((run) => run.split("/")[0]));
   let text: string;
   try {
     text = readFileSync(ledger, "utf8");
@@ -153,7 +154,14 @@ function readRounds(ledger: string, runs: readonly string[]): Round[] {
     if (line === "") return;
     const f = line.split("\t");
     const round = rounds.get(f[2] ?? "");
-    if (round === undefined) return;
+    if (round === undefined) {
+      // This close-out's token with a malformed round (T/R2, T/r02): a typo that would drop the row.
+      const [tok = "", rnd = ""] = (f[2] ?? "").split("/");
+      if (tokens.has(tok) && !/^r[1-9][0-9]*$/.test(rnd)) {
+        problems.push({ column: "run", text: `${ledger}:${i + 1}: run ${f[2]} is not <token>/r<N>` });
+      }
+      return;
+    }
     round.rows++;
     const at = `${ledger}:${i + 1}`;
     if (f.length !== 10) {

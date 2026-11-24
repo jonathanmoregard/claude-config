@@ -112,6 +112,12 @@ says "two tokens: both are named" "$GS"
 run "$TMP/notoken.tsv" abc1234/r1 abc1234/r2
 expect "a label with no HHMM in its token: exits $INPUT" $INPUT "$rc"
 says "a label with no HHMM: named" "abc1234/r1"
+for typo in R2 r02; do
+  { srow e000001-0900/r1 /x.py:1; srow e000001-0900/r2 /y.py:1; srow "e000001-0900/$typo" /x.py:2; } > "$TMP/typo.tsv"
+  run "$TMP/typo.tsv" e000001-0900/r1 e000001-0900/r2
+  expect "a row of this token with round '$typo': exits $INPUT" $INPUT "$rc"
+  says "round '$typo': the row is named" "typo.tsv:3"
+done
 
 # --- grep-over-sed: one row per finding; >= fires on a flat count --------
 run "$LEDGER" $GS/r1 $GS/r2
