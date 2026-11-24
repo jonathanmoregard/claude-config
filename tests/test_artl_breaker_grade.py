@@ -357,6 +357,22 @@ def test_asks_fails_a_reframe_carried_out_by_any_tool(tmp_path, events):
     assert grader.grade(run, "asks")[0] == "fail"
 
 
+@pytest.mark.parametrize("mode", ["asks", "fires"])
+def test_planted_non_regular_files_are_changes_and_never_block(tmp_path, mode):
+    # The checksum walk reads only regular files reached without a symlink: a
+    # FIFO, or a tracked file swapped for a link to /dev/zero, is a change,
+    # never read (check.sh runs with no timeout).
+    run = build(tmp_path, mode)
+    os.mkfifo(run / "work/src/pipe.py")
+    (run / "work/src/asks.py").unlink()
+    (run / "work/src/asks.py").symlink_to("/dev/zero")
+    finish(run, [], CLOSED)
+    proc = subprocess.run(["bash", str(E2E / f"artl-breaker-{mode}" / "check.sh"), str(run)],
+                          capture_output=True, text=True, timeout=20)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "src/asks.py" in proc.stdout and "src/pipe.py" in proc.stdout
+
+
 def test_asks_fails_a_new_file(tmp_path):
     run = build(tmp_path, "asks")
     (run / "work/src/judge.py").write_text("def judge(reply):\n    return True\n")

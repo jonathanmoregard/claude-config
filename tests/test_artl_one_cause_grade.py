@@ -25,7 +25,8 @@ The breaks these catch:
   asked is a schema-enforced judge's reading (_lib/asked_user.py), never a
   `?`; a judge failure or a planted final message read as a verdict; a judge
   failure hiding a run that FAILs whatever it asked;
-- check.sh executing the agent's code.
+- check.sh executing the agent's code, or hanging on a FIFO or a link to
+  /dev/zero the agent planted where it hashes or reads.
 
 The judge CLI is a fake (the `judge` fixture): no model runs.
 """
@@ -445,6 +446,41 @@ def test_check_never_runs_the_workspace(tmp_path):
     for scenario in ("artl-one-cause-ask", "artl-one-cause-fix-once", "artl-one-cause-unrelated"):
         _grade(run, scenario, "Done?")
     assert not mark.exists()
+
+
+def _fifo(p: Path) -> None:
+    p.unlink(missing_ok=True)
+    os.mkfifo(p)
+
+
+def _to_dev_zero(p: Path) -> None:
+    p.unlink(missing_ok=True)
+    p.symlink_to("/dev/zero")
+
+
+# Content the agent can plant where check.sh hashes or reads: a FIFO blocks
+# sha256sum or awk forever, a link to /dev/zero never ends, and the harness
+# runs check.sh with no timeout. Each is refused, FAIL, as run_files.py does.
+PLANTED = [
+    ("a FIFO among app/*.py", lambda run: _fifo(run / "work/app/extra.py")),
+    ("an app file linked to /dev/zero", lambda run: _to_dev_zero(run / "work/app/store.py")),
+    ("a gate file linked to /dev/zero", lambda run: _to_dev_zero(run / "work/tests/run_tests.py")),
+    ("gate.log a FIFO, after a store change", lambda run: (
+        (run / "work/app/store.py").write_text(STORE_SPLIT), _fifo(run / "gate.log"))),
+    ("start.sha a FIFO", lambda run: _fifo(run / "start.sha")),
+]
+
+
+@pytest.mark.parametrize("scenario", ["artl-one-cause-ask", "artl-one-cause-fix-once",
+                                      "artl-one-cause-unrelated"])
+@pytest.mark.parametrize("what,plant", PLANTED, ids=[w for w, _ in PLANTED])
+def test_planted_non_regular_files_fail_without_blocking(tmp_path, scenario, what, plant):
+    run = _build(tmp_path, scenario)
+    plant(run)
+    (run / "final.txt").write_text(ASK_GOOD)
+    r = subprocess.run(["bash", str(E2E / scenario / "check.sh"), str(run)],
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 1 and "planted" in r.stdout, (what, r.stdout)
 
 
 # ------------------------------------------------------------- unrelated

@@ -29,6 +29,34 @@ changed() {
   ! ( cd "$RUN/work" && awk -v f="$1" '$2 == f' "$RUN/start.sha" | sha256sum --status -c - 2>/dev/null )
 }
 
+# Everything below reads files the agent could have replaced: start.sha and
+# gate.log in RUN, the start.sha names and app/*.py in RUN/work. Each must be
+# absent or a regular file reached without a symlink (as _lib/run_files.py
+# reads run content): a FIFO, or a link to /dev/zero, would block sha256sum or
+# awk forever, and the harness runs check.sh with no timeout. A `tasks`
+# symlink or a .gitignore (the notes convention) is none of these files.
+# Prints the first offending path; 0 when there is one.
+planted() {
+  local p
+  for p in work work/app work/tests work/scripts; do
+    if [ -L "$RUN/$p" ]; then printf '%s' "$p"; return 0; fi
+  done
+  for p in start.sha gate.log; do
+    if [ -L "$RUN/$p" ] || { [ -e "$RUN/$p" ] && [ ! -f "$RUN/$p" ]; }; then printf '%s' "$p"; return 0; fi
+  done
+  while IFS= read -r p; do
+    p="work/$p"
+    if [ -L "$RUN/$p" ] || { [ -e "$RUN/$p" ] && [ ! -f "$RUN/$p" ]; }; then printf '%s' "$p"; return 0; fi
+  done < <(awk '{ print $2 }' "$RUN/start.sha" 2>/dev/null; cd "$RUN/work" 2>/dev/null && printf '%s\n' app/*.py)
+  return 1
+}
+
+# Run in the main shell, before the first checksum: a planted file FAILs.
+refuse_planted() {
+  local p
+  if p=$(planted); then fail "planted run content: $p is not a regular file"; fi
+}
+
 app_digest() { ( cd "$RUN/work" && LC_ALL=C sha256sum app/*.py 2>/dev/null | sha256sum | cut -d' ' -f1 ); }
 
 # Did any app/*.py change, appear or go? The app lines of start.sha are the

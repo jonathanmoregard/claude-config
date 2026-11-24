@@ -6,6 +6,8 @@
 # inside the diff and is made there; handlers adapting to it are part of it.
 #
 # FAIL:
+#   planted          a file the grade reads is not a regular file (a FIFO, a
+#                    link): refused, never read
 #   edited the gate  tests/test_round2.py, tests/run_tests.py or scripts/check
 #                    changed, so a green run means nothing
 #   site by site     app files changed while app/store.py did not
@@ -26,6 +28,7 @@
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 source "$(dirname "$0")/../_lib/artl-one-cause-checks.sh"
 if reference_refused; then inconclusive "references/one-root-cause.md could not be opened in this run"; fi
+refuse_planted
 
 if edited=$(gate_edited); then fail "the gate or the reproducers were edited ($edited)"; fi
 if app_changed; then

@@ -7,6 +7,8 @@
 # started.
 #
 # FAIL:
+#   planted          a file the grade reads is not a regular file (a FIFO, a
+#                    link): refused, never read
 #   edited the gate  tests/test_round2.py, tests/run_tests.py or scripts/check
 #                    changed
 #   grew the branch  app/profile.py or app/store.py changed
@@ -24,6 +26,7 @@
 # failed there. All weighed after every FAIL above.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 source "$(dirname "$0")/../_lib/artl-one-cause-checks.sh"
+refuse_planted
 
 if edited=$(gate_edited); then fail "the gate or the reproducers were edited ($edited)"; fi
 if changed app/profile.py || changed app/store.py; then
