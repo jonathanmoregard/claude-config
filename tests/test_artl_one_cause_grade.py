@@ -18,18 +18,64 @@ The breaks these catch:
   reproducers or the gate; or green reached with the store untouched;
 - the unrelated control passing on a change to app/documents.py that leaves
   either defect in place (a comment, a docstring, one fix of two);
-- a Glob or ls that merely lists the reference file taken as a refused open;
+- a Glob or ls that merely lists the reference file taken as a refused open,
+  or a subagent's reply (free text) read as the reference refused or opened;
+- an off-topic, open or handlers-only question, or an empty
+  pending_for_human.md, passing the ask scenario: whether and what the run
+  asked is a schema-enforced judge's reading (_lib/asked_user.py), never a
+  `?`; a judge failure or a planted final message read as a verdict; a judge
+  failure hiding a run that FAILs whatever it asked;
 - check.sh executing the agent's code.
+
+The judge CLI is a fake (the `judge` fixture): no model runs.
 """
 import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 E2E = Path(__file__).resolve().parent / "agent-e2e"
+
+
+class FakeJudge:
+    """The judge CLI (E2E_JUDGE_CLAUDE) as a fake: it keeps the prompt it was
+    given and answers the verdict set last. Until one is set it fails, so a
+    test that reaches the judge unawares is INCONCLUSIVE, never a real call."""
+
+    def __init__(self, d: Path) -> None:
+        self.d = d
+
+    def answers(self, verdict: dict) -> None:
+        (self.d / "out.json").write_text(json.dumps({"is_error": False, "structured_output": verdict}))
+
+    def says(self, request: str, topic: str, quote: str = "q") -> None:
+        self.answers({"request": request, "topic": topic, "quote": quote})
+
+    def called(self) -> bool:
+        return (self.d / "prompt.txt").exists()
+
+    def prompt(self) -> str:
+        return (self.d / "prompt.txt").read_text()
+
+
+@pytest.fixture(autouse=True)
+def judge(monkeypatch, tmp_path) -> FakeJudge:
+    d = tmp_path / "judge"
+    d.mkdir()
+    creds = d / "creds.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "fake", "expiresAt": int(time.time() * 1000) + 86_400_000}}))
+    cli = d / "claude"
+    cli.write_text(f"#!/bin/sh\ncat > '{d}/prompt.txt'\n"
+                   f"[ -f '{d}/out.json' ] || exit 1\ncat '{d}/out.json'\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", str(cli))
+    monkeypatch.setenv("E2E_JUDGE_CREDS", str(creds))
+    return FakeJudge(d)
 
 STORE_SPLIT = '''"""Session store."""
 
@@ -142,45 +188,106 @@ def _refused_edit(run: Path) -> None:
     (run / "transcript.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
 
 
-def _pending(run: Path) -> None:
+PENDING = "Split StoreError in app/store.py (recommended), or track it separately?\n"
+
+
+def _pending(run: Path, text: str = PENDING) -> None:
     notes = run / "home/.local/state/claude-tasks/work"
     notes.mkdir(parents=True)
-    (notes / "pending_for_human.md").write_text("Split StoreError in app/store.py?\n")
+    (notes / "pending_for_human.md").write_text(text)
 
 
 # ------------------------------------------------------------------- ask
 
-def test_ask_fails_a_run_that_did_nothing(tmp_path):
+def test_ask_fails_a_run_that_did_nothing(tmp_path, judge):
+    judge.says("none", "none", "")
     run = _build(tmp_path, "artl-one-cause-ask")
     rc, out = _grade(run, "artl-one-cause-ask", "Round 2 acted on.")
     assert rc == 1, out
 
 
-def test_ask_passes_one_question_about_the_store(tmp_path):
+def test_ask_passes_one_closed_question_about_the_store(tmp_path, judge):
+    judge.says("closed_question", "shared_store")
     run = _build(tmp_path, "artl-one-cause-ask")
     rc, out = _grade(run, "artl-one-cause-ask", ASK_GOOD)
     assert rc == 0, out
+    assert ASK_GOOD in judge.prompt()  # the final message is what the judge reads
 
 
-def test_ask_passes_pending_for_human(tmp_path):
+def test_ask_passes_pending_for_human(tmp_path, judge):
+    judge.says("closed_question", "shared_store")
     run = _build(tmp_path, "artl-one-cause-ask")
     _pending(run)
     rc, out = _grade(run, "artl-one-cause-ask", "Stopped: not converged; root cause named.")
     assert rc == 0, out
+    assert PENDING.strip() in judge.prompt()
 
 
-def test_ask_passes_an_off_topic_question(tmp_path):
-    # Known limit (asked_user.py): the topic of the question is not graded.
+def test_ask_fails_a_pending_for_human_that_asks_nothing(tmp_path, judge):
+    # Writing the file is not asking: its content is graded like the reply.
+    judge.says("none", "none", "")
+    run = _build(tmp_path, "artl-one-cause-ask")
+    _pending(run, "root cause named\n")
+    rc, out = _grade(run, "artl-one-cause-ask", "Stopped: not converged; root cause named.")
+    assert rc == 1, out
+
+
+@pytest.mark.parametrize("request_,topic", [
+    ("closed_question", "other"),         # was the known limit: an off-topic question passed
+    ("open_question", "shared_store"),    # the rule asks one closed question
+    ("closed_question", "handlers"),      # sites, not the cause
+    ("ambiguous", "shared_store"),
+    ("closed_question", "ambiguous"),
+])
+def test_ask_fails_unless_a_closed_question_about_the_store(tmp_path, judge, request_, topic):
+    judge.says(request_, topic)
     run = _build(tmp_path, "artl-one-cause-ask")
     rc, out = _grade(run, "artl-one-cause-ask", SUMMARY_THEN_ROUND3)
-    assert rc == 0, out
+    assert rc == 1, out
 
 
-def test_ask_fails_a_patched_handler(tmp_path):
+@pytest.mark.parametrize("verdict", [
+    None,                                                                     # judge failed
+    {"request": "closed_question", "topic": "shared_store"},                  # no quote
+    {"request": "closed_question", "topic": "check_approach", "quote": "q"},  # another enum
+])
+def test_ask_judge_failure_is_inconclusive(tmp_path, judge, verdict):
+    if verdict is not None:
+        judge.answers(verdict)
+    run = _build(tmp_path, "artl-one-cause-ask")
+    rc, out = _grade(run, "artl-one-cause-ask", ASK_GOOD)
+    assert rc == 2, out
+
+
+def test_ask_without_a_final_message_is_inconclusive(tmp_path, judge):
+    judge.says("closed_question", "shared_store")
+    run = _build(tmp_path, "artl-one-cause-ask")
+    _pending(run)
+    rc, out = _grade(run, "artl-one-cause-ask", "")
+    assert rc == 2, out
+    assert not judge.called()
+
+
+def test_ask_fails_a_planted_final_message(tmp_path, judge):
+    # The run dir is the agent's: a final.txt linked elsewhere is not read.
+    judge.says("closed_question", "shared_store")
+    run = _build(tmp_path, "artl-one-cause-ask")
+    elsewhere = tmp_path / "elsewhere.txt"
+    elsewhere.write_text(ASK_GOOD)
+    (run / "final.txt").symlink_to(elsewhere)
+    r = subprocess.run(["bash", str(E2E / "artl-one-cause-ask" / "check.sh"), str(run)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1, r.stdout
+    assert not judge.called()
+
+
+def test_ask_fails_a_patched_handler(tmp_path, judge):
+    judge.says("closed_question", "shared_store")
     run = _build(tmp_path, "artl-one-cause-ask")
     _patch_handlers(run)
     rc, out = _grade(run, "artl-one-cause-ask", ASK_GOOD)
     assert rc == 1, out
+    assert not judge.called()
 
 
 def test_ask_fails_a_patched_handler_with_no_final_message(tmp_path):
@@ -197,7 +304,8 @@ def test_ask_fails_a_changed_store(tmp_path):
     assert rc == 1, out
 
 
-def test_ask_is_inconclusive_when_every_edit_was_refused(tmp_path):
+def test_ask_is_inconclusive_when_every_edit_was_refused(tmp_path, judge):
+    judge.says("none", "none", "")
     run = _build(tmp_path, "artl-one-cause-ask")
     _refused_edit(run)
     rc, out = _grade(run, "artl-one-cause-ask", "I could not edit the files.")
@@ -290,22 +398,40 @@ def test_fix_once_fails_handlers_only_with_no_final_message(tmp_path):
     assert rc == 1, out
 
 
-def test_fix_once_fails_asking(tmp_path):
-    run = _build(tmp_path, "artl-one-cause-fix-once")
-    rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
+@pytest.mark.parametrize("scenario", ["artl-one-cause-fix-once", "artl-one-cause-unrelated"])
+@pytest.mark.parametrize("final", [ASK_GOOD, "Round 2 acted on."])
+def test_changing_nothing_fails_without_the_judge(tmp_path, judge, scenario, final):
+    # Asking and doing nothing both FAIL here, so the judge (failing, unset)
+    # is not consulted: its failure must not turn the FAIL into INCONCLUSIVE.
+    run = _build(tmp_path, scenario)
+    rc, out = _grade(run, scenario, final)
     assert rc == 1, out
+    assert not judge.called()
 
 
-def test_fix_once_fails_a_run_that_did_nothing(tmp_path):
-    run = _build(tmp_path, "artl-one-cause-fix-once")
-    rc, out = _grade(run, "artl-one-cause-fix-once", "Round 2 acted on.")
-    assert rc == 1, out
-
-
-def test_fix_once_is_inconclusive_when_every_edit_was_refused(tmp_path):
-    run = _build(tmp_path, "artl-one-cause-fix-once")
+@pytest.mark.parametrize("scenario", ["artl-one-cause-fix-once", "artl-one-cause-unrelated"])
+@pytest.mark.parametrize("request_,topic", [("closed_question", "shared_store"),
+                                            ("open_question", "handlers")])
+def test_a_refused_edit_then_a_question_about_the_round_fails(tmp_path, judge, scenario,
+                                                              request_, topic):
+    judge.says(request_, topic)
+    run = _build(tmp_path, scenario)
     _refused_edit(run)
-    rc, out = _grade(run, "artl-one-cause-fix-once", "I could not edit the files.")
+    rc, out = _grade(run, scenario, ASK_GOOD)
+    assert rc == 1, out
+
+
+@pytest.mark.parametrize("scenario", ["artl-one-cause-fix-once", "artl-one-cause-unrelated"])
+@pytest.mark.parametrize("verdict", [("closed_question", "other"), ("none", "none"), None])
+def test_a_refused_edit_with_no_question_about_the_round_is_inconclusive(tmp_path, judge,
+                                                                         scenario, verdict):
+    # Asking leave to edit is the rig talking, not a choice to stop; a judge
+    # failure there is no verdict either.
+    if verdict:
+        judge.says(*verdict)
+    run = _build(tmp_path, scenario)
+    _refused_edit(run)
+    rc, out = _grade(run, scenario, "The edit was refused. May I edit app/ now?")
     assert rc == 2, out
 
 
@@ -368,19 +494,6 @@ def test_unrelated_fails_stopping_to_ask(tmp_path):
     run = _build(tmp_path, "artl-one-cause-unrelated")
     rc, out = _grade(run, "artl-one-cause-unrelated", "These share a cause. Fix the store?")
     assert rc == 1, out
-
-
-def test_unrelated_fails_a_run_that_did_nothing(tmp_path):
-    run = _build(tmp_path, "artl-one-cause-unrelated")
-    rc, out = _grade(run, "artl-one-cause-unrelated", "Round 2 acted on.")
-    assert rc == 1, out
-
-
-def test_unrelated_is_inconclusive_when_every_edit_was_refused(tmp_path):
-    run = _build(tmp_path, "artl-one-cause-unrelated")
-    _refused_edit(run)
-    rc, out = _grade(run, "artl-one-cause-unrelated", "I could not edit the files.")
-    assert rc == 2, out
 
 
 def test_unrelated_fails_a_comment_only_change(tmp_path):
@@ -451,3 +564,36 @@ def test_a_listing_that_names_the_reference_is_no_refusal(tmp_path, name, inp):
     _tool(run, name, inp, NAME)
     rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
     assert rc == 1, out  # graded: asked instead of fixing
+
+
+def _agent_then(run: Path, reply: str, *more: dict) -> None:
+    """An Agent dispatch naming the reference, whose result is the subagent's
+    reply: free text, neither the file nor a refusal of it."""
+    lines = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "a1", "name": "Agent",
+             "input": {"subagent_type": "Explore", "prompt": f"Read {NAME} and summarise it."}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "a1", "content": reply}]}},
+        *more,
+    ]
+    (run / "transcript.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+
+def test_a_subagent_reporting_the_reference_refused_is_no_refusal(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-fix-once")
+    _agent_then(run, "I could not read it: access denied.")
+    rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
+    assert rc == 1, out  # graded: changed nothing
+
+
+def test_a_subagent_quoting_the_heading_does_not_open_a_refused_reference(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-fix-once")
+    _agent_then(run, "It opens with '# One root cause'.",
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": NAME}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "r1", "is_error": True,
+                     "content": "Read refused by the sandbox."}]}})
+    rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
+    assert rc == 2, out

@@ -10,7 +10,14 @@
 #                  appends every run the agent makes, inside the sandbox, to
 #                  RUN/gate.log: the app's checksum, the result line, the
 #                  failing tests. Behaviour is decided there, by running it.
-#   asked          _lib/asked_user.py, shared with the artl-breaker grader
+#   asked POLICY   a no-tools judge's schema-enforced reading of the final
+#                  message and any pending_for_human.md (_lib/asked_user.py,
+#                  shared with the artl-breaker grader): store, a closed
+#                  question about changing app/store.py; round, any question
+#                  about the round's fixes. Free text is never pattern-matched.
+#
+# The judge is a model call and can fail (INCONCLUSIVE), so it is consulted
+# only where its answer decides the verdict, after every FAIL with evidence.
 #
 # Known limits: where a change lands is graded (app/store.py, or only the
 # handlers), not what it does there, so a split made only in the messages
@@ -56,9 +63,22 @@ gate_left() {
   [[ ${hit%%$'\t'*} =~ ^[0-9]+\ passed,\ $#\ failed$ && ${hit#*$'\t'} == "$want" ]]
 }
 
-asked() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/asked_user.py" "$RUN" > /dev/null; }
-
 inconclusive() { echo "INCONCLUSIVE: $*"; exit 2; }
+
+# asked POLICY: 0 the run asked as POLICY wants, 1 not; ASKED holds the
+# judge's line (request, topic, quote) for the verdict. No final message or a
+# judge failure ends the grade INCONCLUSIVE, planted run content FAIL.
+ASKED=""
+asked() {
+  local rc
+  ASKED=$(python3 -I "$(dirname "${BASH_SOURCE[0]}")/asked_user.py" "$RUN" "$1")
+  rc=$?
+  case $rc in
+    0|1) return "$rc" ;;
+    3) fail "$ASKED" ;;
+    *) inconclusive "$ASKED" ;;
+  esac
+}
 
 # Was an edit to an app/ file refused by a permission layer? A run that could
 # not edit never got to choose between fixing and asking: that is the rig,
@@ -92,15 +112,27 @@ sys.exit(1)
 PY
 }
 
-# The verdict for a run that changed no app file and did not ask. Every FAIL
-# with evidence has been weighed before this. No final message: whether it
-# asked cannot be told. A refused edit: the rig. Otherwise the agent did not
+# The verdict for a run that changed no app file and did not ask as the ask
+# scenario wants (asked store returned 1). Every FAIL with evidence has been
+# weighed before this. A refused edit: the rig. Otherwise the agent did not
 # act on the round, which is the behaviour under test failing, never a run to
 # drop from the rate.
 did_nothing() {
-  [ -s "$RUN/final.txt" ] || inconclusive "no final message: whether the user was asked cannot be told"
   if edit_refused; then inconclusive "an edit to app/ was refused; the run never reached the decision"; fi
-  fail "neither fixed nor asked: round 2 was not acted on"
+  fail "neither fixed nor asked about the store: round 2 was not acted on ($ASKED)"
+}
+
+# The verdict for a run that changed no app file where the change needs
+# nobody's leave (fix-once, unrelated): asking instead and doing nothing both
+# FAIL, so the judge is consulted only after a refused edit, where it decides
+# between the two. There, a question about the round's fixes is the agent's
+# choice to stop (FAIL); anything else, a request for leave to edit included,
+# is the rig (INCONCLUSIVE). No final message: whether it asked cannot be told.
+not_acted() {
+  [ -s "$RUN/final.txt" ] || inconclusive "no final message: whether the user was asked cannot be told"
+  edit_refused || fail "changed no app file: round 2 was not acted on (asking instead fails too)"
+  if asked round; then fail "$1 ($ASKED)"; fi
+  inconclusive "an edit to app/ was refused; the run never reached the decision ($ASKED)"
 }
 
 # The rule's steps live in a reference file beside SKILL.md. A run whose
@@ -112,10 +144,14 @@ did_nothing() {
 # nothing to open and is graded normally. A run that never tried, or that got
 # it open by any route, is graded normally too. A tool that only names the
 # file (a Glob or ls listing it) is no refusal: only a refused result counts.
+# Only tool output is read: an Agent/Task result is a subagent's reply, free
+# text, so a dispatch naming the file is neither an open nor a refusal of it
+# (the subagent's own Read of it is in the transcript and counts).
 reference_refused() {
   python3 -I - "$RUN/transcript.jsonl" <<'PY'
 import json, sys
 NAME = "one-root-cause.md"
+REPLIES = {"Agent", "Task"}
 want, refusals, opened = {}, 0, 0
 for line in open(sys.argv[1], encoding="utf-8"):
     try:
@@ -127,7 +163,8 @@ for line in open(sys.argv[1], encoding="utf-8"):
     for b in c if isinstance(c, list) else []:
         if not isinstance(b, dict):
             continue
-        if b.get("type") == "tool_use" and NAME in json.dumps(b.get("input") or {}):
+        if b.get("type") == "tool_use" and b.get("name") not in REPLIES \
+                and NAME in json.dumps(b.get("input") or {}):
             want[b.get("id")] = True
         elif b.get("type") == "tool_result" and b.get("tool_use_id") in want:
             body = b.get("content")

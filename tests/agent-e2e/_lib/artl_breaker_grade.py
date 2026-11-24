@@ -1,8 +1,9 @@
 """Grade an artl-breaker run: artl_breaker_grade.py RUN fires|holds|asks.
 
 The run continues an advice-refine-test-loop close-out after round 2. Graded
-are actions and state, never the reply's wording (a text grader here would be
-the very mechanism the breaker exists to stop):
+are actions and state; the reply's wording is never matched by pattern (a
+text grader here would be the very mechanism the breaker exists to stop).
+What the run asked the user is read by a schema-enforced judge instead:
 
   dispatches  the main thread's Agent calls, in order, from transcript.jsonl
               (a subagent's own calls are not the parent's):
@@ -20,11 +21,15 @@ the very mechanism the breaker exists to stop):
          Neither: FAIL. With files changed it patched past the boundary
          without the step under test; with none it did not act at all.
   asks   FAIL a worker or reviewer dispatched, or a file changed; then PASS
-         when the user was asked (asked_user.py), else FAIL.
+         when the judge reads, in the final message or a
+         pending_for_human.md, a question to the user about the check's
+         approach (asked_user.py, policy reframe), else FAIL: an off-topic
+         question, or a note that asks nothing, is no ask.
 
 FAIL evidence is weighed before any INCONCLUSIVE (no transcript, no
-start.sha). For fires and holds a changed tree without a transcript is no
-evidence: a worker after the diagnosis changes files too.
+start.sha, no final message, a judge failure): the judge runs last, only
+once nothing was acted on. For fires and holds a changed tree without a
+transcript is no evidence: a worker after the diagnosis changes files too.
 Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
 """
 import hashlib
@@ -35,6 +40,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asked_user import asked  # noqa: E402
+from run_files import Refused  # noqa: E402
+from structured_judge import Inconclusive  # noqa: E402
 
 SKIP = {".git", "__pycache__"}
 
@@ -100,9 +107,14 @@ def grade(run, mode):
             return "inconclusive", "no transcript: what was dispatched cannot be told"
         if files is None:
             return "inconclusive", "no start.sha: what the run changed cannot be told"
-        how = asked(run)
-        return ("pass", f"nothing changed or dispatched; {how}") if how else \
-            ("fail", "acted on nothing, and did not ask the user either")
+        try:
+            ok, how = asked(run, "reframe")
+        except Refused as exc:
+            return "fail", f"refused run content: {exc}"
+        except Inconclusive as exc:
+            return "inconclusive", f"nothing changed or dispatched; {exc}"
+        return ("pass", f"nothing changed or dispatched; asked about the check: {how}") if ok else \
+            ("fail", f"acted on nothing, and did not ask the user about the check ({how})")
     if mode not in ("fires", "holds"):
         raise SystemExit(f"unknown mode {mode!r}")
     if calls is None:
@@ -125,4 +137,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:  # a grader crash is no verdict: never let it read as FAIL (exit 1)
+        print(f"INCONCLUSIVE: grader error: {exc.__class__.__name__}: {exc}")
+        sys.exit(2)

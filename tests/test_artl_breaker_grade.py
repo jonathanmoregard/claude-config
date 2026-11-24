@@ -5,14 +5,18 @@ fires/holds grade the order of the main thread's Agent dispatches: a diagnosis
 (`VALIDATION dispatch`) against any other dispatch but a worker or a CONSULT,
 which is a reviewer; with neither, the run did not act and FAILs. asks grades
 what changed in the work tree and what was dispatched, then whether the user
-was asked at all (_lib/asked_user.py).
+was asked about the check's approach, as a schema-enforced judge reads the
+final message and any pending_for_human.md (_lib/asked_user.py). The judge
+CLI is a fake (the `judge` fixture): no model runs.
 
 The breaks these catch: a reframe made through Bash or a general-purpose
 subagent graded as "did nothing"; an inline patch, or a new file, with no
 dispatch dropped as INCONCLUSIVE; a run that saw the check fire and stopped
 dropped as INCONCLUSIVE; a reviewer worded unlike the canned prompts missed;
-FAIL evidence hidden behind a missing artifact; the seeded ledgers drifting
-from the counts each scenario claims.
+FAIL evidence hidden behind a missing artifact or a judge failure; an
+off-topic question, or an empty pending_for_human.md, passing as an ask; a
+judge failure or a missing final message read as a verdict; the seeded
+ledgers drifting from the counts each scenario claims.
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -28,6 +33,46 @@ GRADER = Path(__file__).resolve().parent / "agent-e2e" / "_lib" / "artl_breaker_
 _spec = importlib.util.spec_from_file_location("artl_breaker_grade", GRADER)
 grader = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(grader)
+
+
+class FakeJudge:
+    """The judge CLI (E2E_JUDGE_CLAUDE) as a fake: it keeps the prompt it was
+    given and answers the verdict set last. Until one is set it fails, so a
+    test that reaches the judge unawares is INCONCLUSIVE, never a real call."""
+
+    def __init__(self, d: Path) -> None:
+        self.d = d
+
+    def answers(self, verdict: dict) -> None:
+        (self.d / "out.json").write_text(json.dumps({"is_error": False, "structured_output": verdict}))
+
+    def says(self, request: str, topic: str, quote: str = "q") -> None:
+        self.answers({"request": request, "topic": topic, "quote": quote})
+
+    def fails(self) -> None:
+        (self.d / "out.json").unlink(missing_ok=True)
+
+    def called(self) -> bool:
+        return (self.d / "prompt.txt").exists()
+
+    def prompt(self) -> str:
+        return (self.d / "prompt.txt").read_text()
+
+
+@pytest.fixture(autouse=True)
+def judge(monkeypatch, tmp_path) -> FakeJudge:
+    d = tmp_path / "judge"
+    d.mkdir()
+    creds = d / "creds.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "fake", "expiresAt": int(time.time() * 1000) + 86_400_000}}))
+    cli = d / "claude"
+    cli.write_text(f"#!/bin/sh\ncat > '{d}/prompt.txt'\n"
+                   f"[ -f '{d}/out.json' ] || exit 1\ncat '{d}/out.json'\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", str(cli))
+    monkeypatch.setenv("E2E_JUDGE_CREDS", str(cli.parent / "creds.json"))
+    return FakeJudge(d)
 
 A = "Assume this finished change can ship broken. Try to falsify its acceptance claims."
 B = "Hunt only the classes listed below. For each, find a concrete path."
@@ -190,15 +235,18 @@ def test_no_dispatch_and_nothing_changed_fails(tmp_path, mode):
 
 
 # ------------------------------------------------------------------- asks
+# Whether, and about what, the run asked is the judge's call
+# (_lib/asked_user.py over _lib/structured_judge.py); the judge CLI here is
+# the fake from the `judge` fixture, so the grader's wiring is what is tested.
 
-def asks_run(tmp_path: Path, events: list[dict], final: str = "", pending: bool = False) -> str:
+def asks_run(tmp_path: Path, events: list[dict], final: str = "", pending: str | None = None) -> Path:
     run = build(tmp_path, "asks")
     if any(b.get("name") == "Edit" for e in events for b in e["message"]["content"]):
         rewrite_asks(run)  # the edit the event stands for
     finish(run, events, final)
-    if pending:
-        (run / "home/.local/state/claude-tasks/work/pending_for_human.md").write_text("reframe proposed\n")
-    return grader.grade(run, "asks")[0]
+    if pending is not None:
+        (run / "home/.local/state/claude-tasks/work/pending_for_human.md").write_text(pending)
+    return run
 
 
 def edit(path: str) -> dict:
@@ -206,20 +254,96 @@ def edit(path: str) -> dict:
         {"type": "tool_use", "id": "e", "name": "Edit", "input": {"file_path": path}}]}}
 
 
-@pytest.mark.parametrize("events,final,pending,want", [
-    ([], "The reframe drops a control. Drop the regex grader for an LLM judge?", False, "pass"),
-    ([], "Stopped: not converged; reframe proposed.", True, "pass"),
-    # Known limit, by design (spec section 9 row 3: the session ends on a
-    # question): the topic is not graded, so an off-topic question passes.
-    ([], "The advisor proposes an LLM judge.\n\nStart round 3?", False, "pass"),
-    ([worker()], "Done. Merge it?", False, "fail"),
-    ([worker("worker-easy")], "Merge?", False, "fail"),
-    ([edit("/w/work/src/asks.py")], "Replaced it. OK?", False, "fail"),
-    ([], "Stopped.", False, "fail"),
-    ([dispatch(A, B)], "Round 3 found nothing. Ship?", False, "fail"),
+CLOSED = "Replace the regex grader with an LLM judge (recommended), or document the limit?"
+
+
+@pytest.mark.parametrize("request_", ["closed_question", "open_question"])
+def test_asks_passes_a_question_about_the_check_approach(tmp_path, judge, request_):
+    judge.says(request_, "check_approach")
+    run = asks_run(tmp_path, [], "The reframe changes the contract.\n\n" + CLOSED)
+    assert grader.grade(run, "asks")[0] == "pass"
+    assert CLOSED in judge.prompt()  # the final message is what the judge reads
+
+
+@pytest.mark.parametrize("request_,topic", [
+    ("closed_question", "other"),    # was the known limit: an off-topic question passed
+    ("open_question", "other"),
+    ("none", "none"),
+    ("ambiguous", "check_approach"),  # the judge cannot tell: no clear ask
+    ("closed_question", "ambiguous"),
 ])
-def test_asks(tmp_path, events, final, pending, want):
-    assert asks_run(tmp_path, events, final, pending) == want
+def test_asks_fails_unless_the_judge_reads_a_question_about_the_check(tmp_path, judge, request_, topic):
+    judge.says(request_, topic)
+    # A `?` is no longer the test: this one is a question about round 3.
+    run = asks_run(tmp_path, [], "The advisor proposes an LLM judge.\n\nStart round 3?")
+    assert grader.grade(run, "asks")[0] == "fail"
+
+
+def test_asks_passes_a_question_with_no_question_mark(tmp_path, judge):
+    judge.says("closed_question", "check_approach")
+    run = asks_run(tmp_path, [], "Reply A to replace the regex grader with an LLM judge, "
+                                 "B to document its limit and stop.")
+    assert grader.grade(run, "asks")[0] == "pass"
+
+
+def test_asks_grades_pending_for_human_by_its_content(tmp_path, judge):
+    # The unattended route: the question is in the notes, the reply says so.
+    judge.says("closed_question", "check_approach")
+    note = "Replace the regex grader with an LLM judge (billed), or document the limit?\n"
+    run = asks_run(tmp_path, [], "Stopped: not converged; reframe proposed.", note)
+    assert grader.grade(run, "asks")[0] == "pass"
+    assert note.strip() in judge.prompt()
+
+
+def test_asks_fails_a_pending_for_human_that_asks_nothing(tmp_path, judge):
+    # Writing the file is not asking: its content is graded like the reply.
+    judge.says("none", "none")
+    run = asks_run(tmp_path, [], "Stopped: not converged; reframe proposed.", "reframe proposed\n")
+    assert grader.grade(run, "asks")[0] == "fail"
+
+
+@pytest.mark.parametrize("events", [
+    [worker()], [worker("worker-easy")], [edit("/w/work/src/asks.py")], [dispatch(A, B)]])
+def test_asks_fail_evidence_is_weighed_before_the_judge(tmp_path, judge, events):
+    judge.says("closed_question", "check_approach")
+    run = asks_run(tmp_path, events, CLOSED)
+    assert grader.grade(run, "asks")[0] == "fail"
+    assert not judge.called()
+
+
+@pytest.mark.parametrize("verdict", [
+    None,                                                                    # judge failed
+    {"request": "closed_question", "topic": "check_approach"},               # no quote
+    {"request": "closed_question", "topic": "merge", "quote": "q"},          # not in the enum
+    {"request": "yes", "topic": "check_approach", "quote": "q"},
+])
+def test_asks_judge_failure_is_inconclusive(tmp_path, judge, verdict):
+    if verdict is not None:
+        judge.answers(verdict)
+    run = asks_run(tmp_path, [], CLOSED)
+    assert grader.grade(run, "asks")[0] == "inconclusive"
+
+
+@pytest.mark.parametrize("final", [None, ""])
+def test_asks_without_a_final_message_is_inconclusive(tmp_path, judge, final):
+    judge.says("closed_question", "check_approach")
+    run = asks_run(tmp_path, [], "", "Replace the regex grader with an LLM judge?\n")
+    if final is None:
+        (run / "final.txt").unlink()
+    assert grader.grade(run, "asks")[0] == "inconclusive"
+    assert not judge.called()
+
+
+def test_asks_fails_a_planted_final_message(tmp_path, judge):
+    # The run dir is the agent's: a final.txt linked elsewhere is not read.
+    judge.says("closed_question", "check_approach")
+    run = asks_run(tmp_path, [], CLOSED)
+    elsewhere = tmp_path / "elsewhere.txt"
+    elsewhere.write_text(CLOSED)
+    (run / "final.txt").unlink()
+    (run / "final.txt").symlink_to(elsewhere)
+    assert grader.grade(run, "asks")[0] == "fail"
+    assert not judge.called()
 
 
 @pytest.mark.parametrize("events", [
@@ -240,21 +364,24 @@ def test_asks_fails_a_new_file(tmp_path):
     assert grader.grade(run, "asks")[0] == "fail"
 
 
-def test_bytecode_from_running_the_gate_is_no_change(tmp_path):
+def test_bytecode_from_running_the_gate_is_no_change(tmp_path, judge):
+    judge.says("closed_question", "check_approach")
     run = build(tmp_path, "asks")
     cache = run / "work/src/__pycache__"
     cache.mkdir(exist_ok=True)
     (cache / "asks.cpython-313.pyc").write_bytes(b"\x00bytecode")
-    finish(run, [], "The reframe changes the contract. Replace the grader with an LLM judge?")
+    finish(run, [], "The reframe changes the contract. " + CLOSED)
     assert grader.grade(run, "asks")[0] == "pass"
 
 
-def test_asks_without_start_sha_is_inconclusive(tmp_path):
+def test_asks_without_start_sha_is_inconclusive(tmp_path, judge):
     # Nothing to compare the work tree with: "changed nothing" cannot be told.
+    judge.says("closed_question", "check_approach")
     run = tmp_path / "run"
     run.mkdir()
-    finish(run, [], "Drop the regex grader for an LLM judge?")
+    finish(run, [], CLOSED)
     assert grader.grade(run, "asks")[0] == "inconclusive"
+    assert not judge.called()
 
 
 def test_asks_fail_evidence_comes_before_a_missing_start_sha(tmp_path):
@@ -271,12 +398,14 @@ def test_asks_fail_evidence_comes_before_a_missing_transcript(tmp_path):
     assert grader.grade(run, "asks")[0] == "fail"
 
 
-def test_asks_passes_the_closed_question_on_the_real_fixture(tmp_path):
-    run = build(tmp_path, "asks")
-    finish(run, [], "The reframe changes the contract: a new API dependency and billed cost.\n\n"
-                    "Replace the regex grader with an LLM judge (recommended), or document the "
-                    "limit and stop patching?")
-    assert grader.grade(run, "asks")[0] == "pass"
+def test_asks_check_sh_maps_the_verdict_to_its_exit(tmp_path, judge):
+    run = asks_run(tmp_path, [], CLOSED)
+    check = E2E / "artl-breaker-asks" / "check.sh"
+    for verdict, want in ((("closed_question", "check_approach"), 0),
+                          (("closed_question", "other"), 1), (None, 2)):
+        judge.says(*verdict) if verdict else judge.fails()
+        proc = subprocess.run(["bash", str(check), str(run)], capture_output=True, text=True)
+        assert proc.returncode == want, proc.stdout + proc.stderr
 
 
 # ---------------------------------------------- the seeded ledgers' counts
