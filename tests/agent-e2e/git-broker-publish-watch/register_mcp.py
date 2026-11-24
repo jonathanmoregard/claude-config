@@ -5,11 +5,17 @@
 
 The managed MCP allowlist matches exact argv, so on a host with
 /etc/claude-code/mcp-servers.json the github entry must be that file's, verbatim.
+
+HOME is the staged dir setup.sh can read the arm's mcp-servers.json from. The
+servers are spawned inside the sandbox, so the paths written for them name
+the agent's HOME, E2E_HOME (under bwrap the real HOME's path, where the staged
+dir is mounted; RUN/home itself is hidden there).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,9 +31,10 @@ def arm_path(arg: str, home: Path) -> str:
 
 
 def github_entry(arm_servers: dict, home: Path, run: Path,
-                 policy_file: Path = POLICY_SERVERS) -> dict | None:
+                 policy_file: Path | None = None) -> dict | None:
     if "github" not in arm_servers:
         return None
+    policy_file = POLICY_SERVERS if policy_file is None else policy_file
     if policy_file.is_file():
         cfg = json.loads(policy_file.read_text(encoding="utf-8")).get("github")
         if cfg is None:
@@ -39,7 +46,8 @@ def github_entry(arm_servers: dict, home: Path, run: Path,
         cfg = dict(arm_servers["github"])
         cfg["args"] = [arm_path(arg, home) for arg in cfg.get("args", [])]
     cfg = dict(cfg)
-    # The harness mounts the real HOME read-only, so uv's default cache is unwritable.
+    # HOME is the live path, where the scenario's `lend` puts the credentials
+    # under bwrap; uv's cache stays in the run rather than in either HOME.
     cfg["env"] = {**(cfg.get("env") or {}), "HOME": LIVE_HOME,
                   "UV_CACHE_DIR": str(run / "uv-cache")}
     return cfg
@@ -63,6 +71,7 @@ def broker_argv(cfg: dict, home: Path, mcp_stub: str) -> list[str]:
 
 def main(run: Path, home: Path, mcp_stub: str) -> None:
     servers = json.loads((home / ".claude" / "mcp-servers.json").read_text(encoding="utf-8"))
+    home = Path(os.environ.get("E2E_HOME") or home)
     github = github_entry(servers, home, run)
     if github is not None:
         (run / "mcp.json").write_text(json.dumps({"mcpServers": {"github": github}}),

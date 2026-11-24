@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Workspace: the staged candidate's real app runner, as the agent's only MCP
-# server, with its state root moved into this run (the real HOME is read-only
-# for the agent). It drives a real host unit against the dedicated smoke
-# worktree. The control arm has no runner, so it gets no MCP config at all.
+# server, with its state root moved into this run: the agent's HOME is the
+# staged one, which the host unit the runner drives never sees, while the run
+# dir has the same path on both sides. It drives a real host unit against the
+# dedicated smoke worktree (~/worktrees is lent read-only). The control arm
+# has no runner, so it gets no MCP config at all.
 set -euo pipefail
 
 work=$1

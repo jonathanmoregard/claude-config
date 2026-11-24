@@ -146,13 +146,14 @@ def _scenario(tmp_path, check_body: str) -> pathlib.Path:
 # the first time this workflow ran the whole corpus. A case that cannot sandbox
 # must say so, not report the harness broken.
 #
-# The probe builds the harness's own mount shape rather than a trivial sandbox,
-# because a machine that can unshare can still refuse a mount. Asking
-# `--dev-bind / / --unshare-all` was measured succeeding on a runner that then
-# failed all eleven cases a second time: the binary is there, namespaces work,
-# and what the runner lacked was a `~/.ssh` for the harness to shadow. That was
-# the harness's defect, fixed where it lives; the probe now at least covers the
-# read-only bind of the real HOME that the shadowing stacks on.
+# The probe asks the HOST, never the harness: every kind of mount a run
+# stacks (a bind of one directory over another, a read-only bind, a tmpfs, a
+# symlink, a pid namespace with its own /proc), on directories it makes
+# itself. Asking `--dev-bind / / --unshare-all` alone was measured succeeding
+# on a runner that then failed all eleven cases: the runner lacked a `~/.ssh`
+# for the harness to shadow. That was the harness's defect, and a defect in the
+# harness's own argv must FAIL these tests -- a probe running that argv turned
+# it into a skip of every sandbox test, the suite green with nothing measured.
 # Cached, because nine call sites would otherwise fork nine times.
 _SANDBOX_OK = None
 
@@ -161,26 +162,35 @@ def _require_sandbox():
     """Skip unless bubblewrap can really build a sandbox on this machine."""
     global _SANDBOX_OK
     if _SANDBOX_OK is None:
-        import pwd as _pwd
         import shutil as _sh
+        import tempfile
         bwrap = _sh.which("bwrap")
-        home = _pwd.getpwuid(os.getuid()).pw_dir
         if bwrap is None:
             _SANDBOX_OK = (False, "bubblewrap not on PATH")
         else:
+            base = pathlib.Path(tempfile.mkdtemp(prefix="agent-e2e-probe-"))
             try:
-                p = subprocess.run([bwrap, "--dev-bind", "/", "/",
-                                    "--ro-bind", home, home, "--tmpfs", "/tmp",
-                                    "true"], capture_output=True, text=True, timeout=30)
+                for d in ("src", "dst", "ro", "hidden"):
+                    (base / d).mkdir()
+                (base / "src/file").write_text("x\n")
+                argv = [bwrap, "--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc",
+                        "--die-with-parent", "--tmpfs", str(base / "hidden"),
+                        "--bind", str(base / "src"), str(base / "dst"),
+                        "--ro-bind", str(base / "ro"), str(base / "ro"),
+                        "--symlink", "file", str(base / "dst/link"),
+                        "--setenv", "E2E_PROBE", "1", "--chdir", str(base / "dst"),
+                        "--", _sh.which("true") or "/bin/true"]
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
                 _SANDBOX_OK = (
                     p.returncode == 0,
-                    "bubblewrap is present but cannot build the harness's "
-                    "sandbox here (restricted user namespaces, or a mount it "
-                    "refuses): "
+                    "bubblewrap is present but cannot build a sandbox here "
+                    "(restricted user namespaces, or a mount kind it refuses): "
                     + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 _SANDBOX_OK = (False, f"bubblewrap probe failed: {exc!r}")
+            finally:
+                shutil.rmtree(base, ignore_errors=True)
     ok, why = _SANDBOX_OK
     if not ok:
         pytest.skip(why)
@@ -221,6 +231,19 @@ def _require_nested_sandbox():
         pytest.skip(why)
 
 
+def test_the_sandbox_probe_asks_the_host_not_the_harness(monkeypatch):
+    """A defect in the harness's own mounts must fail the sandbox tests, not
+    skip them all: the probe asks only whether this host can build a sandbox,
+    so it never runs the argv sandboxed() builds."""
+    def broken(*_a, **_k):
+        raise AssertionError("the probe ran the harness's own argv")
+    import types
+    monkeypatch.setitem(globals(), "_harness_module",
+                        lambda: types.SimpleNamespace(sandboxed=broken))
+    monkeypatch.setitem(globals(), "_SANDBOX_OK", None)
+    _require_sandbox()
+
+
 def _run(tmp_path, sc, claude, n=1, **kw):
     out = tmp_path / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", str(n), "--jobs", "1",
@@ -244,6 +267,583 @@ EOF
     assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
 
 
+def _harness_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_e2e_under_test", HARNESS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _ops(argv: list[str], flag: str) -> list[tuple[int, str, str]]:
+    """(position, first, second) of every two-argument FLAG in ARGV."""
+    return [(i, argv[i + 1], argv[i + 2]) for i, a in enumerate(argv[:-2]) if a == flag]
+
+
+def test_the_sandbox_mounts_the_staged_home_at_the_real_home_path(tmp_path):
+    """The agent's HOME is the account's real HOME path, with the staged HOME
+    mounted there, so the policy under test sees the host layout it was
+    written for, never the run dir. Every bind back in (the run, the shared
+    dir, what the real HOME lends) comes after that mount: under it, one
+    whose path is in the real HOME -- a broker run is -- would be hidden."""
+    mod = _harness_module()
+    run = tmp_path / "out/sc/new/1"
+    shared = tmp_path / "shared"
+    for d in (run / "work", run / "home", shared):
+        d.mkdir(parents=True)
+    argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=shared,
+                         work=run / "work")
+    real = str(mod.REAL_HOME)
+    home = [i for i, src, dst in _ops(argv, "--bind") if (src, dst) == (str(run / "home"), real)]
+    assert home, argv
+    assert ("HOME", real) in [(k, v) for _, k, v in _ops(argv, "--setenv")], argv
+    later = [i for flag in ("--bind", "--ro-bind") for i, src, _ in _ops(argv, flag)
+             if src in (str(run), str(shared)) or src.startswith(real + "/")]
+    assert later and min(later) > home[0], argv
+
+
+@pytest.fixture
+def in_real_home():
+    """A fresh directory inside the account's real HOME, removed afterwards.
+
+    What the HOME mount hides, and what is bound back over it, only shows for
+    paths really under the real HOME; a tmp_path under /tmp is hidden by the
+    private /tmp instead and cannot tell the two apart."""
+    import pwd as _pwd
+    import uuid
+    parent = pathlib.Path(_pwd.getpwuid(os.getuid()).pw_dir, ".local/state")
+    parent.mkdir(parents=True, exist_ok=True)
+    path = parent / f"agent-e2e-test-{uuid.uuid4().hex[:12]}"
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.mark.parametrize("on_path", [True, False], ids=["link-dir-on-PATH", "link-dir-off-PATH"])
+def test_a_symlinked_claude_in_the_real_home_runs(tmp_path, in_real_home, on_path):
+    """`claude` is usually a link (~/.local/bin/claude -> a versioned binary)
+    in a directory the HOME mount hides, and that directory is usually on PATH
+    too, so path_guard() binds it back with the link in it. bwrap execs the
+    path it was given: it has to resolve inside either way, and bwrap refuses
+    to mount a file onto a link ("Can't mount on symlink destination")."""
+    _require_sandbox()
+    (in_real_home / "versions").mkdir()
+    real = fake_claude(in_real_home / "versions", _ok(), name="1.0")
+    (in_real_home / "bin").mkdir()
+    (in_real_home / "bin/claude").symlink_to(real)
+    path = os.environ.get("PATH", "")
+    env = {**os.environ, "PATH": f"{in_real_home / 'bin'}:{path}" if on_path else path}
+    sc = _scenario(tmp_path, "exit 0")
+    r, out, verdicts = _run(tmp_path, sc, in_real_home / "bin/claude", env=env)
+    stderr = [p.read_text() for p in out.glob("*/*/*/stderr.txt")]
+    assert [v["verdict"] for v in verdicts] == ["PASS"], (r.stdout, stderr)
+
+
+def test_a_run_under_the_real_home_sees_no_sibling_and_no_account_state(tmp_path, in_real_home):
+    """--out inside the real HOME is the broker's layout (~/.local/state/
+    agent-e2e-broker/...). The run's own directory is bound back over the HOME
+    mount, and nothing beside it: another arm's or sample's staged home, with
+    its account material, stays out of reach, and so does the real
+    ~/.claude.json."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    out = in_real_home / "out"
+    sibling = out / "sc/old/1/home/.claude.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("{}\n")
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "sibling=$(test -e {sibling} && echo seen || echo hidden)"
+   echo "parent=$(ls -A {out} 2>/dev/null | tr '\\n' ' ')"
+   echo "claude_json=$(test -e {real}/.claude.json && echo seen || echo hidden)"
+   echo "own=$(test -d "$HOME/.claude" && echo seen || echo hidden)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    report = dict(line.split("=", 1)
+                  for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+    assert report["own"] == "seen", report
+    assert report["sibling"] == "hidden", report
+    assert report["parent"].strip() in ("", "sc"), report
+    assert report["claude_json"] == "hidden", report
+
+
+def test_the_agent_home_is_the_staged_home_at_the_real_home_path(tmp_path):
+    """Inside the sandbox the real HOME path holds the staged HOME: its
+    settings are the candidate's, what the agent writes there lands in the
+    run's home/, ~/.ssh is empty, and what the real HOME lends on purpose
+    (~/Repos) is still there."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "settings.json").write_text('{"e2e-marker": "staged-copy"}\n')
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "home=$HOME"
+   echo "realpath=$(realpath "$HOME")"
+   echo "settings=$(head -c 200 {real}/.claude/settings.json | tr -d '\\n')"
+   echo "ssh=$(ls -A {real}/.ssh 2>/dev/null | wc -l)"
+   echo "repos=$(ls -A {real}/Repos 2>/dev/null | wc -l)"
+   echo w > {real}/written-by-agent; }} > "$E2E_SHARED/report" 2> "$E2E_SHARED/errors"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    run = out / "sc/new/1"
+    report = dict(line.split("=", 1)
+                  for line in (run / "shared/report").read_text().splitlines())
+    assert report["home"] == real and report["realpath"] == real, report
+    assert report["settings"] == '{"e2e-marker": "staged-copy"}', report
+    assert report["ssh"] == "0", report
+    assert (run / "home/written-by-agent").read_text() == "w\n"
+    assert not pathlib.Path(real, "written-by-agent").exists()
+    if pathlib.Path(real, "Repos").is_dir() and any(pathlib.Path(real, "Repos").iterdir()):
+        assert report["repos"] != "0", report
+
+
+def test_a_vendored_skill_resolves_where_the_projection_puts_it(tmp_path):
+    """runtime/skills/X -> ../../vendor/<sub>/skills/X resolves, in the
+    deployed projection, to ~/.claude/vendor/<sub>/skills/X: the checkout's
+    runtime/ is at ~/.claude/runtime and its submodules at ~/.claude/vendor.
+    The staged HOME flattens runtime/ into ~/.claude, so the arm's own pinned
+    submodules must be staged at ~/.claude/vendor and the link must land there
+    too -- the path the policy's vendor rule names. Dangling, a Read of the
+    skill was refused and perm-read-vendor-skill FAILed."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    link = next((p for p in sorted((RUNTIME / "skills").iterdir())
+                 if p.is_symlink() and "/vendor/" in os.readlink(p)), None)
+    if link is None:
+        pytest.skip("no vendored skill link in this checkout")
+    sub = os.path.normpath(os.path.join("runtime/skills", os.readlink(link))).split("/")[1]
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "resolved=$(realpath {real}/.claude/skills/{link.name}/SKILL.md 2>&1)"
+   echo "readable=$(test -r {real}/.claude/skills/{link.name}/SKILL.md && echo yes || echo no)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    _, out, verdicts = _run(tmp_path, sc, claude)
+    if "not fetched locally" in verdicts[0].get("config", "") \
+            or "not initialised" in verdicts[0].get("config", ""):
+        pytest.skip(f"vendor submodules unavailable here: {verdicts[0]['config']}")
+    report = dict(line.split("=", 1)
+                  for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+    assert report == {
+        "resolved": f"{real}/.claude/vendor/{sub}/skills/{link.name}/SKILL.md",
+        "readable": "yes"}, (report, verdicts[0].get("config"))
+
+
+SANDBOX_PATHS = SCENARIOS / "_lib/sandbox_paths.py"
+
+
+def test_check_maps_what_the_agent_saw_to_the_host(tmp_path, in_real_home):
+    """Under bwrap the agent's HOME is the real HOME's path, backed by the
+    run's home/; check.sh runs on the host. A path the agent logged is
+    translated through the run's own mounts (E2E_MOUNTS), so its HOME lands in
+    RUN/home, the run dir -- here inside the real HOME, as the broker puts it
+    -- stays itself, a second name for RUN/home maps to nothing, and what the
+    real HOME lends (here the scenario's `lend`) stays real."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    lent = in_real_home / "lent"
+    lent.mkdir()
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, f"""
+python3 - "$1" <<'PY'
+import os, sys
+sys.path.insert(0, "{SANDBOX_PATHS.parent}")
+from sandbox_paths import to_host
+run, home = sys.argv[1], os.environ["E2E_HOME"]
+print("home=" + home)
+print("staged=" + str(to_host(home + "/.claude/x")))
+print("run=" + str(to_host(run + "/marker")))
+print("lent=" + str(to_host("{lent}/r")))
+print("second=" + str(to_host(run + "/home/.claude/x")))
+print("tmp=" + str(to_host("/tmp/x")))
+PY
+""")
+    (sc / "lend").write_text(f"{lent.relative_to(real)}\n")
+    out = in_real_home / "out"
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    run = out / "sc/new/1"
+    report = dict(line.split("=", 1) for line in (run / "check.log").read_text().splitlines()
+                  if "=" in line)
+    assert report == {"home": real, "staged": f"{run}/home/.claude/x",
+                      "run": f"{run}/marker", "lent": f"{lent}/r",
+                      "second": "None", "tmp": "None"}, report
+
+
+def test_without_mounts_a_path_maps_to_itself(monkeypatch):
+    """No E2E_MOUNTS (a grader run by hand on a canned run): nothing to map."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sandbox_paths", SANDBOX_PATHS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.delenv("E2E_MOUNTS", raising=False)
+    assert mod.to_host("/a/b/../c") == "/a/c"
+
+
+def test_a_scenario_lends_only_the_paths_it_names(tmp_path, in_real_home):
+    """A scenario whose in-sandbox MCP server needs real-HOME state (the
+    GitHub App host token, say) names those paths in a `lend` file; they are
+    bound read-only at their own path, and nothing beside them is."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = pathlib.Path(_pwd.getpwuid(os.getuid()).pw_dir)
+    (in_real_home / "lent").mkdir()
+    (in_real_home / "lent/token").write_text("t\n")
+    (in_real_home / "other").write_text("o\n")
+    rel = (in_real_home / "lent").relative_to(real)
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "lent=$(cat {in_real_home}/lent/token 2>/dev/null || echo hidden)"
+   echo "other=$(cat {in_real_home}/other 2>/dev/null || echo hidden)"
+   echo "write=$(echo x 2>/dev/null > {in_real_home}/lent/token && echo yes || echo no)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "lend").write_text(f"# the token\n{rel}\n")
+    _, out, verdicts = _run(tmp_path, sc, claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
+    report = dict(line.split("=", 1)
+                  for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+    assert report == {"lent": "t", "other": "hidden", "write": "no"}, report
+    assert (in_real_home / "lent/token").read_text() == "t\n"
+
+
+@pytest.mark.parametrize("entry", ["../etc", "/etc", ".", "a/.."])
+def test_a_lend_outside_home_or_of_all_of_it_is_refused(tmp_path, entry):
+    """`lend` names paths inside HOME, never the whole of it."""
+    _require_sandbox()
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "lend").write_text(f"# comment\n\n{entry}\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert "lend" in verdicts[0]["why"], verdicts
+
+
+# What the sandbox lends back of the real HOME goes through one routine
+# (expose()): every symlink hop on the way is recreated inside, the target is
+# bound at its own path, and a source that is not there, or a destination the
+# staged HOME already holds, stops the run rather than being dropped.
+
+def _report(out: pathlib.Path) -> dict:
+    return dict(line.split("=", 1)
+                for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+
+
+@pytest.mark.parametrize("on_path", [True, False], ids=["first-hop-on-PATH", "off-PATH"])
+def test_a_two_hop_claude_chain_execs(tmp_path, in_real_home, on_path):
+    """~/a/claude -> ~/b/claude -> the binary, with ~/b on no PATH: every
+    hop is in the hidden real HOME, so each one has to be recreated inside
+    or bwrap execs a dangling link."""
+    _require_sandbox()
+    (in_real_home / "versions").mkdir()
+    fake_claude(in_real_home / "versions", _ok(), name="1.0")
+    for d, target in (("b", "../versions/1.0"), ("a", "../b/claude")):
+        (in_real_home / d).mkdir()
+        (in_real_home / d / "claude").symlink_to(target)
+    path = os.environ.get("PATH", "")
+    env = {**os.environ, "PATH": f"{in_real_home / 'a'}:{path}" if on_path else path}
+    sc = _scenario(tmp_path, "exit 0")
+    r, out, verdicts = _run(tmp_path, sc, in_real_home / "a/claude", env=env)
+    stderr = [p.read_text() for p in out.glob("*/*/*/stderr.txt")]
+    assert [v["verdict"] for v in verdicts] == ["PASS"], (r.stdout, stderr)
+
+
+def test_a_symlinked_path_dir_in_home_stays_on_path(tmp_path, in_real_home):
+    """A PATH entry in the real HOME that is a link (~/.nix-profile/bin) is
+    on the agent's PATH by that literal name; lending only what it resolves
+    to takes its tools off PATH."""
+    _require_sandbox()
+    (in_real_home / "realbin").mkdir()
+    tool = in_real_home / "realbin/e2e-pathtool"
+    tool.write_text("#!/bin/sh\necho pathtool-ok\n")
+    tool.chmod(0o755)
+    (in_real_home / "linkbin").symlink_to("realbin")
+    env = {**os.environ, "PATH": f"{in_real_home / 'linkbin'}:{os.environ.get('PATH', '')}"}
+    claude = fake_claude(tmp_path, _ok("""
+{ echo "found=$(command -v e2e-pathtool)"
+  echo "ran=$(e2e-pathtool 2>&1)"; } > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    _, out, verdicts = _run(tmp_path, sc, claude, env=env)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
+    assert _report(out) == {"found": str(in_real_home / "linkbin/e2e-pathtool"),
+                            "ran": "pathtool-ok"}
+
+
+def test_a_config_bin_on_path_imports_its_own_tools(tmp_path):
+    """~/.claude/bin is on PATH, and its scripts import their siblings through
+    `..`: ai-router by realpath (../tools/ai-router), egress-sink by abspath
+    (../egress_guard). Inside, that bin is the candidate's own, staged from the
+    same tree as what it imports, so both shapes resolve -- the deployed bin
+    lent alone would import from a tree that is not there."""
+    _require_sandbox()
+    real = _harness_module().REAL_HOME
+    cfg = tmp_path / "cfg"
+    (cfg / "bin").mkdir(parents=True)
+    (cfg / "tools/standin").mkdir(parents=True)
+    (cfg / "tools/standin/standin_real.py").write_text("VALUE = 'by-realpath'\n")
+    (cfg / "standin_abs").mkdir()
+    (cfg / "standin_abs/__init__.py").write_text("VALUE = 'by-abspath'\n")
+    for name, root in (("e2e-standin-real", 'os.path.join(os.path.dirname(os.path.dirname('
+                        'os.path.realpath(__file__))), "tools", "standin")'),
+                       ("e2e-standin-abs", 'os.path.dirname(os.path.dirname('
+                        'os.path.abspath(__file__)))')):
+        mod_name = "standin_real" if name.endswith("real") else "standin_abs"
+        script = cfg / "bin" / name
+        script.write_text(f"#!/usr/bin/env python3\nimport os, sys\nsys.path.insert(0, {root})\n"
+                          f"import {mod_name}\nprint({mod_name}.VALUE)\n")
+        script.chmod(0o755)
+    env = {**os.environ, "PATH": f"{real}/.claude/bin:{os.environ.get('PATH', '')}"}
+    claude = fake_claude(tmp_path, _ok("""
+{ echo "real=$(e2e-standin-real 2>&1 | tail -1)"
+  echo "abs=$(e2e-standin-abs 2>&1 | tail -1)"; } > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude), env=env)
+    assert r.returncode == 0, r.stderr
+    assert _report(out) == {"real": "by-realpath", "abs": "by-abspath"}
+
+
+def test_an_absent_lend_is_inconclusive(tmp_path, in_real_home):
+    """A scenario that lends a path the host does not have (a typo, `~/x`)
+    asked for something the run will not get: no verdict, and the message
+    names the entry."""
+    _require_sandbox()
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    rel = (in_real_home / "not-there").relative_to(_harness_module().REAL_HOME)
+    (sc / "lend").write_text(f"{rel}\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert str(rel) in verdicts[0]["why"] and "absent" in verdicts[0]["why"], verdicts
+
+
+def test_a_lend_the_staged_home_already_holds_is_inconclusive(tmp_path, in_real_home):
+    """setup.sh planted the path in the staged HOME and `lend` names it too:
+    binding the real one over it would shadow the plant without a word."""
+    _require_sandbox()
+    (in_real_home / "lent").mkdir()
+    rel = (in_real_home / "lent").relative_to(_harness_module().REAL_HOME)
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "setup.sh").write_text(f'#!/usr/bin/env bash\nmkdir -p "$HOME/{rel}"\n')
+    (sc / "lend").write_text(f"{rel}\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert str(rel) in verdicts[0]["why"] and "staged HOME" in verdicts[0]["why"], verdicts
+
+
+@pytest.mark.parametrize("rel", [".claude/plugins", ".claude/.credentials.json"])
+def test_an_optional_row_the_staged_home_provides_is_skipped(tmp_path, rel):
+    """An arm SRC copied whole from a ~/.claude carries plugins/ and
+    .credentials.json of its own. The run goes ahead on the staged copy,
+    and the real one is not bound over it (review r2:
+    every bwrap run of such an arm was INCONCLUSIVE)."""
+    mod = _harness_module()
+    mod.REAL_HOME = tmp_path / "realhome"
+    real, staged = mod.REAL_HOME / rel, tmp_path / "out/sc/new/1/home" / rel
+    for p in (real, staged):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if rel.endswith("plugins"):
+            p.mkdir()
+        else:
+            p.write_text("{}")
+    run = tmp_path / "out/sc/new/1"
+    (run / "work").mkdir()
+    (run / "shared").mkdir()
+    argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                         work=run / "work")
+    assert str(real) not in argv, argv
+
+
+def _bare_run(tmp_path) -> pathlib.Path:
+    run = tmp_path / "out/sc/new/1"
+    for d in (run / "home", run / "work", run / "shared"):
+        d.mkdir(parents=True)
+    return run
+
+
+@pytest.mark.parametrize("target", ["../..", "../../.."], ids=["home", "above-home"])
+def test_a_lend_that_lands_on_the_real_home_is_refused(tmp_path, target):
+    """A row is judged by where it lands, not how it is spelled: a link in the
+    real HOME back up to it (.local/state/h -> ../..) would bind all of the
+    real HOME, or what holds it, over the staged one."""
+    mod = _harness_module()
+    mod.REAL_HOME = tmp_path / "realhome"
+    (mod.REAL_HOME / ".local/state").mkdir(parents=True)
+    (mod.REAL_HOME / ".local/state/h").symlink_to(target)
+    run = _bare_run(tmp_path)
+    with pytest.raises(mod.Unexposable, match="real HOME"):
+        mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                      work=run / "work", lend=[".local/state/h"])
+
+
+def test_a_claude_that_is_not_on_path_is_refused(tmp_path):
+    """A --claude that PATH does not resolve stays a relative name; walked
+    from `/` it named the root, and `--ro-bind / /` after the HOME mount put
+    the real HOME back."""
+    mod = _harness_module()
+    run = _bare_run(tmp_path)
+    with pytest.raises(mod.Unexposable, match="absolute"):
+        mod.sandboxed(["true"], claude="e2e-no-such-claude", run=run,
+                      shared=run / "shared", work=run / "work")
+
+
+def test_no_mount_is_buried_by_a_later_one_over_it(tmp_path):
+    """bwrap mounts in argv order and a mount covers every earlier one under
+    it. So no mount may follow one beneath it, and a tmpfs that hides a path
+    may not be followed by a bind of that same path: claude's own directory
+    lent after the out-dir tmpfs brought the sibling runs back whenever --out
+    sat inside it (a claude in tmp_path, --out tmp_path/out)."""
+    mod = _harness_module()
+    run = _bare_run(tmp_path)
+    claude = fake_claude(tmp_path, "exit 0\n")
+    argv = mod.sandboxed(["true"], claude=str(claude), run=run, shared=run / "shared",
+                         work=run / "work")
+    seen = mod.mounts(argv)[1:]  # past `--dev-bind / /`
+    for i, (earlier, host) in enumerate(seen):
+        for later, _ in seen[i + 1:]:
+            assert not (later != earlier and _within(earlier, later)), (earlier, later, argv)
+            assert not (later == earlier and host is None), (earlier, argv)
+
+
+def _within(path: str, root: str) -> bool:
+    return pathlib.PurePosixPath(path).is_relative_to(root)
+
+
+def test_a_sibling_run_under_claudes_own_dir_is_unreachable(tmp_path):
+    """The same, measured inside: claude in tmp_path, --out tmp_path/out, as
+    every test here lays it out."""
+    _require_sandbox()
+    sibling = tmp_path / "out/sc/old/1/home/.claude.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("{}\n")
+    claude = fake_claude(tmp_path, _ok(
+        f'echo "sibling=$(test -e {sibling} && echo seen || echo hidden)" > "$E2E_SHARED/report"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
+    assert _report(out) == {"sibling": "hidden"}
+
+
+def test_the_run_dir_holds_no_second_name_for_home(tmp_path):
+    """Only the real HOME's path names the staged HOME inside: RUN/home is
+    empty there, so a path baked from the host's view of it fails loudly
+    instead of reaching the same files off-policy. $HOME works, and what is
+    written there lands in RUN/home on the host."""
+    _require_sandbox()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "settings.json").write_text("{}\n")
+    claude = fake_claude(tmp_path, _ok("""
+{ echo "second=$(ls -A "$E2E_RUN/home" 2>/dev/null | wc -l)"
+  echo "home=$(test -f "$HOME/.claude/settings.json" && echo ok || echo missing)"
+  echo w > "$HOME/written"; } > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    assert _report(out) == {"second": "0", "home": "ok"}
+    assert (out / "sc/new/1/home/written").read_text() == "w\n"
+
+
+def test_a_sibling_run_under_a_lent_root_is_unreachable(tmp_path, in_real_home):
+    """--out under a lent root (~/worktrees, where git-broker-publish-watch
+    must run): the root comes back read-only, but the scenario's own out dir
+    is hidden again inside, save this run, so another arm's or sample's
+    staged home is not readable through the lend."""
+    _require_sandbox()
+    lent = in_real_home / "lent"
+    out = lent / "out"
+    sibling = out / "sc/old/1/home/.claude.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("{}\n")
+    (lent / "beside").write_text("b\n")
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "sibling=$(test -e {sibling} && echo seen || echo hidden)"
+   echo "lent=$(cat {lent}/beside 2>/dev/null || echo hidden)"
+   echo "own=$(test -d "$E2E_RUN/work" && echo seen || echo hidden)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "lend").write_text(f"{lent.relative_to(_harness_module().REAL_HOME)}\n")
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    assert _report(out) == {"sibling": "hidden", "lent": "b", "own": "seen"}
+
+
+def _sandbox_check_env(run: pathlib.Path, real_home: pathlib.Path | None = None) -> dict:
+    """The env check.sh gets from the harness for RUN, on a host whose HOME
+    is REAL_HOME (default: this account's)."""
+    mod = _harness_module()
+    if real_home is not None:
+        mod.REAL_HOME = real_home
+    env = {**os.environ, "HOME": str(run / "home"), "E2E_RUN": str(run)}
+    env.pop("E2E_MOUNTS", None)
+    for d in (run / "work", run / "home", run / "shared"):
+        d.mkdir(parents=True, exist_ok=True)
+    argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                         work=run / "work")
+    return {**env, "E2E_HOME": str(mod.REAL_HOME), "E2E_MOUNTS": json.dumps(mod.mounts(argv))}
+
+
+@pytest.mark.parametrize("where,want", [
+    (".claude/tools/ai-router", "FAIL"),
+    ("Repos/claude-config/runtime/tools/ai-router", "PASS"),
+])
+def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, where, want):
+    """The pytest stub logs its cwd as the agent saw it. A suite run inside the
+    agent's own ~/.claude is the staged projection (FAIL) whichever path that
+    HOME had; one under the lent ~/Repos is the host's checkout (PASS). The
+    host is a staged one with its own ~/Repos, so the case holds on a runner
+    that has none."""
+    host = tmp_path / "realhome"
+    (host / "Repos/claude-config/runtime/tools/ai-router").mkdir(parents=True)
+    run = tmp_path / "sc/old/1"
+    (run / "home/.claude/tools/ai-router").mkdir(parents=True)
+    env = _sandbox_check_env(run, host)
+    seen = env["E2E_HOME"]
+    (run / "suite-calls.txt").write_text(f"{seen}/{where}\t-q tests\n")
+    (run / "commands.txt").write_text(f"ls ~/.claude/tools\ncd {seen}/{where} && pytest -q tests\n")
+    (run / "final.txt").write_text("done\n")
+    r = _grade(run, "tests-out-of-projection", env)
+    assert r.stdout.startswith(want), r.stdout + r.stderr
+
+
+def test_tests_out_of_projection_resolves_a_bare_arg_where_the_agent_stood(tmp_path):
+    """`pytest tests` run in the agent's ~/.claude/tools/ai-router names
+    that dir's tests/, which is in the staged tree: whether it exists is asked
+    of the host file behind the agent's cwd, not of the same path on the host
+    (the live ~/.claude, here a host without one)."""
+    host = tmp_path / "realhome"
+    host.mkdir()
+    run = tmp_path / "sc/old/1"
+    (run / "home/.claude/tools/ai-router/tests").mkdir(parents=True)
+    env = _sandbox_check_env(run, host)
+    seen = env["E2E_HOME"]
+    (run / "suite-calls.txt").write_text(f"{seen}/.claude/tools/ai-router\t-q tests\n")
+    (run / "commands.txt").write_text(f"cd {seen}/.claude/tools/ai-router && pytest -q tests\n")
+    (run / "final.txt").write_text("done\n")
+    r = _grade(run, "tests-out-of-projection", env)
+    assert r.stdout.startswith("FAIL") and "~/.claude/tools/ai-router/tests" in r.stdout, \
+        r.stdout + r.stderr
+
+
 def test_check_failure_is_fail(tmp_path):
     _require_sandbox()
     claude = fake_claude(tmp_path, f"cat <<'EOF'\n{stream('done', [])}\nEOF\n")
@@ -259,6 +859,7 @@ def test_check_failure_is_fail(tmp_path):
     f"cat <<'EOF'\n{stream('partial', [], is_error=True)}\nEOF\n",  # budget cap etc.
 ])
 def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
+    _require_sandbox()
     claude = fake_claude(tmp_path, body)
     sc = _scenario(tmp_path, "exit 0")  # a check that would PASS anything
     _, _, verdicts = _run(tmp_path, sc, claude)
@@ -267,12 +868,12 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 _SECRETS = (".claude.json", ".claude.json.backup", ".claude/backups/.claude.json.backup.1",
             ".ssh/id_x", ".codex/auth.json", ".claude/.credentials.json")
-# Plants every secret in $HOME. The credentials entry is a link to the REAL
-# file, so it is removed first: writing through it would overwrite the real one.
-# A token refresh leaves it a regular file, which is what this plants.
+# Plants every secret in $HOME. The credentials entry, where the host has
+# one, is a bind mount of the REAL file, which no rm removes, so it is left
+# alone and the empty file bwrap made for the mount is what the scrub must take.
 _PLANT = "\n".join(
-    ['rm -f "$HOME/.claude/.credentials.json"']
-    + [f'mkdir -p "$(dirname "$HOME/{rel}")"; echo s > "$HOME/{rel}"' for rel in _SECRETS]
+    [f'mkdir -p "$(dirname "$HOME/{rel}")"; [ -e "$HOME/{rel}" ] || echo s > "$HOME/{rel}"'
+       for rel in _SECRETS]
     + ['ln -s / "$HOME/.local-root"', 'ln -s /etc/hostname "$HOME/.claude/out-link"'])
 
 
@@ -329,6 +930,7 @@ def test_retained_run_is_scrubbed_after_check_but_state_survives(tmp_path):
 
 
 def test_run_is_scrubbed_when_setup_fails(tmp_path):
+    _require_sandbox()
     claude = fake_claude(tmp_path, "exit 0\n")
     sc = _scenario(tmp_path, "exit 0")
     (sc / "setup.sh").write_text(f"#!/usr/bin/env bash\n{_PLANT}\nexit 1\n")
@@ -352,11 +954,15 @@ def test_secrets_outside_home_are_scrubbed_too(tmp_path):
     _assert_scrubbed(out / "sc/new/1")
 
 
+# Each swap proves its link landed (exit 9 otherwise, INCONCLUSIVE): swapping
+# RUN/home was a silent no-op under bwrap, where it is a tmpfs mountpoint (mv
+# gets EBUSY, ln lands inside it), so the case attacks RUN/work instead.
 @pytest.mark.parametrize("swap", [
-    'cd /; mv "$HOME" "$E2E_RUN/h2"; ln -s {decoy} "$E2E_RUN/home"',
-    'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"',
-    'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"',
-    'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"',
+    'cd /; mv "$E2E_RUN/work" "$E2E_RUN/w2"; ln -s {decoy} "$E2E_RUN/work"; test -L "$E2E_RUN/work" || exit 9',
+    'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"; test -L "$HOME/.claude" || exit 9',
+    'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"; test -L "$HOME/x/y" || exit 9',
+    'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"; '
+    'test -L "$E2E_RUN/final.txt" || exit 9',
 ])
 def test_scrub_and_writes_never_follow_a_link_the_run_planted(tmp_path, swap):
     _require_sandbox()
@@ -872,6 +1478,48 @@ def test_dogfood_setup_makes_a_worktree_of_the_staged_config(tmp_path):
     assert (run / "shared/claude.log").read_text().strip() == "-p x"
 
 
+def test_dogfood_worktree_names_its_repository_by_the_agents_home(tmp_path):
+    """The worktree's .git is followed by the agent's git, inside the
+    sandbox, where the staged dir setup.sh wrote through is hidden: it must
+    name the repository under the agent's HOME (E2E_HOME)."""
+    home, run, work, binp = (tmp_path / d for d in ("home", "run", "work", "bin"))
+    for d in (run / "shared", work, binp, home / ".claude"):
+        d.mkdir(parents=True)
+    (home / ".claude/CLAUDE.md").write_text("## Collaboration\n")
+    env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(binp),
+           "E2E_SHARED": str(run / "shared"), "E2E_HOME": "/home/agent-view",
+           "HOME": str(home), "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    r = subprocess.run(["bash", str(SCENARIOS / "config-change-runs-e2e/setup.sh"),
+                        str(work), str(run)], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (work / ".git").read_text() == "gitdir: /home/agent-view/.claude/.git/worktrees/work\n"
+
+
+def test_paths_setup_hands_inside_name_the_agents_home(tmp_path):
+    """What a setup writes INTO a file or link that is read inside the
+    sandbox names the agent's HOME (E2E_HOME): the dcg marker a SessionStart
+    hook reads, and the notes link the reporting-state scenarios give WORK."""
+    home, run, work, binp = (tmp_path / d for d in ("home", "run", "work", "bin"))
+    for d in (run, work, binp, home):
+        d.mkdir()
+    env = {**os.environ, "E2E_RUN": str(run), "E2E_WORK": str(work), "E2E_BIN": str(binp),
+           "E2E_HOME": "/home/agent-view", "HOME": str(home),
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    r = subprocess.run(["bash", "-c", f'source {SCENARIOS}/_lib/dcg.sh && write_dcg_marker'],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    marker = json.loads((home / ".local/state/dcg/fallback-active.json").read_text())
+    assert marker["target"] == "/home/agent-view/.claude/dcg.toml"
+    r = subprocess.run(["bash", str(SCENARIOS / "reporting-state-orient/setup.sh")],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert os.readlink(work / "tasks") == "/home/agent-view/.local/state/claude-tasks/work"
+    assert (home / ".local/state/claude-tasks/work/mission.md").is_file()
+
+
 @pytest.mark.parametrize("commands,claude_ran,want", [
     (["python3 scripts/agent-e2e/agent_e2e.py run t --arm a=b", "gh pr create --fill"], True, 0),
     (["claude -p hi"], True, 0),
@@ -1185,9 +1833,24 @@ def test_runs_get_a_private_tmp(tmp_path):
         sc = _scenario(tmp_path, "exit 0")
         _, _, verdicts = _run(tmp_path, sc, claude)
         assert verdicts[0]["verdict"] == "PASS", verdicts
-        assert verdicts[0]["isolated_tmp"] is True
     finally:
         probe.unlink()
+
+
+def test_a_run_without_bubblewrap_is_inconclusive(tmp_path):
+    """The sandbox is the isolation: with no bwrap on PATH nothing runs, and
+    the verdict names what is missing."""
+    bindir = tmp_path / "bin-no-bwrap"
+    bindir.mkdir()
+    for tool in ("bash", "cat", "git", "tar", "python3"):
+        if found := shutil.which(tool):
+            (bindir / tool).symlink_to(found)
+    claude = fake_claude(tmp_path, f'echo x > "{tmp_path}/called"\n' + _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    _, _, verdicts = _run(tmp_path, sc, claude, env={**os.environ, "PATH": str(bindir)})
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert "bubblewrap (bwrap)" in verdicts[0]["why"], verdicts
+    assert not (tmp_path / "called").exists()
 
 
 def test_nested_run_reaches_shared_dir(tmp_path):
@@ -1234,7 +1897,8 @@ def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
         f'[ -z "$SSH_AUTH_SOCK$GH_TOKEN$GITHUB_TOKEN" ] || exit 11\n'
         f'[ "$GIT_SSH_COMMAND" = false ] || exit 12\n'
         f'[ -z "$(ls -A {real}/.ssh 2>/dev/null)" ] || exit 13\n'
-        f'touch {real}/.agent-e2e-escape 2>/dev/null && exit 14\n'
+        # The staged HOME is mounted at this path, so the touch lands there.
+        f'touch {real}/.agent-e2e-escape 2>/dev/null\n'
         "cat <<'EOF'\n" + stream("contained", []) + "\nEOF\n")
     claude = fake_claude(tmp_path, body)
     sc = _scenario(tmp_path, "exit 0")
@@ -1266,6 +1930,7 @@ def test_nested_default_out_stays_inside_the_run(tmp_path):
 
 def test_headless_permission_denials_count_as_blocked(tmp_path):
     """Review M3: -p permission denials make a run INCONCLUSIVE, like hook refusals."""
+    _require_sandbox()
     events = [
         {"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "gh pr create"}}]}},

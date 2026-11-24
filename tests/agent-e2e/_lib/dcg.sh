@@ -2,7 +2,8 @@
 # Staging helpers for the dcg rule-set health scenarios. $HOME is the sandbox
 # HOME the run was staged into, so both of these write where the SessionStart
 # hook will look: the marker under $HOME/.local/state, dcg's config where
-# `~/.config/dcg/config.toml` resolves.
+# `~/.config/dcg/config.toml` resolves. A path written INTO a file names the
+# HOME the hook sees, E2E_HOME (under bwrap the real HOME's path).
 
 # nixos-config's activation marker, in the shape home/dcg.nix:434 writes it.
 # `observed_at` is deliberately old: the false alarm these scenarios are about
@@ -17,7 +18,7 @@ write_dcg_marker() {
   "schema": 1,
   "component": "dcg",
   "state": "fallback-active",
-  "target": "$HOME/.claude/dcg.toml",
+  "target": "${E2E_HOME:-$HOME}/.claude/dcg.toml",
   "fallback_source": "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-dcg-fallback.toml",
   "fallback_sha256": "e55b000000000000000000000000000000000000000000000000000000000000",
   "observed_at": "2026-10-29T08:14:03Z",

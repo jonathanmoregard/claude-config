@@ -96,6 +96,14 @@ So `Read(/secrets/**)` in user settings guards `~/.claude/secrets/**` and nothin
 in any project. This repo hit exactly that: commit `602e6e4` re-anchored every path
 rule at `//` after finding the single-slash forms inert. That change was correct.
 
+**Home paths: write `~/`, never `//home/jonathan/`.** `~/` follows the HOME the CLI
+started with, as AppArmor's `@{HOME}`, systemd's `%h` and Flatpak's `~/` do. A
+`//home/jonathan/` rule matches nothing under another HOME: in CI
+(`HOME=/home/runner`) the e2e agent was denied its own skills. A different HOME is a
+different environment, and keeping the real home out of it is the sandbox's job (the
+e2e harness runs only under bubblewrap). `tests/test_permission_anchors.py` enforces
+this.
+
 Symlinks are checked on both link and target: **allow** needs both to match, **deny**
 fires if either does. **[docs]**
 
