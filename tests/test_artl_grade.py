@@ -78,6 +78,8 @@ def edit(run, path, old, new, count=0):
     ("fires", [(R, "Explore", "toolu_1"), (V, "advisor")], "PASS"),  # a subagent's own call
     ("fires", [("find the ledger", "Explore"), (V, "advisor")], "PASS"),  # not a reviewer
     ("fires", [(R, "advisor"), (V, "advisor")], "FAIL"),
+    ("fires", [(R, "general-purpose"), (V, "advisor")], "FAIL"),
+    ("fires", [(R, ""), (V, "advisor")], "FAIL"),  # untyped dispatch
     ("fires", [], "FAIL"),
     ("holds", [(R, "advisor"), (V, "advisor")], "PASS"),
     ("holds", [(V, "advisor"), (R, "advisor")], "FAIL"),

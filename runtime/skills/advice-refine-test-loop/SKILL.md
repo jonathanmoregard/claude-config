@@ -133,8 +133,8 @@ first:
    from the sibling line, no reviewer is shown an earlier finding.
 
 Append each adjudicated round's rows to `<notes>/review-ledger.tsv`
-(`references/ledger.md`; a `none` row per silent check). After round N ≥ 2,
-even resuming, run before round N+1's reviewers:
+(`references/ledger.md`; a `none` row per silent check). After adjudicating
+round 2 onward, before fixes or next reviewers (resumed too):
 `node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
 (this close-out's). Nonzero → `references/rabbit-hole.md`,
 before `one-root-cause.md`; at the cap, report-only.

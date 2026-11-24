@@ -16,8 +16,8 @@ the verdict is "asked the user a closed question", a schema-enforced judge
              question about changing the shared store
   unrelated  PASS when app/ changed but not app/store.py, and the gate is green
 
-A reviewer is any dispatch but a `VALIDATION dispatch`, a `CONSULT dispatch`
-or a worker-* subagent. Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
+A reviewer is any dispatch but a `VALIDATION dispatch`, a `CONSULT dispatch`,
+a worker-* or an Explore subagent. Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
 """
 import json
 import subprocess
@@ -67,9 +67,9 @@ def dispatches(run):
                 out.append("diagnosis")
             elif b["input"].get("subagent_type", "").startswith("worker-"):
                 out.append("worker")
-            elif (b["input"].get("subagent_type") == "advisor"
+            elif (b["input"].get("subagent_type") != "Explore"
                   and not prompt.startswith("CONSULT dispatch")):
-                out.append("reviewer")  # the skill's reviewers; Explore etc. are neither
+                out.append("reviewer")  # Explore only looks things up
     return out
 
 
