@@ -32,7 +32,7 @@ Give the reviewer only:
 - the exclusion list, when it has entries
   (`references/exclusions.md`), under the line "Do not report:".
 
-The reviewer chooses which files, callers, tests, and configuration to inspect.
+The reviewer chooses which files to inspect.
 Inspection depth is the reviewer's judgment.
 Never restrict inspection to changed hunks: a historical miss hid in an
 unchanged invariant elsewhere in a changed file. Do not preselect or cap files
@@ -48,8 +48,7 @@ read and why each context expansion was relevant.
    them even when it quotes nothing. Keep both reviewers in flight at once. One
    tool-use block always does that; a later message only where the dispatch
    returns before the reviewer reports. If the tool result carries A's
-   findings, B in the next message is already anchored — so send both together
-   rather than assuming. Two fresh, read-only reviewers; neither sees the
+   findings, B in the next message is already anchored — so send both together. Two fresh, read-only reviewers; neither sees the
    other's prompt, findings, or existence.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
@@ -138,7 +137,7 @@ nothing new unconfirmed. Cap: four rounds. At the cap without two empty
 rounds, stop and report "not converged" with the count per round; the user
 decides what happens next.
 
-Once a round is adjudicated, append its rows to `<notes>/review-ledger.tsv`
+After adjudication, append each round's rows to `<notes>/review-ledger.tsv`
 (`references/ledger.md`; a `none` row per silent check). Before rounds 3–4, run
 `node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
 (this close-out's runs, in order). `fire` → `references/rabbit-hole.md`
@@ -151,7 +150,7 @@ and model usage when available, B's hunt classes per round, files read,
 findings proposed / reproduced / refuted / unconfirmed / fixed / deferred,
 design and advisory findings surfaced, commands run, and final gate status.
 List every unconfirmed finding with what was tried. Reframes: threads,
-verdicts, approach, whether the user was asked.
+verdicts, approach, user asked?
 
 End the report with the `ledger-tally.sh` line for each check that ran in
 this close-out. If a line says `drop` or `reword`, or an `exclude?` line
