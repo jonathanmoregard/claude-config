@@ -102,3 +102,21 @@ def test_cli_bad_base_fails_loudly(tmp_path: Path):
                           "--base", "nope"], cwd=tmp_path, capture_output=True,
                          text=True)
     assert out.returncode == 2 and "nope" in out.stderr
+
+
+def test_risky_words_inside_camel_case_and_longer_forms_are_t3():
+    for path in ("src/AuthMiddleware.ts", "src/authentication/x.py",
+                 "lib/authorization.rb", "app/PasswordReset.tsx",
+                 "db/migrate_users.py", "api/SecretStore.go"):
+        assert tier([(path, 2)]) == "T3", path
+
+
+def test_cli_base_equals_form_is_honoured(tmp_path: Path):
+    _git(tmp_path, "init", "-q", "-b", "master")
+    (tmp_path / "a").write_text("a\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "base")
+    for argv in (["--base=nope"], ["--base"]):
+        out = subprocess.run([sys.executable, str(HOOKS / "artl_gate.py"), "tier", *argv],
+                             cwd=tmp_path, capture_output=True, text=True)
+        assert out.returncode == 2, (argv, out.stdout)

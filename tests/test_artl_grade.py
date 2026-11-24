@@ -82,7 +82,8 @@ def edit(run, path, old, new, count=0):
     ([(A, "advisor"), ("CONSULT dispatch\nq", "advisor")], "PASS"),
     ([(A, "advisor", "toolu_1"), (A, "advisor")], "PASS"),        # a subagent's own call
     ([[(A, "advisor"), (B, "advisor")]], "FAIL"),                 # the blind pair
-    ([(A, "advisor"), (A, "advisor")], "FAIL"),                   # a second round
+    ([(A, "advisor"), (A, "advisor")], "PASS"),                   # a single delta round
+    ([(A, "advisor"), (B, "advisor")], "FAIL"),                   # B in a later round
     ([], "FAIL"),
     ([("Look over this diff for bugs.", "general-purpose")], "INCONCLUSIVE"),
 ])
@@ -109,6 +110,7 @@ def delta_prompt(run, *, delta=True, dnr=True, whole=False):
     ("pair", "FAIL"),
     ("b-only", "FAIL"),
     ("whole", "FAIL"),        # the whole original diff pasted in
+    ("whole-range", "FAIL"),  # the whole diff by range, fix sha mentioned too
     ("no-dnr", "FAIL"),
     ("no-delta", "FAIL"),
     ("none", "FAIL"),
@@ -124,6 +126,7 @@ def test_delta_round(tmp_path, shape, want):
         "pair": [[good, (B + "\nDo not report:", "advisor")]],
         "b-only": [(B + delta_prompt(run)[len(A):], "advisor")],
         "whole": [(delta_prompt(run, whole=True), "advisor")],
+        "whole-range": [(delta_prompt(run) + "\nReview git diff main...HEAD", "advisor")],
         "no-dnr": [(delta_prompt(run, dnr=False), "advisor")],
         "no-delta": [(delta_prompt(run, delta=False), "advisor")],
         "none": [],

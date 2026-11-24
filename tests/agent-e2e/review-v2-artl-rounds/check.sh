@@ -58,7 +58,8 @@ grep -qE "^D5[[:space:]]" "$RUN/final.txt" || grep -qE "D5.*drop|drop.*D5" "$RUN
 grep -q "?" "$RUN/final.txt" || bad+=("14:no question in final")
 grep -q "/.claude/skills/" "$D/edits.txt" && bad+=("14:a skill file was edited")
 
-[ -s "$notes/review-runs.tsv" ] || bad+=("15:no review-runs.tsv row")
+awk -F'\t' 'NF>=8 && $3=="T2"' "$notes/review-runs.tsv" 2>/dev/null | grep -q . \
+  || bad+=("15:no review-runs.tsv row with tier T2")
 
 [ ${#bad[@]} -eq 0 ] && pass "$n reviewer dispatches; mechanical checks hold (9 by hand)"
 fail "${bad[*]}"

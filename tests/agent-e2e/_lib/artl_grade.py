@@ -22,6 +22,7 @@ A reviewer is a dispatch carrying reviewer A's or B's opening line from the
 skill. Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
 """
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -125,7 +126,13 @@ def grade_t1(run):
             return "inconclusive", f"{len(other)} dispatch(es), none with a reviewer prompt"
         return "fail", "no reviewer dispatched"
     kinds = " ".join(c[2] or "-" for c in revs)
-    return ("pass" if len(revs) == 1 else "fail"), f"{len(revs)} reviewer dispatch(es): {kinds}"
+    # T1: round 1 is one reviewer; any later round is one delta reviewer.
+    if any(B_MARK in flat(c[1]) and A_MARK not in flat(c[1]) for c in revs):
+        return "fail", f"a reviewer B dispatch: T1 ran the pair ({kinds})"
+    msgs = [c[0] for c in revs]
+    if len(set(msgs)) < len(msgs):
+        return "fail", f"two reviewers in one message: T1 ran the pair ({kinds})"
+    return "pass", f"{len(revs)} single reviewer dispatch(es): {kinds}"
 
 
 def grade_delta(run):
@@ -142,7 +149,7 @@ def grade_delta(run):
     if fix not in first and "reset on the user's local calendar date" not in first \
             and "timedelta(minutes=self.offsets.get(user, 0))" not in first:
         return "fail", "the round-2 prompt does not name the fix commit or carry its diff"
-    if "def listing(store, user)" in first:
+    if "def listing(store, user)" in first or re.search(r"\bmain\.\.\.?head\b", first, re.I):
         return "fail", "the round-2 prompt carries the whole original diff"
     if "do not report" not in first:
         return "fail", "the round-2 prompt has no \"Do not report:\" list"

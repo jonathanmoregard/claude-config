@@ -26,9 +26,9 @@ task, or chunk; the project tests serve there.
 | Tier | Review |
 |---|---|
 | T0 | None. The gates above are the review; report the tier line. |
-| T1 | One round: reviewer A alone, B's triggered `Hunt` lines appended. |
+| T1 | Round 1 is reviewer A alone, B's triggered `Hunt` lines appended; then delta rounds. |
 | T2 | The blind pair, then delta rounds (see Rounds). |
-| T3 | T2, plus A's prompt once through `scripts/codex-advise.sh` in round 1. |
+| T3 | T2, plus A's prompt once through `scripts/codex-advise.sh` in round 1; on a nonzero exit, report that pass unavailable. |
 
 Do not invite an LLM reviewer while a deterministic gate is red.
 
@@ -123,9 +123,9 @@ Then:
 
 ## Rounds
 
-T2 and T3 only; T1 ends after its one round. After a round's fixes, run each
+After a round's fixes, run each
 reproducer, the project gate, the acceptance scenarios and the deterministic
-gate again. Then, if the round reproduced anything, run the next round:
+gate again. Then, unless the round was empty, run the next round:
 
 1. One fresh reviewer with A's prompt, over the delta only: the commits since
    the tree the previous round reviewed. A fix is new code; the reviewer may

@@ -1058,16 +1058,20 @@ T1_LINES = 80
 T1_FILES = 5
 BINARY_LINES = 30
 # Path words where a defect is a security hole, data loss or hard to undo.
-# Matched as whole words of the path, so `author` is not `auth`.
+# Matched as words of the path, camelCase split, so `author` is not `auth`
+# but `AuthMiddleware` is; RISKY_STEMS also catch the longer forms.
 RISKY_WORDS = {"auth", "authn", "authz", "oauth", "secret", "secrets", "credential",
                "credentials", "crypto", "password", "passwords", "migration",
                "migrations", "sandbox", "guard", "gate", "deny", "permission",
                "permissions", "security", "pii", "gdpr"}
-_PATH_WORDS = re.compile(r"[a-z0-9]+")
+RISKY_STEMS = ("authentic", "authoriz", "authoris", "credential", "secret", "crypt",
+               "passw", "migrat", "permission", "sandbox")
+_PATH_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 
 
 def is_risky(path: str) -> bool:
-    return any(w in RISKY_WORDS for w in _PATH_WORDS.findall(path.lower()))
+    words = [w.lower() for w in _PATH_WORDS.findall(path)]
+    return any(w in RISKY_WORDS or w.startswith(RISKY_STEMS) for w in words)
 
 
 def review_tier(changes: list[tuple[str, int | None]]) -> tuple[str, str]:
@@ -1094,7 +1098,15 @@ def _tier_cli(argv: list[str]) -> int:
     if top is None:
         print("tier: not inside a git work tree", file=sys.stderr)
         return 2
-    base = argv[argv.index("--base") + 1] if "--base" in argv[:-1] else local_base_ref(top)
+    if argv and argv[0].startswith("--base="):
+        argv = ["--base", argv[0].split("=", 1)[1], *argv[1:]]
+    if argv[:1] == ["--base"] and len(argv) == 2:
+        base = argv[1]
+    elif not argv:
+        base = local_base_ref(top)
+    else:
+        print(f"tier: bad arguments {argv!r}; usage: tier [--base REF]", file=sys.stderr)
+        return 2
     mb = git(top, "merge-base", base, "HEAD") if base else None
     if mb is None:
         print(f"tier: no merge base with {base!r}", file=sys.stderr)
@@ -1103,7 +1115,10 @@ def _tier_cli(argv: list[str]) -> int:
     if changes is None:
         print("tier: git diff failed", file=sys.stderr)
         return 2
-    untracked = git(top, "ls-files", "--others", "--exclude-standard", "-z") or ""
+    untracked = git(top, "ls-files", "--others", "--exclude-standard", "-z")
+    if untracked is None:
+        print("tier: git ls-files failed", file=sys.stderr)
+        return 2
     for path in filter(None, untracked.split("\0")):
         try:
             n = len((Path(top) / path).read_text().splitlines())
