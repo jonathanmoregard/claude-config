@@ -1,0 +1,1 @@
+Round 3 of the close-out review on this branch is back and the verifier has been through it. review/round-3.md has the finding and its outcome, and the reproducer is in tests/test_round3.py (red for now). Pick up advice-refine-test-loop from there and carry on. I'm away until tomorrow; I'll merge the branch myself.

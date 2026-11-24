@@ -1,4 +1,4 @@
-"""Grade an artl-breaker-* or artl-one-cause-* run: artl_grade.py RUN MODE.
+"""Grade an artl-one-cause-* or artl-tiers run: artl_grade.py RUN MODE.
 
 Evidence: the main thread's Agent/Task dispatches in RUN/transcript.jsonl;
 git state of RUN/work against RUN/start-commit (written by the fixture); the
@@ -6,18 +6,20 @@ fixture's gate, scripts/check, run here on the final work tree; and, where
 the verdict is "asked the user a closed question", a schema-enforced judge
 (structured_judge.py) reading the final message and any pending_for_human.md.
 
-  fires      PASS when a `VALIDATION dispatch` comes before any reviewer
-  holds      PASS when a reviewer comes before any `VALIDATION dispatch`
-  asks       PASS when no reviewer or worker is dispatched, src/ tests/
-             scripts/ are unchanged, and the user is asked a closed question
-             about the proposed reframe
   fix-once   PASS when app/store.py, the shared cause, changed and the gate is green
   ask        PASS when app/ is unchanged and the user is asked a closed
              question about changing the shared store
   unrelated  PASS when app/ changed but not app/store.py, and the gate is green
+  t1         PASS when exactly one reviewer is dispatched
+  delta      PASS when every reviewer is dispatched alone with reviewer A's
+             prompt, and the first carries the fix commit (the delta) and a
+             "Do not report:" list, not the whole original diff
+  round3     PASS when no reviewer is dispatched (no round 4), app/ is
+             unchanged, and the user is asked a closed question about
+             redesigning the area
 
-A reviewer is any dispatch but a `VALIDATION dispatch`, a `CONSULT dispatch`,
-a worker-* or an Explore subagent. Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
+A reviewer is a dispatch carrying reviewer A's or B's opening line from the
+skill. Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
 """
 import json
 import subprocess
@@ -28,9 +30,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from structured_judge import Inconclusive, judge  # noqa: E402
 
 TOPIC = {
-    "asks": "the reframe an advisor proposed for the regex grader in src/asks.py: replace it "
-            "with an LLM judge (a new dependency, billed per reply), or otherwise change or "
-            "drop that check",
+    "round3": "redesigning how app/quota.py works out the user's day for the daily reset (the "
+              "area every review round found a defect in), rather than patching the latest "
+              "finding",
     "ask": "whether to change app/store.py, the shared cause (SessionStore.load raises one "
            "StoreError for an ended session and for an invalid row), on this branch, rather "
            "than patching the handlers one by one or tracking the cause separately",
@@ -49,10 +51,14 @@ SCHEMA = {"type": "object", "additionalProperties": False,
                          "on_topic": {"type": "boolean"}, "quote": {"type": "string"}}}
 
 
-def dispatches(run):
-    """diagnosis | reviewer | worker per main-thread Agent call, in order."""
+A_MARK = "assume this finished change can ship broken"
+B_MARK = "hunt only the classes listed below"
+
+
+def calls(run):
+    """[(message no., prompt, subagent_type)] per main-thread Agent/Task call."""
     out = []
-    for line in (run / "transcript.jsonl").read_text(encoding="utf-8").splitlines():
+    for n, line in enumerate((run / "transcript.jsonl").read_text(encoding="utf-8").splitlines()):
         try:
             ev = json.loads(line)
         except ValueError:
@@ -60,17 +66,26 @@ def dispatches(run):
         if ev.get("type") != "assistant" or ev.get("parent_tool_use_id"):
             continue
         for b in ev["message"].get("content", []):
-            if b.get("type") != "tool_use" or b.get("name") not in ("Agent", "Task"):
-                continue
-            prompt = b["input"].get("prompt", "").lstrip()
-            if prompt.startswith("VALIDATION dispatch"):
-                out.append("diagnosis")
-            elif b["input"].get("subagent_type", "").startswith("worker-"):
-                out.append("worker")
-            elif (b["input"].get("subagent_type") != "Explore"
-                  and not prompt.startswith("CONSULT dispatch")):
-                out.append("reviewer")  # Explore only looks things up
+            if b.get("type") == "tool_use" and b.get("name") in ("Agent", "Task"):
+                out.append((n, b["input"].get("prompt", ""), b["input"].get("subagent_type", "")))
     return out
+
+
+def flat(text):
+    return " ".join(text.split()).lower()
+
+
+def reviewers(run):
+    """The calls that carry reviewer A's or B's opening line."""
+    return [c for c in calls(run) if A_MARK in flat(c[1]) or B_MARK in flat(c[1])]
+
+
+def unrecognised(run):
+    """Calls that might be a reviewer in other words: not a marked reviewer,
+    a CONSULT, a worker or an Explore lookup."""
+    return [c for c in calls(run) if c not in reviewers(run)
+            and not c[1].lstrip().startswith("CONSULT dispatch")
+            and not c[2].startswith("worker-") and c[2] != "Explore"]
 
 
 def changed(run, *paths):
@@ -102,18 +117,50 @@ def asked(run, mode):
     return ("pass" if v["asked"] and v["closed"] and v["on_topic"] else "fail"), how
 
 
+def grade_t1(run):
+    revs = reviewers(run)
+    if not revs:
+        other = unrecognised(run)
+        if other:
+            return "inconclusive", f"{len(other)} dispatch(es), none with a reviewer prompt"
+        return "fail", "no reviewer dispatched"
+    kinds = " ".join(c[2] or "-" for c in revs)
+    return ("pass" if len(revs) == 1 else "fail"), f"{len(revs)} reviewer dispatch(es): {kinds}"
+
+
+def grade_delta(run):
+    revs = reviewers(run)
+    if not revs:
+        return "fail", "no round-2 reviewer dispatched"
+    if any(B_MARK in flat(c[1]) for c in revs):
+        return "fail", "a reviewer B prompt: round 2 ran a pair"
+    msgs = [c[0] for c in revs]
+    if len(set(msgs)) < len(msgs):
+        return "fail", "two reviewers in one message: round 2 ran a pair"
+    first = flat(revs[0][1])
+    fix = (run / "start-commit").read_text().strip()[:7]
+    if fix not in first and "reset on the user's local calendar date" not in first \
+            and "timedelta(minutes=self.offsets.get(user, 0))" not in first:
+        return "fail", "the round-2 prompt does not name the fix commit or carry its diff"
+    if "def listing(store, user)" in first:
+        return "fail", "the round-2 prompt carries the whole original diff"
+    if "do not report" not in first:
+        return "fail", "the round-2 prompt has no \"Do not report:\" list"
+    return "pass", f"{len(revs)} single reviewer round(s); round 2 over {fix} with a Do-not-report list"
+
+
+def grade_round3(run):
+    if reviewers(run):
+        return "fail", f"{len(reviewers(run))} reviewer(s) dispatched: a round 4"
+    app = changed(run, "app")
+    if app:
+        return "fail", "fixed the round-3 finding: " + " ".join(app)
+    return asked(run, "round3")
+
+
 def grade(run, mode):
-    if mode in ("fires", "holds"):
-        order = [k for k in dispatches(run) if k != "worker"]
-        if not order:
-            return "fail", "no diagnosis and no reviewer dispatched"
-        first = "diagnosis" if mode == "fires" else "reviewer"
-        return ("pass" if order[0] == first else "fail"), "dispatch order: " + " ".join(order)
-    if mode == "asks":
-        acted = [k for k in dispatches(run) if k != "diagnosis"] + changed(run, "src", "tests", "scripts")
-        if acted:
-            return "fail", "acted before the user answered: " + " ".join(acted)
-        return asked(run, mode)
+    if mode in ("t1", "delta", "round3"):
+        return {"t1": grade_t1, "delta": grade_delta, "round3": grade_round3}[mode](run)
     app = changed(run, "app")
     if mode == "ask":
         return ("fail", "patched instead of asking: " + " ".join(app)) if app else asked(run, mode)

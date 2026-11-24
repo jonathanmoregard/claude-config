@@ -1,5 +1,5 @@
 """tests/agent-e2e/_lib/artl_grade.py on synthetic runs built from the real
-artl-breaker / artl-one-cause fixtures. The judge CLI is a fake: no model runs."""
+artl-tiers / artl-one-cause fixtures. The judge CLI is a fake: no model runs."""
 import json
 import os
 import re
@@ -11,9 +11,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 E2E = ROOT / "tests/agent-e2e"
-CHECK = ROOT / "runtime/skills/advice-refine-test-loop/scripts/convergence-check.mts"
-V = "VALIDATION dispatch\nCluster these findings into threads across rounds."
-R = "Assume this finished change can ship broken."
+A = "Assume this finished change can ship broken. Try to falsify its acceptance\nclaims."
+B = "Hunt only the classes listed below. For each, find a concrete path"
+VERIFY = "Reproduce each finding below against the code and report the outcome."
 
 
 @pytest.fixture
@@ -52,10 +52,14 @@ def build(tmp_path, scenario):
 
 
 def finish(run, calls=(), final="Done."):
-    """Write the transcript (CALLS: (prompt, subagent_type[, parent])) and final message."""
-    lines = [json.dumps({"type": "assistant", "parent_tool_use_id": c[2] if len(c) > 2 else None,
-                         "message": {"content": [{"type": "tool_use", "name": "Agent", "input": {
-                             "prompt": c[0], "subagent_type": c[1]}}]}}) for c in calls]
+    """Write the transcript and final message. Each of CALLS is one assistant
+    message: a (prompt, subagent_type[, parent]) call, or a list of them."""
+    def msg(cs):
+        cs = cs if isinstance(cs, list) else [cs]
+        return json.dumps({"type": "assistant", "parent_tool_use_id": cs[0][2] if len(cs[0]) > 2 else None,
+                           "message": {"content": [{"type": "tool_use", "name": "Agent", "input": {
+                               "prompt": c[0], "subagent_type": c[1]}} for c in cs]}})
+    lines = [msg(c) for c in calls]
     (run / "transcript.jsonl").write_text("\n".join(lines) + "\n")
     (run / "final.txt").write_text(final)
 
@@ -71,53 +75,85 @@ def edit(run, path, old, new, count=0):
     f.write_text(re.sub(old, new, f.read_text(), count=count))
 
 
-# ------------------------------------------------------------------ breaker
-@pytest.mark.parametrize("mode,calls,want", [
-    ("fires", [(V, "advisor"), (R, "advisor")], "PASS"),
-    ("fires", [("CONSULT dispatch\nq", "advisor"), ("x", "worker-hard"), (V, "advisor")], "PASS"),
-    ("fires", [(R, "advisor", "toolu_1"), (V, "advisor")], "PASS"),  # a subagent's own call
-    ("fires", [("find the ledger", "Explore"), (V, "advisor")], "PASS"),  # not a reviewer
-    ("fires", [(R, "advisor"), (V, "advisor")], "FAIL"),
-    ("fires", [(R, "general-purpose"), (V, "advisor")], "FAIL"),
-    ("fires", [(R, ""), (V, "advisor")], "FAIL"),  # untyped dispatch
-    ("fires", [], "FAIL"),
-    ("holds", [(R, "advisor"), (V, "advisor")], "PASS"),
-    ("holds", [(V, "advisor"), (R, "advisor")], "FAIL"),
-    ("holds", [("x", "worker-easy")], "FAIL"),
+# ------------------------------------------------------------------- tiers
+@pytest.mark.parametrize("calls,want", [
+    ([(A + "\n" + B, "advisor")], "PASS"),                        # A with B's Hunt lines
+    ([(A, "advisor"), (VERIFY, "general-purpose")], "PASS"),      # the verifier is no reviewer
+    ([(A, "advisor"), ("CONSULT dispatch\nq", "advisor")], "PASS"),
+    ([(A, "advisor", "toolu_1"), (A, "advisor")], "PASS"),        # a subagent's own call
+    ([[(A, "advisor"), (B, "advisor")]], "FAIL"),                 # the blind pair
+    ([(A, "advisor"), (A, "advisor")], "FAIL"),                   # a second round
+    ([], "FAIL"),
+    ([("Look over this diff for bugs.", "general-purpose")], "INCONCLUSIVE"),
 ])
-def test_breaker_dispatch_order(tmp_path, mode, calls, want):
-    run = tmp_path / "run"
-    run.mkdir()
+def test_t1_one_reviewer(tmp_path, calls, want):
+    run = build(tmp_path, "artl-tier-t1-one-reviewer")
     finish(run, calls)
-    assert grade(run, mode)[0] == want
+    assert grade(run, "t1")[0] == want
 
 
-@pytest.mark.parametrize("mode,verdict", [("fires", "fire"), ("asks", "fire"), ("holds", "hold")])
-def test_seeded_ledger_meets_the_convergence_check(tmp_path, mode, verdict):
-    run = build(tmp_path, f"artl-breaker-{mode}")
-    ledger = run / "home/.local/state/claude-tasks/work/review-ledger.tsv"
-    tok = ledger.read_text().splitlines()[1].split("\t")[2].split("/")[0]
-    r = subprocess.run(["node", str(CHECK), str(ledger), f"{tok}/r1", f"{tok}/r2"],
-                       capture_output=True, text=True, timeout=60)
-    assert r.stdout.splitlines()[-1].split("\t")[0] == verdict, r.stdout + r.stderr
+def delta_prompt(run, *, delta=True, dnr=True, whole=False):
+    fix = (run / "start-commit").read_text().strip()[:7]
+    p = A + (f"\nReview the delta {fix}^..{fix} only." if delta else "\nReview the diff.")
+    if whole:
+        p += "\n+def listing(store, user):\n+    return sorted(name for (owner, name) in store)"
+    if dnr:
+        p += "\nDo not report:\n- accept charges the quota before the size check"
+    return p
 
 
-@pytest.mark.parametrize("calls,edits,verdict,want", [
-    ([(V, "advisor")], False, asked(), "PASS"),
+@pytest.mark.parametrize("shape,want", [
+    ("one", "PASS"),
+    ("one-then-round3", "PASS"),
+    ("subject", "PASS"),      # the delta named by the fix commit's subject
+    ("pair", "FAIL"),
+    ("b-only", "FAIL"),
+    ("whole", "FAIL"),        # the whole original diff pasted in
+    ("no-dnr", "FAIL"),
+    ("no-delta", "FAIL"),
+    ("none", "FAIL"),
+])
+def test_delta_round(tmp_path, shape, want):
+    run = build(tmp_path, "artl-delta-round")
+    good = (delta_prompt(run), "advisor")
+    calls = {
+        "one": [good, (VERIFY, "general-purpose")],
+        "one-then-round3": [good, good],
+        "subject": [(delta_prompt(run, delta=False)
+                     + "\nThe delta is fix(quota): reset on the user's local calendar date", "advisor")],
+        "pair": [[good, (B + "\nDo not report:", "advisor")]],
+        "b-only": [(B + delta_prompt(run)[len(A):], "advisor")],
+        "whole": [(delta_prompt(run, whole=True), "advisor")],
+        "no-dnr": [(delta_prompt(run, dnr=False), "advisor")],
+        "no-delta": [(delta_prompt(run, delta=False), "advisor")],
+        "none": [],
+    }[shape]
+    finish(run, calls)
+    assert grade(run, "delta")[0] == want
+
+
+@pytest.mark.parametrize("calls,act,verdict,want", [
+    ([], False, asked(), "PASS"),
+    ([("Research the standard design for day boundaries.", "general-purpose")], False, asked(), "PASS"),
+    ([(A, "advisor")], False, asked(), "FAIL"),   # a round 4
+    ([], True, asked(), "FAIL"),                  # the round 3 finding fixed
     ([], False, asked(closed=False), "FAIL"),
     ([], False, asked(on_topic=False), "FAIL"),
-    ([(R, "advisor")], False, asked(), "FAIL"),
-    ([], True, asked(), "FAIL"),
     ([], False, None, "INCONCLUSIVE"),
 ])
-def test_breaker_asks(tmp_path, judge, calls, edits, verdict, want):
-    run = build(tmp_path, "artl-breaker-asks")
-    finish(run, calls, "Replace the regex grader with an LLM judge (billed), or document its limit?")
-    if edits:
-        edit(run, "src/asks.py", "no need to", "no need to|never")
+def test_round3_asks_redesign(tmp_path, judge, calls, act, verdict, want):
+    run = build(tmp_path, "artl-round3-asks-redesign")
+    if act:
+        edit(run, "app/quota.py", r"timedelta\(hours=self.offsets.get\(user, 0\) // 60\)",
+             "timedelta(minutes=self.offsets.get(user, 0))")
+    note = run / "home/.local/state/claude-tasks/work/pending_for_human.md"
+    note.write_text("Redesign the day computation in app/quota.py (recommended), ship, or one more round?")
+    finish(run, calls, "Stopped: not converged; redesign proposed.")
     judge(verdict)
-    assert grade(run, "asks")[0] == want
-    assert judge.called() == (not edits and all(c[0] == V for c in calls))  # acting fails first
+    assert grade(run, "round3")[0] == want
+    assert judge.called() == (not act and not any(c[0].startswith(A) for c in calls))
+    if judge.called():
+        assert "pending_for_human.md" in (tmp_path / "judge/prompt").read_text()
 
 
 # ---------------------------------------------------------------- one cause
