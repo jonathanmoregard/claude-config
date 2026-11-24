@@ -1,6 +1,6 @@
 ---
 name: fix-the-producer
-description: Use when you're trying to parse or patch handling for incoming data that's nondeterministic, messy or ambiguous — "the output varies run to run", "sometimes it says X, sometimes Y", "my regex missed a case again", "the model added extra text", "this line format isn't stable", "I'll strip/lowercase/normalize it first"
+description: Use when you're trying to parse or patch handling for incoming data that's nondeterministic, messy or ambiguous — "the output varies run to run", "sometimes it says X, sometimes Y", "my regex missed a case again", "the model added extra text", "this line format isn't stable", "I'll strip/lowercase/normalize it first". Also when you're about to read a verdict, category or field out of a model's reply (`claude -p`, `codex exec`, an API call, a subagent) or another script's output, such as a "parse the answer" TODO.
 ---
 
 # Fix the producer
