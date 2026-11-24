@@ -97,7 +97,7 @@ from pathlib import Path
 import artl_gate as g
 
 SKIP_TOKEN = "skip-artl"
-SKIP_LINE = re.compile(rf"{SKIP_TOKEN}(?:\s+([\w./-]+))?")
+SKIP_LINE = re.compile(rf"{SKIP_TOKEN}(?:\s+(\S+))?")
 # Text written by an agent, not the user, reaches UserPromptSubmit wrapped in
 # one of these (Claude Code 2.1.322's own list of agent/untrusted wrappers,
 # plus the framing lines it puts around a peer message). MEASURED for a peer

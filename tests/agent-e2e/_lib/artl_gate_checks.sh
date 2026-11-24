@@ -165,7 +165,10 @@ for log in Path(sys.argv[1]).glob("*/artl-exemptions.jsonl"):
         try:
             e = json.loads(line)
         except ValueError:
-            continue
+            # Unreadable is not "not spent": refuse to grade (see _pr_open_refusals).
+            print(f"artl_gate_checks: {log} has invalid JSON; cannot grade this run",
+                  file=sys.stderr)
+            sys.exit(3)
         if e.get("kind") == "user-override" and e.get("branch") == sys.argv[2]:
             sys.exit(0)
 sys.exit(1)
