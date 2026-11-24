@@ -18,7 +18,7 @@ set -uo pipefail
 # the pin, going silently mute at exactly the moment the layout changed under
 # it. scripts/config-repo.sh owns the resolution rule.
 #
-# Sourced defensively, like hooks/ralph-loop-stop.sh does: a missing library
+# Sourced defensively: a missing library
 # must not take a SessionStart hook down, so it falls back to the historical
 # path and keeps observing.
 script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
