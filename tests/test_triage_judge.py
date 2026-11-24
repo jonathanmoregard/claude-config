@@ -90,6 +90,20 @@ def test_judge_faults_are_inconclusive(run, monkeypatch, tmp_path, capsys, verdi
     assert grade(run, capsys)[0] == 2
 
 
+def test_missing_final_message_is_inconclusive(run, capsys) -> None:
+    """The harness writes final.txt and grades only runs with a final message."""
+    (run / "final.txt").unlink()
+    assert grade(run, capsys)[0] == 2
+
+
+@pytest.mark.parametrize("method,code,want", [
+    ("schema_enforced", 0, 0), ("text_matching", 0, 1), ("schema_enforced", 1, 2)])
+def test_check_sh_passes_the_exit_code_through(run, monkeypatch, tmp_path, method, code, want) -> None:
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", fake(tmp_path, {"method": method, "quote": "q"}, code))
+    proc = subprocess.run(["bash", str(JUDGE.parent / "check.sh"), str(run)], capture_output=True)
+    assert proc.returncode == want, proc.stdout + proc.stderr
+
+
 def test_missing_run_dir_is_inconclusive(tmp_path, capsys) -> None:
     assert grade(tmp_path / "no-such-run", capsys)[0] == 2
 

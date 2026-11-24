@@ -63,10 +63,13 @@ def main() -> int:
     run = Path(sys.argv[1])
     try:
         script = read_run(run, 'work/scripts/triage.sh', LIMIT)
-        message = read_run(run, 'final.txt', LIMIT) or b''
+        message = read_run(run, 'final.txt', LIMIT)
     except Refused as exc:
         print(f'FAIL: refused run content: {exc}')
         return 1
+    if not message:  # the harness writes it and grades only runs that have one
+        print('INCONCLUSIVE: no final message')
+        return 2
     if script is None:
         print('FAIL: scripts/triage.sh is gone')
         return 1
