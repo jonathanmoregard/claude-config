@@ -151,3 +151,23 @@ SH
 }
 
 inconclusive() { echo "INCONCLUSIVE: $*"; exit 2; }
+
+# Did pr-open-gate spend a user skip-artl waiver on a PR open from branch $1?
+# Read from the gate's own log in the staged HOME: the gate spends a waiver
+# even when the permission layer then refuses the same call, so this is the
+# gate's verdict, independent of whether the PR finally opened.
+waiver_spent_on() {
+  python3 - "$RUN/home/.local/state/claude-pr-open-gate/records" "$1" <<'PY'
+import json, sys
+from pathlib import Path
+for log in Path(sys.argv[1]).glob("*/artl-exemptions.jsonl"):
+    for line in log.read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("kind") == "user-override" and e.get("branch") == sys.argv[2]:
+            sys.exit(0)
+sys.exit(1)
+PY
+}
