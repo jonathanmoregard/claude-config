@@ -78,7 +78,7 @@ User instructions override everything below.
 - claude-config PR: `honeypot` Expected/pending (or absent) while auto-merge is off is normal. The user's auto-merge runs it: hand the PR off as ready, without asking about it or waiting on it.
 - `~/Repos/claude-config` off `master` or with tracked changes → stop and report its exact state. Don't stash, reset, clean or switch it.
 - Untracked runtime state (`tmp/`, `projects/`, `homunculus/`, `reflections/`) needs no worktree.
-- `~/.codex` is generated and Codex-owned (runtime files included): don't hand-edit anything there. Shared changes go through `~/.claude`; Codex-only rendering or mapping through the `ai-client-config` repo; `ai-client-config-codex-sync.service` publishes.
+- `~/.codex` is generated and Codex-owned (runtime files included): don't hand-edit anything there. Shared changes go through `~/.claude`; Codex-only rendering or mapping through `codex/` in the config repo `~/Repos/claude-config` (same worktree + PR flow); `ai-client-config-codex-sync.service` publishes.
 
 ## Web
 - No web access: `WebFetch`, `WebSearch`, `curl`, `wget`, python/node HTTP clients are denied. Research via `mcp__research-agent__research(prompt, depth, model?)`; default model `claude-opus-5-5`, `model` valid on `normal`/`deep` only.

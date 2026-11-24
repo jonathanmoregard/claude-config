@@ -2069,7 +2069,36 @@ def test_report_discloses_research_agent_fallback() -> None:
     assert "automatically retries with Codex" in gaps
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from retired_repo_names import retired_repo_mentions  # noqa: E402
+
+
+def test_generated_text_never_routes_codex_changes_to_the_retired_repo() -> None:
+    with round_trip(RICH_INPUTS) as rt:
+        stale: list[str] = []
+        generated = [
+            path
+            for root in (".codex", ".agents", "plugins")
+            for path in sorted((rt.home / root).rglob("*"))
+        ]
+        assert any(path.name == "plugin.json" for path in generated)
+        for path in generated:
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                if retired_repo_mentions(line, temp_home_ok=True):
+                    stale.append(f"{path.relative_to(rt.home)}:{number}: {line.strip()}")
+        assert stale == [], "\n".join(stale)
+        agents = (rt.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
+        assert "`codex/` in the claude-config repo" in agents
+
+
 if __name__ == "__main__":
+    test_generated_text_never_routes_codex_changes_to_the_retired_repo()
     test_round_trip_matrix_checks_clean_and_rerenders_as_no_op()
     test_unchanged_hourly_run_from_a_staged_home_publishes_nothing()
     test_check_fails_for_every_corrupted_or_deleted_published_file()
