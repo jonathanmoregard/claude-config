@@ -53,8 +53,8 @@ read and why each context expansion was relevant.
 3. Merge by meaning. Convergence is not confidence — shared blind spots are
    real, so a finding both report still reproduces before any edit.
 
-Two reviewers is the whole budget per round. Further rounds (see Rounds) and
-the escalation rule are the only ways to add reviewers.
+Two reviewers per round is the whole budget; only further rounds and the
+escalation rule add reviewers.
 
 Reviewer A, falsification:
 
@@ -99,8 +99,8 @@ concurrent reproducers would mutate shared state.
 
 Then:
 
-- First: multiple fixes haphazardly patching one unaddressed root cause?
-  `references/one-root-cause.md`.
+- First: findings (any round, fixed or not) sharing one cause? Don't
+  haphazardly patch the unaddressed root cause: `references/one-root-cause.md`.
 - Reproduced, and caused by the diff or violating its acceptance contract:
   fix it now. The reproducer stays as a regression test.
 - Reproduced but pre-existing and unrelated: record it separately; do not
@@ -140,7 +140,7 @@ decides what happens next.
 After adjudication, append each round's rows to `<notes>/review-ledger.tsv`
 (`references/ledger.md`; a `none` row per silent check). Before rounds 3–4, run
 `node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
-(this close-out's runs, in order). `fire` → `references/rabbit-hole.md`
+(this close-out's, in order). `fire` → `references/rabbit-hole.md`
 first; at the cap, report-only.
 
 ## Report
