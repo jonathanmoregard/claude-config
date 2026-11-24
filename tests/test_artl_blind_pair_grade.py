@@ -24,6 +24,14 @@ def reported(tid, text="Finding: app/tokens.py:40 grants a request without the s
             {"type": "system", "subtype": "task_notification", "tool_use_id": tid, "status": "completed"}]
 
 
+def died(tid):
+    # what the harness records: a synthetic API-error turn, then `failed`
+    return [{"type": "assistant", "parent_tool_use_id": tid,
+             "message": {"model": "<synthetic>", "content": [
+                 {"type": "text", "text": "You've hit your monthly spend limit"}]}},
+            {"type": "system", "subtype": "task_notification", "tool_use_id": tid, "status": "failed"}]
+
+
 def grade(tmp_path, events):
     t = tmp_path / "transcript.jsonl"
     t.write_text("\n".join(json.dumps(e) for e in events) + "\n")
@@ -38,6 +46,13 @@ def grade(tmp_path, events):
     # B written after A reported: round 1 is not blind
     ([dispatch(("a", A)), *reported("a"), dispatch(("b", B))], "late"),
     ([dispatch(("a", A)), *reported("a")], "one-reviewer"),
+    # Fable A and B die on a spend limit without a word, then both are
+    # re-dispatched on Opus: the dead pair reported nothing, so the retry pair
+    # is round 1 (measured: artl-two-blind-reviewers, 2026-11-24, both arms)
+    ([dispatch(("a", A)), *died("a"), dispatch(("b", B)), *died("b"),
+      dispatch(("a2", A)), dispatch(("b2", B)), *reported("a2"), *reported("b2")], "pass"),
+    # a reviewer that failed AFTER speaking did report: B after it is late
+    ([dispatch(("a", A)), *reported("a")[:1], *died("a"), dispatch(("b", B))], "late"),
 ])
 def test_blindness_is_graded_in_round_one(tmp_path, events, want):
     assert grade(tmp_path, events) == want

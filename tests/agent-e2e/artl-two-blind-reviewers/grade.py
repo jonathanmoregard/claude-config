@@ -133,6 +133,7 @@ def read(path):
     """
     dispatches = []
     bg, notify, result, turn_last, report = {}, {}, {}, {}, {}
+    failed = set()
     for i, line in enumerate(open(path, encoding="utf-8")):
         try:
             ev = json.loads(line)
@@ -143,7 +144,11 @@ def read(path):
         if parent:
             turn_last[parent] = i
             said = spoken_text(ev)
-            if said.strip():
+            # A `<synthetic>` turn is the harness's API-error text, not the
+            # reviewer speaking.
+            synthetic = (ev.get("message") or {}).get("model") == "<synthetic>" \
+                if isinstance(ev.get("message"), dict) else False
+            if said.strip() and not synthetic:
                 report[parent] = said
             continue
 
@@ -156,6 +161,8 @@ def read(path):
             elif sub == "task_notification" and ev.get("status") in (
                     "completed", "failed", "error"):
                 notify.setdefault(tid, i)
+                if ev.get("status") != "completed":
+                    failed.add(tid)
             continue
 
         for b in blocks(ev):
@@ -175,6 +182,10 @@ def read(path):
                 bg[b.get("id")] = True
             if any(m in norm(prompt) for m in REVIEW_MARKERS):
                 dispatches.append((i, b.get("id"), prompt))
+    # A dispatch that failed without saying a word (a spend limit, an API
+    # error) reviewed nothing and reported nothing: it is not a reviewer, and
+    # its retry takes its place in the pair.
+    dispatches = [d for d in dispatches if not (d[1] in failed and d[1] not in report)]
     return dispatches, bg, notify, result, turn_last, report
 
 
