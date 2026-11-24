@@ -23,7 +23,7 @@
 # Nothing here hints at how many reviewers to use.
 #
 # The change sits on a branch off main, with __pycache__ ignored, so
-# `artl_gate.py tier` reads it as T2 (the blind pair). Committed on the
+# the skill's tier table reads it as T2 (the blind pair). Committed on the
 # default branch, the tier saw an empty diff plus the gate's untracked .pyc
 # files.
 set -euo pipefail

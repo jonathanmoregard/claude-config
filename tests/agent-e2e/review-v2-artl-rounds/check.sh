@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P4, new arm. The docvault diff is T2 (artl_gate.py tier), so round 1 is the
+# P4, new arm. The docvault diff is T2 (the skill's tier table), so round 1 is the
 # blind pair and every later round is one reviewer over the delta. Check 9
 # (the round-2 capsule carries the fix commit, not the whole diff) is read by
 # hand from digest/dispatch-NN.prompt; artl-delta-round grades it mechanically.

@@ -80,7 +80,6 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 GIT_TIMEOUT_S = 5
@@ -1048,90 +1047,6 @@ def computed_exemption(changes: list[tuple[str, int | None]]) -> str | None:
     return None
 
 
-# --- review tier (advice-refine-test-loop step 0) ---------------------------------
-# How much LLM review a diff gets. Advisory to the skill, never to the gate:
-# the gate still demands a passing review for anything computed_exemption
-# does not exempt. T0 is exactly that exemption, so a T0 diff opens a PR with
-# no review and no skip-artl.
-
-T1_LINES = 80
-T1_FILES = 5
-BINARY_LINES = 30
-# Path words where a defect is a security hole, data loss or hard to undo.
-# Matched as words of the path, camelCase split, so `author` is not `auth`
-# but `AuthMiddleware` is. RISKY_STEMS match anywhere in a word (`encryption`).
-# A heuristic: a lowercase compound like `authhandler` still reads as one
-# word, which is why the skill lets the agent raise a tier, never lower it.
-RISKY_WORDS = {"auth", "authn", "authz", "oauth", "secret", "secrets", "credential",
-               "credentials", "crypto", "password", "passwords", "migration",
-               "migrations", "sandbox", "guard", "gate", "deny", "permission",
-               "permissions", "security", "pii", "gdpr"}
-RISKY_STEMS = ("authentic", "authoriz", "authoris", "credential", "secret", "crypt",
-               "passw", "migrat", "permission", "sandbox")
-_PATH_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
-
-
-def is_risky(path: str) -> bool:
-    words = [w.lower() for w in _PATH_WORDS.findall(path)]
-    return any(w in RISKY_WORDS or any(s in w for s in RISKY_STEMS) for w in words)
-
-
-def review_tier(changes: list[tuple[str, int | None]]) -> tuple[str, str]:
-    """(tier, reason) for a diff's [(path, lines or None for binary)]."""
-    risky = sorted(p for p, _ in changes if is_risky(p))
-    if risky:
-        return "T3", f"risky path(s): {_shown(risky)}"
-    exempt = computed_exemption(changes)
-    if exempt:
-        return "T0", exempt
-    total = line_total(changes, BINARY_LINES)
-    if total <= T1_LINES and len(changes) <= T1_FILES:
-        return "T1", f"{total} line(s) in {len(changes)} file(s)"
-    return "T2", (f"{total} line(s) in {len(changes)} file(s), over T1's "
-                  f"{T1_LINES} lines / {T1_FILES} files")
-
-
-def _tier_cli(argv: list[str]) -> int:
-    """`artl_gate.py tier [--base REF]`: the working tree against its merge
-    base with REF (default: the local default branch). Prints
-    `<tier>\\t<reason>`; exit 2 when the diff cannot be read."""
-    import sys
-    top = git(os.getcwd(), "rev-parse", "--show-toplevel")
-    if top is None:
-        print("tier: not inside a git work tree", file=sys.stderr)
-        return 2
-    if argv and argv[0].startswith("--base="):
-        argv = ["--base", argv[0].split("=", 1)[1], *argv[1:]]
-    if argv[:1] == ["--base"] and len(argv) == 2:
-        base = argv[1]
-    elif not argv:
-        base = local_base_ref(top)
-    else:
-        print(f"tier: bad arguments {argv!r}; usage: tier [--base REF]", file=sys.stderr)
-        return 2
-    mb = git(top, "merge-base", base, "HEAD") if base else None
-    if mb is None:
-        print(f"tier: no merge base with {base!r}", file=sys.stderr)
-        return 2
-    changes = numstat(top, mb, None)
-    if changes is None:
-        print("tier: git diff failed", file=sys.stderr)
-        return 2
-    untracked = git(top, "ls-files", "--others", "--exclude-standard", "-z")
-    if untracked is None:
-        print("tier: git ls-files failed", file=sys.stderr)
-        return 2
-    for path in filter(None, untracked.split("\0")):
-        try:
-            n = len((Path(top) / path).read_text().splitlines())
-        except (OSError, UnicodeDecodeError):
-            n = None
-        changes.append((path, n))
-    tier, why = review_tier(changes)
-    print(f"{tier}\t{why}")
-    return 0
-
-
 def tree_rows(top: str, tree: object, tip: str, cache: dict) -> dict[str, int] | None:
     """{path: lines changed} from a reviewed tree to the tip; None if unknown."""
     if not isinstance(tree, str) or not SHA_RE.fullmatch(tree):
@@ -1345,11 +1260,3 @@ def smoke_problem(top: str, mb: str, tip: str,
         if p.is_file():
             return None, None
     return head + f"; no file named in {value[:160]!r} exists", None
-
-
-if __name__ == "__main__":
-    import sys
-    if sys.argv[1:2] == ["tier"]:
-        sys.exit(_tier_cli(sys.argv[2:]))
-    print("usage: artl_gate.py tier [--base REF]", file=sys.stderr)
-    sys.exit(2)

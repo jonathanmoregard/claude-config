@@ -66,7 +66,7 @@ required=(
   # round through r5 and 61 of 171 runs overran the cap (review-ledger,
   # 2026-11-17..24), because fresh blind passes over the same diff barely
   # overlap and so always find something new.
-  "artl_gate.py tier"
+  "pick the tier from the diff yourself"
   "over the delta only"
   "Do not report:"
   "Cap: three rounds"

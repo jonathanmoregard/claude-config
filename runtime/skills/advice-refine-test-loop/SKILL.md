@@ -18,17 +18,15 @@ task, or chunk; the project tests serve there.
    report that the gate was unavailable.
 4. If rendered UI changed, invoke `visual-verify` first and include its evidence
    in the review capsule.
-5. Note the start time, then classify:
-   `python3 ~/.claude/hooks/artl_gate.py tier` (`--base <ref>` for a stacked
-   branch). It prints the tier and why. You may raise a tier when the diff is
-   riskier than its paths show, never lower one.
+5. Note the start time, then pick the tier from the diff yourself; give a
+   one-line reason. If torn, take the higher.
 
-| Tier | Review |
-|---|---|
-| T0 | None. The gates above are the review; report the tier line. |
-| T1 | Round 1 is reviewer A alone, B's triggered `Hunt` lines appended; then delta rounds. |
-| T2 | The blind pair, then delta rounds (see Rounds). |
-| T3 | T2, plus A's prompt once through `scripts/codex-advise.sh` in round 1; on a nonzero exit, report that pass unavailable. |
+| Tier | When | Review |
+|---|---|---|
+| T0 | Docs only, or ≤15 lines outside behaviour paths (hooks, scripts, skills, agents, settings, CLAUDE.md) | None: the gates are the review. |
+| T1 | Up to ~80 lines in ≤5 files | Round 1 is reviewer A alone, B's triggered `Hunt` lines appended; then delta rounds. |
+| T2 | Larger, or cross-component | The blind pair, then delta rounds. |
+| T3 | Security, data loss or irreversibility: auth, secrets, crypto, permissions, sandboxes, gates, migrations, PII | T2, plus A's prompt once through `scripts/codex-advise.sh` in round 1; on a nonzero exit, report that pass unavailable. |
 
 Do not invite an LLM reviewer while a deterministic gate is red.
 
@@ -84,8 +82,7 @@ classes. Send only the classes whose trigger this diff satisfies — never the
 whole list — and keep B's two finding buckets, defect and design, apart as the
 file defines them.
 
-Beyond T3, another vendor or specialist only on the user's deep-audit request
-or unresolved contradictory evidence.
+Beyond T3: only on the user's deep-audit request.
 
 ## Adjudicate, Then Act
 
@@ -106,19 +103,19 @@ Then:
 
 - First, append this round's rows to `<notes>/review-ledger.tsv`
   (`references/ledger.md`; a `none` row per silent check).
-- Findings (any round, fixed or not) sharing one cause? Don't haphazardly
-  patch the unaddressed root cause: `references/one-root-cause.md`.
+- Findings sharing one cause (any round, fixed or not):
+  `references/one-root-cause.md`.
 - Reproduced, and caused by the diff or violating its acceptance contract:
   fix it now, as a class: the fixer searches the repository for every other
   site with the same shape and fixes them in the same change (each extra
   site gets a `variant` row). The reproducer stays as a regression test.
 - Reproduced, pre-existing and unrelated: record it; don't grow the branch.
-- Refuted: close it and record the reason in the ledger.
+- Refuted: close it; the ledger records why.
 - Unconfirmed: never closed, never fixed blind, never dropped. List it for
   the user with what was tried; whether to ship with it open is their call.
 - Design finding (`unverifiable: true`): no reproducer applies. Surface it to
-  the user as a taste call with file and line. Never auto-fix it, and never
-  let it block the ship alone. Classes marked advisory in
+  the user as a taste call with file and line. Never auto-fix it or let it
+  block the ship alone. Classes marked advisory in
   `references/hunt-classes.md` are only listed in the report.
 
 ## Rounds

@@ -3,7 +3,7 @@
 # artl-round3-asks-redesign: a daily upload quota (plain Python, unittest) on
 # feat/upload-quota. Usage: artl-tiers.sh WORK RUN t1|delta|round3
 #   t1      the branch adds the daily reset to an existing quota: a T1 diff
-#           (`artl_gate.py tier`). Planted: the reset compares the day of the
+#           (by the skill's tier table). Planted: the reset compares the day of the
 #           month, in UTC, so 5 Jan's usage still counts on 5 Feb.
 #   delta   a T2 diff, resumed after round 1: its findings are adjudicated in
 #           review/round-1.md and the ledger, and the fix for the reproduced
