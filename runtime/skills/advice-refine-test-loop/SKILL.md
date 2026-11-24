@@ -127,7 +127,7 @@ After a round's fixes, run each
 reproducer, the project gate, the acceptance scenarios and the deterministic
 gate again. If anything new reproduced or newly unconfirmed, run the next:
 
-1. One fresh reviewer with A's prompt, over the delta only: the commits since
+1. One fresh reviewer with A's prompt verbatim, over the delta only: the commits since
    the tree the previous round reviewed. A fix is new code; the reviewer may
    read outside the delta to judge it.
 2. Its capsule adds each Unconfirmed finding as a claim to settle, and every
@@ -156,5 +156,5 @@ appears that `references/exclusion-decisions.tsv` does not already decide
 (by meaning, not wording; see `references/ledger.md`), put it to the user as
 one closed question. Change nothing yourself.
 
-Never claim broad audit coverage from this bounded close-out review. An
+Never claim broad audit coverage from this close-out review. An
 empty round is one sample, not proof.

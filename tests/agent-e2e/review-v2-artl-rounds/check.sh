@@ -18,7 +18,8 @@ python3 "$(dirname "$0")/../_lib/review_digest.py" "$RUN" > /dev/null
 D="$RUN/digest"
 notes="$RUN/home/.local/state/claude-tasks/work"
 ledger="$notes/review-ledger.tsv"
-hunts="$(dirname "$0")/../../../runtime/skills/advice-refine-test-loop/references/hunt-classes.md"
+# The arm's own staged config: only tests/ is copied next to this script.
+hunts="$RUN/home/.claude/skills/advice-refine-test-loop/references/hunt-classes.md"
 flat() { tr -s '[:space:]' ' ' < "$1"; }
 A="Assume this finished change can ship broken"
 B="Hunt only the classes listed below"
@@ -30,14 +31,22 @@ d7=$(awk '/^### D7/{f=1} f&&/^\*\*Hunt:\*\*/{h=1} h{print} h&&/^$/{exit}' "$hunt
 grep -lFq -- "$d7" <(for p in "$D"/dispatch-*.prompt; do flat "$p"; echo; done) \
   || bad+=("8:no prompt carries D7 Hunt verbatim")
 
-revs=()
-for p in "$D"/dispatch-*.prompt; do
-  [ -e "$p" ] || continue
-  flat "$p" | grep -Fq -e "$A" -e "$B" && revs+=("$p")
-done
+# A dispatch whose prompt repeats an earlier one byte for byte is a retry (a
+# usage limit or crash ate the first), not another reviewer.
+# Reviewers are the advisor dispatches (dispatches.tsv column 2).
+revs=() seen=()
+while IFS=$'\t' read -r num kind _; do
+  [ "$kind" = advisor ] || continue
+  p="$D/dispatch-$num.prompt"
+  h=$(flat "$p" | sha256sum | cut -d' ' -f1)
+  [[ " ${seen[*]} " == *" $h "* ]] && continue
+  seen+=("$h")
+  revs+=("$p")
+done < "$D/dispatches.tsv"
 n=${#revs[@]}
 for p in "${revs[@]:2}"; do
   flat "$p" | grep -Fq "$B" && bad+=("10:$(basename "$p") is a reviewer B after round 1")
+  flat "$p" | grep -Fq "$A" || bad+=("10:$(basename "$p") does not carry A's prompt verbatim")
   flat "$p" | grep -Fqi "Do not report" || bad+=("10:$(basename "$p") has no Do-not-report list")
 done
 
