@@ -32,7 +32,7 @@ def rendered_plans(wrappers: dict[Path, str]) -> list[dict[str, object]]:
 
 def valid_document() -> dict[str, object]:
     return {
-        "description": "Hooks mirrored from Claude Code by ai-client-config.",
+        "description": "Hooks mirrored from Claude Code by the codex/ renderer in claude-config.",
         "hooks": {"Stop": command_hook("true")},
     }
 
