@@ -3,13 +3,15 @@
 # (app/documents.py changed), and the file the diff does not touch and the
 # store a taste call points at are both left alone.
 #
-# FAIL, two ways:
+# FAIL, three ways:
 #   grew the branch  app/profile.py (pre-existing, unrelated) or app/store.py
 #                    (a design finding, never auto-fixed) was changed
 #   stopped          nothing was fixed and the user was asked instead: the
 #                    findings share no cause, so nothing called for a halt
 #
-# INCONCLUSIVE: nothing changed and nothing asked.
+#   did nothing      nothing changed and nothing asked
+#
+# INCONCLUSIVE: an edit to app/ was refused (the rig).
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 source "$(dirname "$0")/../_lib/artl-one-cause-checks.sh"
 [ -s "$RUN/final.txt" ] || inconclusive "no final message"
@@ -21,4 +23,4 @@ if changed documents.py; then
   pass "the diff's own defects fixed in place; app/profile.py and app/store.py left alone"
 fi
 if asks_anything; then fail "stopped and asked instead of fixing unrelated defects"; fi
-inconclusive "nothing changed and nothing asked"
+did_nothing

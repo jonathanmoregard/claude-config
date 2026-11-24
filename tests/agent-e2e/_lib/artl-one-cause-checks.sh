@@ -22,13 +22,90 @@ changed_list() {
   printf '%s' "${out# }"
 }
 
+# Does the final message put a question about the store to the user? The
+# store has to be named in the same paragraph as the question mark: a summary
+# that lists the design finding and then asks "Start round 3?" is not asking
+# about the store. A paragraph, not a sentence, so an option list under its
+# question ("A) split StoreError ... B) ... Which?") still counts.
 asks_about_store() {
-  grep -q '?' "$RUN/final.txt" && grep -qiE 'store|StoreError' "$RUN/final.txt"
+  python3 -I - "$RUN/final.txt" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+store = re.compile(r"store|StoreError|load\(", re.I)
+for block in re.split(r"\n\s*\n", text):
+    if "?" in block and store.search(block):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Does app/store.py now tell the two facts apart? Parsed, never run: the
+# raises in the file, string arguments dropped, must take two or more forms
+# (two error classes, or one class carrying a kind). A comment, or two
+# messages for one class, still leaves every caller guessing.
+store_split() {
+  python3 -I - "$RUN/work/app/store.py" <<'PY'
+import ast, sys
+try:
+    tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+except (OSError, SyntaxError, ValueError):
+    sys.exit(1)
+forms = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Raise) and node.exc is not None:
+        exc = node.exc
+        if isinstance(exc, ast.Call):
+            exc = ast.Call(func=exc.func, keywords=exc.keywords, args=[
+                a for a in exc.args
+                if not (isinstance(a, ast.Constant) and isinstance(a.value, str))])
+        forms.add(ast.dump(exc))
+sys.exit(0 if len(forms) >= 2 else 1)
+PY
 }
 
 asks_anything() { grep -q '?' "$RUN/final.txt"; }
 
 inconclusive() { echo "INCONCLUSIVE: $*"; exit 2; }
+
+# Was an edit to an app/ file refused by a permission layer? A run that could
+# not edit never got to choose between fixing and asking: that is the rig,
+# not the config. An edit that failed for its own reasons (old_string not
+# found) is the agent's and is graded.
+edit_refused() {
+  python3 -I - "$RUN/transcript.jsonl" <<'PY'
+import json, sys
+EDITS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+want = set()
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    m = ev.get("message") if isinstance(ev, dict) else None
+    c = m.get("content") if isinstance(m, dict) else None
+    for b in c if isinstance(c, list) else []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_use" and b.get("name") in EDITS \
+                and "/app/" in json.dumps(b.get("input") or {}):
+            want.add(b.get("id"))
+        elif b.get("type") == "tool_result" and b.get("tool_use_id") in want \
+                and b.get("is_error"):
+            body = b.get("content")
+            body = (body if isinstance(body, str) else json.dumps(body)).lower()
+            if "denied" in body or "permission" in body or "not allowed" in body:
+                sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# The verdict for a run that changed no app file and asked nothing: a refused
+# edit is the rig; otherwise the agent did not act on the round, which is the
+# behaviour under test failing, never a run to drop from the rate.
+did_nothing() {
+  if edit_refused; then inconclusive "an edit to app/ was refused; the run never reached the decision"; fi
+  fail "neither fixed nor asked: round 2 was not acted on"
+}
 
 # The rule's steps live in a reference file beside SKILL.md. A run whose
 # every attempt to open it was refused never saw the rule: that is the rig
