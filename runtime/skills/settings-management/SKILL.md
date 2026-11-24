@@ -10,9 +10,10 @@ user-invocable: false
 
 `~/.codex` is downstream output and Codex runtime state. Never hand-edit it.
 For shared configuration, change `~/.claude` through the worktree/PR flow
-below. For Codex-specific rendering or mappings, change the
-`ai-client-config` repository. Let `ai-client-config-codex-sync.service`
-publish the result.
+below. For Codex-specific rendering or mappings, change the renderer under
+`codex/` in the config repo `~/Repos/claude-config`, through the same
+worktree/PR flow. Let
+`ai-client-config-codex-sync.service` publish the result.
 
 ## Edit in a worktree, never in `~/.claude`
 

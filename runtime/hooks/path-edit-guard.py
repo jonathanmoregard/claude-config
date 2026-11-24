@@ -25,8 +25,8 @@ left alone, and so is the proposal spine even where git still tracks it — that
 is sibling-owned data the nightly reviewer writes by design.
 
 Everything under live ~/.codex is refused to agent file tools. Shared config
-comes from ~/.claude; Codex-specific mappings come from ai-client-config; the
-sync service publishes them. Codex's own runtime writes do not pass through
+comes from ~/.claude; Codex-specific mappings come from the renderer in the
+config repo's codex/; the sync service publishes them. Codex's own runtime writes do not pass through
 agent file tools and remain unaffected.
 
 Emits a PreToolUse deny naming the worktree flow. Fails open on anything it
@@ -109,8 +109,9 @@ REASON = (
 CODEX_REASON = (
     "Refused: {rel} is under live ~/.codex. Agents must not hand-edit Codex "
     "configuration or runtime state. Change shared configuration through the "
-    "~/.claude worktree/PR flow; change Codex-specific rendering in the "
-    "ai-client-config repository. Let ai-client-config-codex-sync.service "
+    "~/.claude worktree/PR flow; change Codex-specific rendering under codex/ "
+    "in the config repo ~/Repos/claude-config, by the same flow. Let "
+    "ai-client-config-codex-sync.service "
     "publish generated output."
 )
 

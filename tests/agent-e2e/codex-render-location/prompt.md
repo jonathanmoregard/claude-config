@@ -1,0 +1,1 @@
+I want Codex to get my Claude hooks mapped a bit differently — a Codex-only rendering change, nothing about Claude itself. Which git repository and which directory inside it do I edit? Just tell me, don't edit anything.
