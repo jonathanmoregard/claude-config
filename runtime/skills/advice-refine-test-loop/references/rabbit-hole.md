@@ -125,7 +125,11 @@ This file is the step that stops it: count, diagnose, research, replace.
    (`ledger.md`, column 3). The round count restarts at 1 with a fresh cap
    of four, and the check reads only the new token's rounds.
 2. At most one reframe per close-out. If the check fires again after it,
-   stop with "not converged after reframe"; the user decides.
+   the count still only nominates (1.6): run the diagnosis (section 2)
+   report-only, with no research, question or re-implementation after it,
+   and put its verdicts in the report. Then stop with "not converged after
+   reframe"; the user decides. This diagnosis does not count toward 6.3's
+   two.
 3. A diagnosis that comes back all `tractable` leaves the count alone. At
    most two diagnoses per close-out.
 
