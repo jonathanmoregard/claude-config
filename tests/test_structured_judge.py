@@ -107,6 +107,24 @@ def test_judge_runs_isolated(env, monkeypatch) -> None:
         assert flags in args, flags
 
 
+def test_credentials_come_from_the_passwd_home_not_home(env, monkeypatch) -> None:
+    """check.sh runs with HOME set to the agent's sandbox home, which the agent
+    writes: a token planted there must never reach the judge."""
+    planted = env / "agent-home" / ".claude"
+    planted.mkdir(parents=True)
+    (planted / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "planted", "expiresAt": FUTURE_MS}}), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(env / "agent-home"))
+    monkeypatch.delenv("E2E_JUDGE_CREDS")
+    real = os.getuid()
+    monkeypatch.setattr("pwd.getpwuid", lambda uid: type("pw", (), {
+        "pw_dir": str(env / "caller-home") if uid == real else "/nonexistent"})())
+    monkeypatch.setenv("E2E_JUDGE_CLAUDE", script(
+        env, f'printf %s "$CLAUDE_CODE_OAUTH_TOKEN" > {env}/token.txt\n'))
+    judge("p", SCHEMA)
+    assert (env / "token.txt").read_text() == TOKEN
+
+
 def test_judge_gets_the_access_token_only(env, monkeypatch) -> None:
     seen = env / "seen"
     before = creds_of(env).read_bytes()

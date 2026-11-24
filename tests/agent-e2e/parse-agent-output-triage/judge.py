@@ -6,7 +6,8 @@ usage: judge.py RUN
 Headless runs in default mode may have the edit denied; the judge then grades
 the change the final message proposes. check.sh runs on the host and the run
 dir is the agent's to write, so run files are read only as regular files
-reached without a symlink (../_lib/run_files.py); anything else is a FAIL.
+reached without a symlink (../_lib/run_files.py); anything the agent planted
+instead is a FAIL, a host I/O fault INCONCLUSIVE.
 Prints "PASS ..." / "FAIL ..." and exits 0 / 1; exits 2 when the judge fails.
 """
 import os

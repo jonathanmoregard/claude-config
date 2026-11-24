@@ -3,7 +3,8 @@
 check.sh runs outside the agent sandbox and the run dir is the agent's to
 write, so a grader reads run content only as a regular file reached without a
 symlink at any step: a planted link (to ~/.ssh, say) or FIFO is refused, never
-followed or blocked on. Standard library only, so it works from the
+followed or blocked on. A host I/O fault raises OSError, so it is never graded
+as the agent's FAIL. Standard library only, so it works from the
 tests/agent-e2e tree the e2e broker extracts. helper_lang.read_run is the same
 walk inside a grader that also needs the runtime layout.
 """
@@ -15,6 +16,13 @@ import stat
 
 class Refused(Exception):
     """Run content the grader will not read; the run grades FAIL."""
+
+
+# Errors the agent can cause from inside its run dir: a symlink at any step, a
+# file where a directory belongs, a socket, a mode it took away. Any other
+# OSError is the host's fault (EIO, EMFILE, ENOMEM) and propagates unchanged.
+_AGENT_CAUSED = {errno.ELOOP: 'a symlink', errno.ENOTDIR: 'not a directory',
+                 errno.ENXIO: 'not a regular file', errno.EACCES: 'unreadable'}
 
 
 def read_run(top: Path, rel: str, limit: int = -1) -> bytes | None:
@@ -33,8 +41,9 @@ def read_run(top: Path, rel: str, limit: int = -1) -> bytes | None:
     except FileNotFoundError:
         return None
     except OSError as e:
-        why = "a symlink" if e.errno == errno.ELOOP else e.strerror
-        raise Refused(f"{top.name}/{rel}: {why}") from None
+        if e.errno not in _AGENT_CAUSED:
+            raise
+        raise Refused(f"{top.name}/{rel}: {_AGENT_CAUSED[e.errno]}") from None
     finally:
         if fd is not None:
             os.close(fd)
