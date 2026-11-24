@@ -132,16 +132,16 @@ first:
    an earlier adjudicated one by meaning keeps the earlier outcome. Apart
    from the sibling line, no reviewer is shown an earlier finding.
 
-Stop when two consecutive rounds are empty: nothing new reproduced and
-nothing new unconfirmed. Cap: four rounds. At the cap without two empty
-rounds, stop and report "not converged" with the count per round; the user
-decides what happens next.
-
 Append each adjudicated round's rows to `<notes>/review-ledger.tsv`
-(`references/ledger.md`; a `none` row per silent check); from round 2, run
+(`references/ledger.md`; a `none` row per silent check). After round N ≥ 2,
+even resuming, run before round N+1's reviewers:
 `node ~/.claude/skills/advice-refine-test-loop/scripts/convergence-check.mts <notes>/review-ledger.tsv <run>…`
-(this close-out's). Nonzero exit → `references/rabbit-hole.md`,
+(this close-out's). Nonzero → `references/rabbit-hole.md`,
 before `one-root-cause.md`; at the cap, report-only.
+
+Stop when two consecutive rounds are empty (nothing new reproduced or
+unconfirmed). Cap: four rounds. At the cap without them, report "not
+converged" with the count per round; the user decides what happens next.
 
 ## Report
 
