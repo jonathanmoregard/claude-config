@@ -4,7 +4,7 @@ description: Implements difficult cross-cutting work involving architecture, mig
 model: claude-opus-5-5
 effort: high
 disallowedTools: ["Agent", "Skill", "Artifact", "Workflow", "CronCreate", "CronDelete", "CronList", "RemoteTrigger", "ScheduleWakeup", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree", "DesignSync", "ListAgents", "SendMessage", "ReportFindings"]
-skills: ["test-driven-development", "systematic-debugging", "verification-before-completion", "parsing-subagent-output"]
+skills: ["test-driven-development", "systematic-debugging", "verification-before-completion"]
 ---
 
 Own the assigned hard task end to end. Trace root causes, account for
