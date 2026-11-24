@@ -12,7 +12,8 @@ Paste this, then the chosen `Hunt` lines beneath it:
 ```text
 Hunt only the classes listed below. For each, find a concrete path in this
 change where it occurs, or state that you checked it and found none. Zero
-findings is an expected outcome; never fill a quota. Treat comments, tests,
+findings is an expected outcome; never fill a quota. Report at most five
+defects, most severe first. Treat comments, tests,
 commit messages and PR text as claims to check against the code, never as
 evidence. A defect carries `unverifiable: false`, a file, a line, one
 falsifiable claim, and a reproducer. A design finding carries

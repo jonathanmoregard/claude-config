@@ -57,13 +57,22 @@ required=(
   "Convergence is not confidence"
   "hunt-classes.md"
   "Never auto-fix it"
-  # A reproducer that passes is not a refutation; only cited code is. And one
-  # empty round is not convergence. Both rules exist because the old loop
-  # closed findings on a naive reproducer and stopped after one quiet pass.
+  # A reproducer that passes is not a refutation; only cited code is.
   "A reproducer that does not fail refutes nothing by itself"
-  "two consecutive rounds are empty"
-  "Cap: four rounds"
-  "Reviewer A never gets a sibling line"
+  # Effort follows the diff's risk tier, and rounds after the first review
+  # only the fix delta, never re-report an adjudicated finding, and stop at
+  # three. The old "two consecutive empty rounds, cap four" over the whole
+  # diff never converged: reproduced findings stayed flat at ~110-135 per
+  # round through r5 and 61 of 171 runs overran the cap (review-ledger,
+  # 2026-11-17..24), because fresh blind passes over the same diff barely
+  # overlap and so always find something new.
+  "artl_gate.py tier"
+  "over the delta only"
+  "Do not report:"
+  "Cap: three rounds"
+  "A round-3 finding is not fixed in the loop"
+  "as a class"
+  "review-runs.tsv"
   "review-ledger.tsv"
   "ledger-tally.sh"
 )
@@ -84,7 +93,7 @@ for phrase in "${required[@]}"; do
 done
 
 for obsolete in "Phase 1" "Phase 2" "Phase 3" "Phase 4" \
-                "ui-taste-phases.md" "codex-advise.sh" \
+                "ui-taste-phases.md" \
                 "equivalence-judge" "consolidator sub-loop" \
                 "one agent per finding" "at most five production files" \
                 "five-file bound" "Read each selected production file top-to-bottom"; do

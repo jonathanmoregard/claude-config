@@ -8,10 +8,10 @@ inside a field, `-` for an empty field.
 |---|---|---|
 | 1 | date | `YYYY-MM-DD` |
 | 2 | source | `artl` or `sweep` |
-| 3 | run | `artl`: `<token>/r<N>`, always. The token is picked once, at the Entry Gate: the start commit and the time, `<short commit>-<HHMM>`, as in `a1b2c3d-1432/r2`. N counts this close-out's rounds from 1. A re-invoked close-out, or a restart after a reframe, picks a new token. `sweep`: short commit, then lens, as in `a1b2c3d/races` |
-| 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a finding raised by a sibling line, `reframe` for a rabbit-hole thread (`rabbit-hole.md`), or a lens name |
+| 3 | run | `artl`: `<token>/r<N>`, always. The token is picked once, at the Entry Gate: the start commit and the time, `<short commit>-<HHMM>`, as in `a1b2c3d-1432/r2`. N counts this close-out's rounds from 1. A re-invoked close-out picks a new token. `sweep`: short commit, then lens, as in `a1b2c3d/races` |
+| 4 | check | `A`, a class id (`D3`, `G12`), `variant` for a site the fixer's class search found, or a lens name |
 | 5 | trigger | what made the check run: the part of the diff that met its `When`; `always` for A; for a sweep, why it was run |
-| 6 | where | the finding's schema `file` and `line` verbatim, `/abs/path:<int>` (0 = whole file); `-` on a `none` row |
+| 6 | where | `file:line` exactly as the reviewer reported it; `-` on a `none` row |
 | 7 | claim | one sentence |
 | 8 | outcome | `reproduced`, `refuted`, `unconfirmed`, `advisory`, `none` |
 | 9 | fixed | `yes`, `no`, `deferred`, `open`, `-` |
@@ -27,21 +27,12 @@ Rules:
 3. For a sweep item, `reproduced` means the cited lines show what the item
    claims.
 4. `fixed` is the only column edited after the row is written (`open` →
-   `yes`, `no` or `deferred`). One exception: a row that
-   `convergence-check.mts` names on exit 11 or 12 is corrected in place, in
-   whichever column it names, before the rerun (`rabbit-hole.md` 1.3).
+   `yes`, `no` or `deferred`).
 5. Write `fp_reason` in a few plain words, and reuse an earlier reason's
    exact wording when it fits, so reasons can be counted.
-6. A review finding's `where` is the `file:line` its reviewer reported, never
-   paraphrased. `scripts/convergence-check.mts` checks every column of this
-   close-out's rows against the table above: exit 12 when only `where`
-   departs from it, 11 for anything else. Sweep rows are not read by it.
-7. `reframe` rows, one per thread of a diagnosis: outcome `reproduced` for
-   `wrong_shape` or `intractable_as_framed`, `none` for `tractable`, in a
-   mixed diagnosis too; `fixed` is `-` on a `none` row.
-8. A finding that repeats one already in the ledger, open or adjudicated,
+6. A finding that repeats one already in the ledger, open or adjudicated,
    gets no new row: the earlier row stands and keeps its outcome (`SKILL.md`,
-   Rounds, step 4). Rows are never matched or merged afterwards.
+   Rounds, step 2). Rows are never matched or merged afterwards.
 
 ## Reading it
 
@@ -55,8 +46,6 @@ asks. Across every repository:
 It prints `check runs findings reproduced fixed refuted advice_taken propose`
 per check (named checks only, when given), then one `exclude?` line per
 `fp_reason` that meets rule 3 below. `propose` applies rules 1 and 2.
-`reframe` rows are skipped: a rabbit-hole diagnosis is not a reviewer check,
-so there is nothing to drop or reword.
 
 Then propose, to the user, never on your own:
 
@@ -76,3 +65,12 @@ cannot tell. Every answer to rule 3, yes or no, gets a row there
 
 `A` cannot be dropped; it is reworded. A change the user accepts goes through
 the normal change process for these files, tally included.
+
+## Runs
+
+`<notes>/review-runs.tsv`, one row per close-out, same format rules:
+`date`, `run` (the token), `tier` (`T0`–`T3`), `rounds`, `reviewer_calls`,
+`wall_ms` (Entry Gate start to report), `tokens` (sum of the reviewers' and
+verifier's reported totals, `-` when a result gave none), `stop` (`clean`,
+`cap`, `redesign`, `user`). Read it to see what close-outs cost and whether
+tiers hold their budgets.

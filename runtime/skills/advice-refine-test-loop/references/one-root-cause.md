@@ -1,7 +1,7 @@
 # One root cause
 
 The failure this stops: multiple fixes haphazardly patch the same unaddressed
-root cause, instead of solving it once and for all. Each round's sibling line
+root cause, instead of solving it once and for all. Each class search
 finds more sites, each site gets its own patch, the patches start to disagree,
 and the cause is named only at the cap.
 
@@ -9,12 +9,12 @@ and the cause is named only at the cap.
 
 At every adjudication, before any edit, sort the reproduced findings by why
 they fail, not where. Include earlier rounds' findings, fixed or not, and
-what sibling lines turned up. It applies when two or more of them fail for
+what class searches turned up. It applies when two or more of them fail for
 one reason that no fix so far has removed: every fix made, or about to be
 made, changes a call site while the code producing the failure stays as it
 is. Signs:
 
-1. a sibling line keeps finding more sites of a shape already fixed;
+1. a class search keeps finding more sites of a shape already fixed;
 2. site fixes disagree with each other (a different status, fallback or
    message for the same fact);
 3. a reviewer, or a design finding, names the shared cause.
@@ -43,9 +43,9 @@ removes it for every site, the unreported ones included. List the known sites.
    patches and track the cause separately?" Unattended: write the question to
    `<notes>/pending_for_human.md` and stop with "not converged; root cause
    named".
-3. After the root change lands, run the gates and every reproducer, then a
-   fresh round over the whole diff. Its sibling line names the cause, not a
-   site: "find any site that still works around <cause>".
+3. After the root change lands, run the gates and every reproducer, then the
+   next delta round. Its capsule names the cause: "find any site that still
+   works around <cause>".
 
 ## 4. What it overrides
 
@@ -62,11 +62,7 @@ In this situation, this file wins over:
 4. Global rule, `CLAUDE.md` "Build + review": this is one of its stop
    triggers.
 
-The count-based breaker (`rabbit-hole.md`) is separate: it fires on counts and
-asks an advisor about the mechanism. This rule needs neither; you see the
-shape while adjudicating. A cause already removed here is not a thread for it.
-When the breaker has fired, it goes first: follow `rabbit-hole.md`. Once its
-diagnosis is settled without a stop, apply this rule to the findings in hand.
+A round-3 finding goes to `SKILL.md` Rounds (redesign question) instead.
 
 ## 5. Ledger and report
 

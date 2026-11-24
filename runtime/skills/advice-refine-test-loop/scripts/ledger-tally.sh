@@ -8,9 +8,8 @@
 # where propose is drop, reword or -, from the thresholds in ledger.md. Then
 # one line per fp_reason that meets the exclusion threshold:
 #   exclude? reason rows runs
-# Named checks restrict the per-check lines only. `reframe` rows (a
-# rabbit-hole diagnosis, not a reviewer check) are skipped. No ledger files:
-# prints nothing, exits 0. --root defaults to ~/.local/state/claude-tasks.
+# Named checks restrict the per-check lines only. No ledger files: prints
+# nothing, exits 0. --root defaults to ~/.local/state/claude-tasks.
 set -euo pipefail
 
 root="$HOME/.local/state/claude-tasks"
@@ -31,7 +30,6 @@ NF != 10 {                                          # not a ledger row: say so
   printf "ledger-tally: %s:%d: skipped, not ten fields\n", FILENAME, FNR > "/dev/stderr"
   next
 }
-$4 == "reframe" { next }                            # a diagnosis, not a reviewer check
 {
   if ($8 == "confirmed") $8 = "reproduced"          # assurance-sweep verdict
   check = $4; run = FILENAME SUBSEP $3; outcome = $8; fixed = $9; reason = $10
