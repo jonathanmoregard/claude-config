@@ -53,6 +53,11 @@ def grade(tmp_path, events):
       dispatch(("a2", A)), dispatch(("b2", B)), *reported("a2"), *reported("b2")], "pass"),
     # a reviewer that failed AFTER speaking did report: B after it is late
     ([dispatch(("a", A)), *reported("a")[:1], *died("a"), dispatch(("b", B))], "late"),
+    # B names its classes by id with its own wording. Ids are matched as
+    # written, uppercase (measured: artl-two-blind-reviewers 2026-11-24, new arm
+    # graded no-hunt while its prompt listed "D1 — ...", "D2 — ...")
+    ([dispatch(("a", A), ("b", "Hunt only the classes listed below.\nD1 — look for errors\nG11 — bypasses")),
+      *reported("a"), *reported("b")], "pass"),
 ])
 def test_blindness_is_graded_in_round_one(tmp_path, events, want):
     assert grade(tmp_path, events) == want
