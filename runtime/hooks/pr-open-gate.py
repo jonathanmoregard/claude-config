@@ -68,7 +68,9 @@ EVENTS (one script, dispatched on hook_event_name):
   UserPromptSubmit
     The user arms a one-shot override for this session by sending a message
     in which `skip-artl` stands alone on a line of its own (or is the whole
-    message). A mention inside a sentence -- "what does skip-artl do?", or a
+    message), optionally followed by a branch (`skip-artl feat/x`): a named
+    waiver is spent only by a PR open from that branch, and a PR open from
+    any other branch leaves it armed. A mention inside a sentence -- "what does skip-artl do?", or a
     pasted refusal from this gate, which names the word -- arms nothing.
     A prompt carrying any agent-authored wrapper never arms it: a
     task-notification (subagent and background-job output, a resumed
@@ -95,6 +97,7 @@ from pathlib import Path
 import artl_gate as g
 
 SKIP_TOKEN = "skip-artl"
+SKIP_LINE = re.compile(rf"{SKIP_TOKEN}(?:\s+([\w./-]+))?")
 # Text written by an agent, not the user, reaches UserPromptSubmit wrapped in
 # one of these (Claude Code 2.1.322's own list of agent/untrusted wrappers,
 # plus the framing lines it puts around a peer message). MEASURED for a peer
@@ -164,20 +167,26 @@ def on_prompt(payload: dict) -> None:
     prompt = payload.get("prompt")
     if not session or not isinstance(prompt, str):
         return
-    if AGENT_CHANNEL.search(prompt) or \
-            not any(line.strip() == SKIP_TOKEN for line in prompt.splitlines()):
+    if AGENT_CHANNEL.search(prompt):
         return
-    g.write_json(override_path(session), {"ts": time.time(), "prompt_sha256": g.sha256(prompt)})
+    match = next((m for m in map(SKIP_LINE.fullmatch, map(str.strip, prompt.splitlines()))
+                  if m), None)
+    if not match:
+        return
+    branch = match.group(1)
+    g.write_json(override_path(session), {"ts": time.time(), "prompt_sha256": g.sha256(prompt),
+                                          "branch": branch})
     out({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": (
-        "pr-open-gate: the user typed skip-artl. The next PR open in this session that "
-        "lacks advice-refine-test-loop evidence is allowed once, and the waiver is logged "
-        "to artl-exemptions.jsonl.")}})
+        "pr-open-gate: the user typed skip-artl. The next PR open in this session "
+        + (f"from branch {branch} " if branch else "")
+        + "that lacks advice-refine-test-loop evidence is allowed once, and the waiver "
+        "is logged to artl-exemptions.jsonl.")}})
 
 
-def take_override(session: str, now: float) -> bool:
+def take_override(session: str, now: float, branch: str | None) -> bool:
     path = override_path(session)
     data = g.read_json(path)
-    if not data:
+    if not data or data.get("branch") not in (None, branch):
         return False
     try:
         path.unlink()
@@ -353,7 +362,7 @@ def on_pretool(payload: dict) -> None:
             if problem:
                 break
         if problem:
-            if not take_override(session, now):
+            if not take_override(session, now, branch):
                 deny([problem], with_remedy=True)
                 return
             log_exemption(payload, {"kind": "user-override", "why": problem, **where})

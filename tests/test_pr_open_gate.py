@@ -813,6 +813,23 @@ def test_skip_artl_is_per_session(sb):
     assert is_deny(sb.gate(session="s1"))
 
 
+def test_skip_artl_naming_the_branch_waives_that_branch(sb):
+    # Break: the branch word stops the line matching the token at all.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    rc, out = sb.run(GATE, prompt_payload("skip-artl feat/x"))
+    assert "feat/x" in out
+    assert sb.gate() is None
+    assert is_deny(sb.gate())
+
+
+def test_skip_artl_naming_another_branch_neither_waives_nor_is_spent(sb):
+    # Break: a named waiver spent (or honoured) by a PR open from another branch.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    sb.run(GATE, prompt_payload("skip-artl feat/other"))
+    assert is_deny(sb.gate())
+    assert (sb.state / "override" / "s1.json").exists()
+
+
 def test_skip_artl_must_be_the_token(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
     sb.run(GATE, prompt_payload("don't skip-artlike things"))
