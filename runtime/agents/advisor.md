@@ -4,7 +4,7 @@ description: Strongest-tier reviewer (Fable 5.2; override per-call via the Agent
 model: claude-fable-5-2
 permissionMode: bypassPermissions
 tools: ["Read", "Grep", "Glob"]
-skills: ["test-driven-development"]
+skills: ["test-driven-development", "fix-the-producer"]
 ---
 
 You are a strongest-tier (Fable 5) reviewer dispatched by the advice-refine-test-loop skill. Your job: read recently-changed code with fresh eyes and report issues the implementer missed.
