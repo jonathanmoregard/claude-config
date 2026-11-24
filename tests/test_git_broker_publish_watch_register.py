@@ -106,3 +106,17 @@ def test_broker_argv_parses_with_the_stub_helper_argparse(tmp_path, monkeypatch)
     assert entry["timeout"] == 5
     assert entry["env"]["K"] == "v"
     assert json.loads(entry["env"]["E2E_MCP_STUB_ARGS"]) == ["--x", "y"]
+
+
+def test_main_reads_the_staged_home_and_names_the_agents(tmp_path, monkeypatch):
+    """setup.sh hands main() the staged dir it can read; the servers in
+    mcp.json are spawned inside the sandbox, where that dir is hidden and the
+    agent's HOME (E2E_HOME, the real HOME's path) holds the same files."""
+    staged = tmp_path / "run/home"
+    (staged / ".claude").mkdir(parents=True)
+    (staged / ".claude/mcp-servers.json").write_text(json.dumps(ARM))
+    monkeypatch.setattr(reg, "POLICY_SERVERS", tmp_path / "absent")
+    monkeypatch.setenv("E2E_HOME", "/home/agent")
+    reg.main(tmp_path / "run", staged, str(STUB))
+    entry = json.loads((tmp_path / "run/mcp.json").read_text())["mcpServers"]["github"]
+    assert entry["args"][2] == "/home/agent/.claude/mcps/github-mux/server.py"
