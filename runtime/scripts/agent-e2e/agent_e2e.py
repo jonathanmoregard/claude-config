@@ -69,8 +69,10 @@ FIDELITY
     shared dirs, with the rest of the scenario's out dir hidden. Only the
     credentials, the run and the shared dir are writable, and nothing else of
     the real HOME is visible. A path the scenario lends that the host lacks,
-    or that the staged HOME already holds, makes the run INCONCLUSIVE; any
-    other row the host lacks or the staged HOME holds is skipped.
+    or that the staged HOME already holds, makes the run INCONCLUSIVE, as
+    does any harness row (claude, the run, the shared and out dirs) that
+    cannot be lent; an optional row (LINKS, ~/worktrees, PATH dirs) the host
+    lacks or the staged HOME holds is skipped.
     Without bwrap HOME is the staged dir itself and LINKS are links. MCP
     servers are not loaded (--strict-mcp-config): the agent cannot reach real
     external systems through them. A scenario that needs an MCP tool has
