@@ -21,11 +21,12 @@ This file is the step that stops it: count, diagnose, research, replace.
    earlier close-outs' rounds are never passed.
 3. It prints `c` per round, each file with findings in two or more rounds
    (`recur`), and a last line `fire` or `hold` with the reason. Exit 0 hold,
-   1 fire, 2 input error (labels that are not one token's r1..rN in order, or
-   a row that departs from `ledger.md` in any column), 3 a finding row whose
-   `where` is not `/abs/path:<line>` and nothing else wrong. Every bad row is
-   named. On 2 or 3, fix the arguments or the rows and rerun. Never count by
-   hand instead.
+   10 fire, 11 input error (labels that are not one token's r1..rN in order,
+   a row that departs from `ledger.md` in any column, or anything the script
+   threw), 12 a finding row whose `where` is not `/abs/path:<line>` and
+   nothing else wrong. Every bad row is named. On 11 or 12, fix the arguments
+   or the rows and rerun. Any other code, 1 included, is node failing to run
+   the script: no verdict; report it. Never count by hand instead.
 4. `c(N)` is round N's `reproduced` and `unconfirmed` rows, one per finding
    (a row repeated verbatim counts once), `reframe` rows excluded. It fires at round N ≥ 2 when `c(N) > 0` and either:
    1. `c(N) ≥ c(N−1)` (count); or

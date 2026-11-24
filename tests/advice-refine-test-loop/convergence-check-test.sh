@@ -12,8 +12,10 @@
 # the near trigger (a finding within 50 lines of one from the previous round,
 # in the same file; line 0, a whole-file finding, matches the whole file),
 # the labels (one `<commit>-<HHMM>` token, rounds r1..rN in the order given),
-# the row check (every column against ledger.md: exit 3 when only `where` is
-# wrong, 2 otherwise) and the input errors (exit 2).
+# the row check (every column against ledger.md: exit 12 when only `where` is
+# wrong, 11 otherwise), the input errors (exit 11), and the exit codes: fire
+# is 10, never 1, which node itself returns when the script cannot load or
+# throws.
 #
 # Usage: convergence-check-test.sh [path/to/convergence-check.mts]
 set -uo pipefail
@@ -24,6 +26,10 @@ LEDGER="$HERE/fixtures/convergence-ledger.tsv"
 [[ -f $CHECK ]] || { echo "FAIL: no script at $CHECK" >&2; exit 1; }
 [[ -f $LEDGER ]] || { echo "FAIL: no fixture at $LEDGER" >&2; exit 1; }
 command -v node > /dev/null || { echo "FAIL: node not on PATH" >&2; exit 1; }
+
+# The script's codes: none is one node uses on its own (1 uncaught error or
+# failed load, 9 bad option, 13 unsettled await).
+FIRE=10 INPUT=11 WHERE=12
 
 TMP=$(mktemp -d)
 trap 'rm -r "$TMP"' EXIT
@@ -72,7 +78,7 @@ CO=4c469b4-1120 GS=afb78c3-1010 TO=c4726a9-1230 IA=4b4fbf1-0840 MX=e1836c3-1400
 
 # --- codex-render grader: fires after round 2 ----------------------------
 run "$LEDGER" $CO/r1 $CO/r2
-expect "codex r1-r2 exits 1 (fire)" 1 "$rc"
+expect "codex r1-r2 exits $FIRE (fire)" $FIRE "$rc"
 has "codex r1 c" "round 1${T}$CO/r1${T}c=4"
 has "codex r2 c" "round 2${T}$CO/r2${T}c=5"
 expect "codex r1-r2 verdict" fire "$(verdict)"
@@ -89,13 +95,13 @@ has "codex r3 c excludes advisory" "round 3${T}$CO/r3${T}c=2"
 has "codex r4: two findings on one line count twice" "round 4${T}$CO/r4${T}c=4"
 has "codex recurrence of the grader" "recur${T}$CR${T}1,2,3,4"
 
-# --- labels: one token, r1..rN in the order given, else exit 2 -----------
+# --- labels: one token, r1..rN in the order given, else exit 11 ----------
 # ledger.md column 3: a close-out picks `<commit>-<HHMM>` once; every label
 # is `<token>/r<N>`. Nothing else is a close-out's run.
 for bad in "$CO/r2 $CO/r1" "$CO/r1 $CO/r3" "$CO/r2 $CO/r3" "$CO/r1 $GS/r2"; do
   # shellcheck disable=SC2086 # two labels, split on purpose
   run "$LEDGER" $bad
-  expect "labels '$bad': exit 2" 2 "$rc"
+  expect "labels '$bad': exits $INPUT" $INPUT "$rc"
   expect "labels '$bad': no verdict" "" "$out"
 done
 run "$LEDGER" $CO/r2 $CO/r1
@@ -104,7 +110,7 @@ run "$LEDGER" $CO/r1 $GS/r2
 says "two tokens: both are named" "$GS"
 { srow abc1234/r1 /x.py:1; srow abc1234/r2 /x.py:2; } > "$TMP/notoken.tsv"
 run "$TMP/notoken.tsv" abc1234/r1 abc1234/r2
-expect "a label with no HHMM in its token: exit 2" 2 "$rc"
+expect "a label with no HHMM in its token: exits $INPUT" $INPUT "$rc"
 says "a label with no HHMM: named" "abc1234/r1"
 
 # --- grep-over-sed: one row per finding; >= fires on a flat count --------
@@ -149,7 +155,7 @@ done
 # in the same file, while the total shrinks.
 # Real: idle-alarm grader, total 9 -> 6, both rounds hit idle_alarm_grade.py:98.
 run "$LEDGER" $IA/r1 $IA/r2
-expect "idle grader r1-r2 exits 1" 1 "$rc"
+expect "idle grader r1-r2 exits $FIRE" $FIRE "$rc"
 expect "idle grader r1-r2 fires" fire "$(verdict)"
 lacks "idle grader r1-r2: not by count" '^fire.*count'
 expect "idle grader r1-r2 names the closest pair" \
@@ -215,25 +221,25 @@ printf '2026-11-23\tartl\t%s/r3\treframe\tc=3,3\tthe grader\tgrader over reply t
   "$TO" >> "$TMP/ledger.tsv"
 run "$TMP/ledger.tsv" $TO/r1 $TO/r2 $TO/r3
 has "reframe row not counted" "round 3${T}$TO/r3${T}c=1"
-expect "reframe row: a free-text where is exempt from the parse" 1 "$rc"
+expect "reframe row: a free-text where is exempt from the parse" $FIRE "$rc"
 
 # --- strict where: a finding row of a named run must be /abs/path:<line> --
-# Exit 3, naming the row, and no verdict. Other runs' rows are not parsed.
+# Exit 12, naming the row, and no verdict. Other runs' rows are not parsed.
 i=0
 for bad in src/lib/x.py:10 $X - $X:ten; do
   i=$((i + 1)); tok=d00000$i-0900
   { srow $tok/r1 $X:10; srow $tok/r1 "$bad"; } > "$TMP/where.tsv"
   run "$TMP/where.tsv" $tok/r1
-  expect "where '$bad': exits 3" 3 "$rc"
+  expect "where '$bad': exits $WHERE" $WHERE "$rc"
   expect "where '$bad': prints no verdict" "" "$out"
   says "where '$bad': the row is named" "where.tsv:2"
 done
 { srow d000009-0900/r1 $X:10; srow d000009-0900/r1 $X refuted; } > "$TMP/where.tsv"
 run "$TMP/where.tsv" d000009-0900/r1
-expect "a refuted row's where is checked too: exits 3" 3 "$rc"
+expect "a refuted row's where is checked too: exits $WHERE" $WHERE "$rc"
 { srow d000010-0900/r1 $X:10; srow d000010-0900/r1 $X:3 none; } > "$TMP/where.tsv"
 run "$TMP/where.tsv" d000010-0900/r1
-expect "a none row with a where: exits 3" 3 "$rc"
+expect "a none row with a where: exits $WHERE" $WHERE "$rc"
 {
   srow 0c00000-0900/r1 $X:10
   srow 0c00000-0900/r1 - none
@@ -244,7 +250,7 @@ expect "a none row keeps its -; malformed rows of other runs are ignored" 0 "$rc
 has "a none row counts nothing" "round 1${T}0c00000-0900/r1${T}c=1"
 
 # --- every column is checked against ledger.md, in one pass ---------------
-# Anything but `where` exits 2, naming the row and the column; every problem
+# Anything but `where` exits 11, naming the row and the column; every problem
 # of every named row is listed before the exit.
 col() { # NAME COLUMN VALUE: a row with field COLUMN (1-10) set to VALUE
   local f
@@ -252,7 +258,7 @@ col() { # NAME COLUMN VALUE: a row with field COLUMN (1-10) set to VALUE
   f[$2 - 1]=$3
   { srow e000000-0900/r1 $X:2; (IFS=$'\t'; echo "${f[*]}"); } > "$TMP/col.tsv"
   run "$TMP/col.tsv" e000000-0900/r1
-  expect "$1: exits 2" 2 "$rc"
+  expect "$1: exits $INPUT" $INPUT "$rc"
   expect "$1: prints no verdict" "" "$out"
   says "$1: the row is named" "col.tsv:2"
 }
@@ -274,16 +280,16 @@ says "the column is named" "fp_reason"
   printf '2026-11-23\tartl\te000001-0900/r1\tReframe\tc=3,3\t%s:5\tthread\treproduced\topen\t-\n' $X
 } > "$TMP/reframe.tsv"
 run "$TMP/reframe.tsv" e000001-0900/r1
-expect "Reframe is rejected, not counted" 2 "$rc"
+expect "Reframe is rejected, not counted" $INPUT "$rc"
 says "Reframe: the column is named" "check"
 # one pass: two bad columns in a row, and a bad where beside them, all
-# reported; any problem besides `where` makes it exit 2
+# reported; any problem besides `where` makes it exit 11
 {
   srow e000002-0900/r1 $X:1
   printf '2026-11-23\tartl\te000002-0900/r1\tA\talways\trel.py:1\tclaim\treproduced\tdone\tx\n'
 } > "$TMP/many.tsv"
 run "$TMP/many.tsv" e000002-0900/r1
-expect "where plus other columns: exits 2" 2 "$rc"
+expect "where plus other columns: exits $INPUT" $INPUT "$rc"
 says "one pass: where" "where"
 says "one pass: fixed" "fixed"
 says "one pass: fp_reason" "fp_reason"
@@ -294,34 +300,34 @@ says "one pass: fp_reason" "fp_reason"
 for bad in confirmed Reproduced reprodcued; do
   { srow 0e00000-0900/r1 $X:1; srow 0e00000-0900/r2 $X:2 "$bad"; } > "$TMP/outcome.tsv"
   run "$TMP/outcome.tsv" 0e00000-0900/r1 0e00000-0900/r2
-  expect "outcome $bad: exits 2" 2 "$rc"
+  expect "outcome $bad: exits $INPUT" $INPUT "$rc"
   expect "outcome $bad: prints no verdict" "" "$out"
   says "outcome $bad: the row is named" "outcome.tsv:2"
 done
 
-# --- input errors exit 2 and name the problem ----------------------------
+# --- input errors exit 11 and name the problem ---------------------------
 run "$LEDGER"
-expect "no labels exits 2" 2 "$rc"
+expect "no labels exits $INPUT" $INPUT "$rc"
 run
-expect "no arguments exits 2" 2 "$rc"
+expect "no arguments exits $INPUT" $INPUT "$rc"
 run "$TMP/missing.tsv" a000000-0900/r1
-expect "missing ledger exits 2" 2 "$rc"
+expect "missing ledger exits $INPUT" $INPUT "$rc"
 run "$LEDGER" $CO/r1 $CO/r2 $CO/r3 $CO/r4 $CO/r5
-expect "a label with no rows exits 2" 2 "$rc"
+expect "a label with no rows exits $INPUT" $INPUT "$rc"
 says "a label with no rows is named" "$CO/r5"
 run "$LEDGER" $CO/r1 $CO/r1
-expect "repeated label exits 2" 2 "$rc"
+expect "repeated label exits $INPUT" $INPUT "$rc"
 {
   srow f000000-0900/r1 /f.py:1
   printf '2026-11-23\tartl\tf000000-0900/r1\tA\talways\t/f.py:2\tnine fields\treproduced\tyes\n'
 } > "$TMP/short.tsv"
 run "$TMP/short.tsv" f000000-0900/r1
-expect "short row in a named run exits 2" 2 "$rc"
+expect "short row in a named run exits $INPUT" $INPUT "$rc"
 says "short row is reported as such" "not ten fields"
 cp "$LEDGER" "$TMP/other.tsv"
 printf 'not a ledger row\n' >> "$TMP/other.tsv"
 run "$TMP/other.tsv" $CO/r1 $CO/r2
-expect "short row in another run is skipped" 1 "$rc"
+expect "short row in another run is skipped" $FIRE "$rc"
 
 # --- c counts findings, one row each: distinct findings on one `where` ----
 # (a line, or a whole file at :0) are each counted; only a row repeated
@@ -349,6 +355,21 @@ expect "2 >= 2 across one shared where: fires" fire "$(verdict)"
 run "$TMP/again.tsv" abc1234-1400/r1 abc1234-1400/r2
 has "re-invoked: round 1 is its own row only" "round 1${T}abc1234-1400/r1${T}c=1"
 expect "re-invoked: 1 >= 1 fires on its own count" fire "$(verdict)"
+
+# --- node's own failures are never a verdict -----------------------------
+# A script node cannot load exits 1 by node's choice: no code of the
+# script's may share it.
+out=$(node --no-experimental-strip-types "$CHECK" "$LEDGER" $CO/r1 2> /dev/null); rc=$?
+expect "a script node cannot load: exits 1, not a verdict" 1 "$rc"
+for code in 0 $FIRE $INPUT $WHERE; do
+  [[ $code != 1 ]] || { echo "FAIL: exit code $code is node's own"; fails=$((fails + 1)); }
+done
+# Anything thrown past the checks is an input error, never a fire.
+printf 'process.stdout.write = () => { throw new Error("planted throw"); };\n' > "$TMP/throw.mjs"
+out=$(NODE_OPTIONS="--import=$TMP/throw.mjs" node "$CHECK" "$LEDGER" $CO/r1 $CO/r2 2> "$TMP/err"); rc=$?
+err=$(< "$TMP/err")
+expect "an unexpected throw exits $INPUT" $INPUT "$rc"
+says "an unexpected throw is named" "planted throw"
 
 if ((fails)); then
   echo "$fails failure(s)"

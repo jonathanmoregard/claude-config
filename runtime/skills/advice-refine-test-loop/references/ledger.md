@@ -32,8 +32,8 @@ Rules:
    exact wording when it fits, so reasons can be counted.
 6. A review finding's `where` is the `file:line` its reviewer reported, never
    paraphrased. `scripts/convergence-check.mts` checks every column of this
-   close-out's rows against the table above: exit 3 when only `where`
-   departs from it, 2 for anything else. Sweep rows are not read by it.
+   close-out's rows against the table above: exit 12 when only `where`
+   departs from it, 11 for anything else. Sweep rows are not read by it.
 7. `reframe` rows, one per thread of a diagnosis: outcome `reproduced` for
    `wrong_shape` or `intractable_as_framed`, `none` for `tractable`, in a
    mixed diagnosis too; `fixed` is `-` on a `none` row.

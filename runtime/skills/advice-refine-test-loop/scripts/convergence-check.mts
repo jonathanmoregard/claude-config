@@ -4,14 +4,14 @@
 //
 // The labels are this close-out's rounds as the ledger's run column holds them
 // (../references/ledger.md, column 3): one token, `<commit>-<HHMM>`, picked
-// once at the Entry Gate, then r1..rN in order. Anything else exits 2: two
+// once at the Entry Gate, then r1..rN in order. Anything else exits 11: two
 // tokens, a gap, a round out of place, a token without its minute. Rows of any
 // other run are ignored, so a re-invoked close-out, under its own token, counts
 // its own rounds.
 //
 // Every row of a named run is checked against ledger.md's ten columns in one
 // pass, and every problem is listed on stderr (`<ledger>:<line>: ...`) before
-// the exit: 3 when the only problems are in `where`, 2 otherwise.
+// the exit: 12 when the only problems are in `where`, 11 otherwise.
 //   date       YYYY-MM-DD
 //   source     artl
 //   check      A, a class id (D3, G12), variant or reframe
@@ -39,12 +39,20 @@
 //          and within 50 lines of it; a line-0 finding matches its whole
 //          file. The reason names the closest pair per file.
 //
-// Exit: 0 hold, 1 fire, 2 input error (usage, unreadable ledger, the labels,
-// a run with no rows, a row of a named run without ten fields or with a bad
-// column), 3 a malformed `where` and nothing else wrong.
+// Exit: 0 hold, 10 fire, 11 input error (usage, unreadable ledger, the
+// labels, a run with no rows, a row of a named run without ten fields or with
+// a bad column, anything thrown), 12 a malformed `where` and nothing else
+// wrong. None of 10-12 is a code node returns on its own: node exits 1 when
+// it cannot load this file (no type stripping, a syntax error) or on an
+// uncaught throw, so 1 is never read as a verdict.
 
 import { readFileSync } from "node:fs";
 import process, { argv, exit, stderr, stdout } from "node:process";
+
+const HOLD = 0;
+const FIRE = 10;
+const INPUT = 11;
+const WHERE = 12;
 
 const COUNTED: ReadonlySet<string> = new Set(["reproduced", "unconfirmed"]);
 const OUTCOMES: ReadonlySet<string> = new Set([...COUNTED, "refuted", "advisory", "none"]);
@@ -79,7 +87,7 @@ interface Problem {
   readonly text: string;
 }
 
-function die(lines: readonly string[], code = 2): never {
+function die(lines: readonly string[], code = INPUT): never {
   stderr.write(lines.map((l) => `convergence-check: ${l}\n`).join(""));
   exit(code);
 }
@@ -161,7 +169,7 @@ function readRounds(ledger: string, runs: readonly string[]): Round[] {
     }
   });
   if (problems.length > 0) {
-    die(problems.map((p) => p.text), problems.every((p) => p.column === "where") ? 3 : 2);
+    die(problems.map((p) => p.text), problems.every((p) => p.column === "where") ? WHERE : INPUT);
   }
   for (const round of rounds.values()) {
     if (round.rows === 0) die([`no ledger rows for run ${round.run}`]);
@@ -231,7 +239,11 @@ function main(args: readonly string[]): number {
   }
   out.push(verdict);
   stdout.write(`${out.join("\n")}\n`);
-  return verdict.startsWith("fire") ? 1 : 0;
+  return verdict.startsWith("fire") ? FIRE : HOLD;
 }
 
-process.exitCode = main(argv.slice(2));
+try {
+  process.exitCode = main(argv.slice(2));
+} catch (e) {
+  die([`unexpected error: ${e instanceof Error ? e.message : String(e)}`]);
+}

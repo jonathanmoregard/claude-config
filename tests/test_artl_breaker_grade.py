@@ -414,8 +414,8 @@ def test_asks_check_sh_maps_the_verdict_to_its_exit(tmp_path, judge):
 # labels only: the earlier close-out seeded beside them is not passed.
 
 @pytest.mark.parametrize("mode,counts,verdict,rc", [
-    ("fires", (3, 3), "fire", 1),
-    ("asks", (3, 3), "fire", 1),
+    ("fires", (3, 3), "fire", 10),
+    ("asks", (3, 3), "fire", 10),
     ("holds", (4, 2), "hold", 0),
 ])
 def test_seeded_ledger_counts(tmp_path, mode, counts, verdict, rc):
