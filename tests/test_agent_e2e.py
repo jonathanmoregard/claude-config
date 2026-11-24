@@ -581,27 +581,6 @@ def test_a_symlinked_path_dir_in_home_stays_on_path(tmp_path, in_real_home):
                             "ran": "pathtool-ok"}
 
 
-def test_a_path_tool_linking_elsewhere_in_home_runs(tmp_path, in_real_home):
-    """A tool in a PATH dir in the real HOME that links into another HOME dir
-    (pipx, uv tool, npm -g: bin/t -> ../lib/t) runs inside; lending its bin
-    alone left the link dangling (review r3)."""
-    _require_sandbox()
-    (in_real_home / "x/bin").mkdir(parents=True)
-    (in_real_home / "x/lib").mkdir()
-    tool = in_real_home / "x/lib/e2e-linktool"
-    tool.write_text("#!/bin/sh\necho linktool-ok\n")
-    tool.chmod(0o755)
-    (in_real_home / "x/bin/e2e-linktool").symlink_to("../lib/e2e-linktool")
-    env = {**os.environ, "PATH": f"{in_real_home / 'x/bin'}:{os.environ.get('PATH', '')}"}
-    claude = fake_claude(tmp_path, _ok("""
-{ echo "ran=$(e2e-linktool 2>&1)"; } > "$E2E_SHARED/report"
-"""))
-    sc = _scenario(tmp_path, "exit 0")
-    _, out, verdicts = _run(tmp_path, sc, claude, env=env)
-    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
-    assert _report(out) == {"ran": "linktool-ok"}
-
-
 def test_a_config_bin_on_path_imports_its_own_tools(tmp_path):
     """~/.claude/bin is on PATH, and its scripts import their siblings through
     `..`: ai-router by realpath (../tools/ai-router), egress-sink by abspath

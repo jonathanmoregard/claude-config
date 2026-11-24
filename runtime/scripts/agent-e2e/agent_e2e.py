@@ -856,24 +856,6 @@ def _path_in_home() -> list[pathlib.Path]:
     return out
 
 
-def _link_dirs_in_home(d: pathlib.Path) -> list[pathlib.Path]:
-    """The dirs that entries of PATH dir D link into, where those lie in the
-    real HOME (not ~/.claude, not HOME itself) and outside D."""
-    config, out = REAL_HOME / ".claude", []
-    try:
-        entries = list(os.scandir(d))
-    except OSError:
-        return out
-    for e in entries:
-        if not e.is_symlink():
-            continue
-        parent = pathlib.Path(os.path.realpath(e.path)).parent
-        if (parent != REAL_HOME and _within(parent, REAL_HOME)
-                and not _within(parent, config) and not _within(parent, d.resolve())):
-            out.append(parent)
-    return list(dict.fromkeys(out))
-
-
 def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
                  lend: list[str] | tuple[str, ...] = ()
                  ) -> list[tuple[pathlib.Path, str, bool]]:
@@ -912,12 +894,11 @@ def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
     rows = [(home / rel, mode, False) for rel, mode in LINKS.items()]
     rows += [(home / rel, "ro", False) for rel in CHECKOUT_ROOTS]
     rows += [(home / rel, "ro", True) for rel in lend]
-    for p in _path_in_home():
-        rows.append((p, "ro", False))
-        # A tool there that links elsewhere in HOME (pipx, uv tool, npm -g:
-        # bin/t -> ../lib/t) needs its target's dir lent too, or it dangles.
-        for target in _link_dirs_in_home(p):
-            rows.append((target, "ro", False))
+    # A PATH dir is lent alone: a tool in it that links elsewhere in HOME
+    # (pipx, uv tool, npm -g) dangles inside. Lending its target would lend
+    # whole HOME dirs (~/.local/share and its keyrings), so a scenario that
+    # needs such a tool names its tree in `lend`.
+    rows += [(p, "ro", False) for p in _path_in_home()]
     rows.append((run.parents[1], "tmpfs", True))
     exe = pathlib.Path(claude if os.path.isabs(claude) else shutil.which(claude) or claude)
     real = exe.resolve()
