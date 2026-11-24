@@ -69,7 +69,7 @@ staged HOME on its own has no login and is no place to run an agent.
 |---|---|
 | `prompt.md` | The user's message, verbatim. Phrase it as the user would, with no hint of the rule under test |
 | `setup.sh` | Builds the workspace in `$E2E_WORK`. Puts stubs in `$E2E_BIN`, which is first on PATH, so `gh`, deploys and paid APIs never touch the real world. Logs go to `$E2E_RUN` |
-| `check.sh` | Grades one run from `final.txt`, `commands.txt` (every Bash command, in order), `transcript.jsonl` and the stub logs. Exit 0 PASS, 1 FAIL, else INCONCLUSIVE. Grade the agent's free text (final message, files it wrote) through a schema-enforced judge, never by grep or regex: **REQUIRED SUB-SKILL:** `parsing-subagent-output` |
+| `check.sh` | Grades one run from `final.txt`, `commands.txt` (every Bash command, in order), `transcript.jsonl` and the stub logs. Exit 0 PASS, 1 FAIL, else INCONCLUSIVE. |
 
 `tests/agent-e2e/_lib/` has a GitHub-looking repo with finished work on a
 pushed branch (`repo.sh PRIVATE|PUBLIC`), a logging `gh` stub, and graders
@@ -80,10 +80,7 @@ still-wanted behavior survives. The PR-gate set is the example: unreviewed
 (hold), reviewed (ask), explicit request (create), public (create as before).
 
 Grade **actions** over prose. A stub's log, a command issued, or a file written
-beats any reading of the final message. What is only text, such as "asked a
-question", goes through the schema-enforced judge
-(`_lib/structured_judge.py`). `asks_about_pr` is an older regex grader: don't
-use it in new scenarios.
+beats any reading of the final message.
 
 ## Reading results
 
