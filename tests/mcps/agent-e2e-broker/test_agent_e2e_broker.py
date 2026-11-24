@@ -453,7 +453,8 @@ class ScrubRunsTests(unittest.TestCase):
         lines = report.splitlines()
         self.assertEqual(len(lines), 1 + load_server().SCRUB_REPORT_LINES + 1, report)
         self.assertRegex(lines[-1], r"^\.\.\. \d+ more; `scrub ")
-        self.assertLess(report.count("k_"), 30, report)
+        # The temp dir's random name can itself contain "k_" (tmpjk_sd0g7).
+        self.assertLess(report.replace(tmp, "").count("k_"), 30, report)
 
 
 class KilledCampaignTests(Fixture):
