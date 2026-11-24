@@ -1059,7 +1059,9 @@ T1_FILES = 5
 BINARY_LINES = 30
 # Path words where a defect is a security hole, data loss or hard to undo.
 # Matched as words of the path, camelCase split, so `author` is not `auth`
-# but `AuthMiddleware` is; RISKY_STEMS also catch the longer forms.
+# but `AuthMiddleware` is. RISKY_STEMS match anywhere in a word (`encryption`).
+# A heuristic: a lowercase compound like `authhandler` still reads as one
+# word, which is why the skill lets the agent raise a tier, never lower it.
 RISKY_WORDS = {"auth", "authn", "authz", "oauth", "secret", "secrets", "credential",
                "credentials", "crypto", "password", "passwords", "migration",
                "migrations", "sandbox", "guard", "gate", "deny", "permission",
@@ -1071,7 +1073,7 @@ _PATH_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 
 def is_risky(path: str) -> bool:
     words = [w.lower() for w in _PATH_WORDS.findall(path)]
-    return any(w in RISKY_WORDS or w.startswith(RISKY_STEMS) for w in words)
+    return any(w in RISKY_WORDS or any(s in w for s in RISKY_STEMS) for w in words)
 
 
 def review_tier(changes: list[tuple[str, int | None]]) -> tuple[str, str]:

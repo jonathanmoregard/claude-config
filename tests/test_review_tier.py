@@ -107,7 +107,8 @@ def test_cli_bad_base_fails_loudly(tmp_path: Path):
 def test_risky_words_inside_camel_case_and_longer_forms_are_t3():
     for path in ("src/AuthMiddleware.ts", "src/authentication/x.py",
                  "lib/authorization.rb", "app/PasswordReset.tsx",
-                 "db/migrate_users.py", "api/SecretStore.go"):
+                 "db/migrate_users.py", "api/SecretStore.go", "src/encryption.py",
+                 "lib/decrypt.rs"):
         assert tier([(path, 2)]) == "T3", path
 
 

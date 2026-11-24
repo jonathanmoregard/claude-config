@@ -125,7 +125,7 @@ Then:
 
 After a round's fixes, run each
 reproducer, the project gate, the acceptance scenarios and the deterministic
-gate again. Then, unless the round was empty, run the next round:
+gate again. If anything new reproduced or stayed unconfirmed, run the next:
 
 1. One fresh reviewer with A's prompt, over the delta only: the commits since
    the tree the previous round reviewed. A fix is new code; the reviewer may
