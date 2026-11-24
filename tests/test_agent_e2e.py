@@ -146,13 +146,14 @@ def _scenario(tmp_path, check_body: str) -> pathlib.Path:
 # the first time this workflow ran the whole corpus. A case that cannot sandbox
 # must say so, not report the harness broken.
 #
-# The probe builds the harness's own mount shape rather than a trivial sandbox,
-# because a machine that can unshare can still refuse a mount. Asking
-# `--dev-bind / / --unshare-all` was measured succeeding on a runner that then
-# failed all eleven cases a second time: the binary is there, namespaces work,
-# and what the runner lacked was a `~/.ssh` for the harness to shadow. That was
-# the harness's defect, fixed where it lives; the probe now runs the argv
-# sandboxed() itself builds, so it covers every mount a run stacks.
+# The probe asks the HOST, never the harness: every kind of mount a run
+# stacks (a bind of one directory over another, a read-only bind, a tmpfs, a
+# symlink, a pid namespace with its own /proc), on directories it makes
+# itself. Asking `--dev-bind / / --unshare-all` alone was measured succeeding
+# on a runner that then failed all eleven cases: the runner lacked a `~/.ssh`
+# for the harness to shadow. That was the harness's defect, and a defect in the
+# harness's own argv must FAIL these tests -- a probe running that argv turned
+# it into a skip of every sandbox test, the suite green with nothing measured.
 # Cached, because nine call sites would otherwise fork nine times.
 _SANDBOX_OK = None
 
@@ -167,23 +168,23 @@ def _require_sandbox():
         if bwrap is None:
             _SANDBOX_OK = (False, "bubblewrap not on PATH")
         else:
-            # The harness's own argv, so the probe cannot drift from the
-            # mounts a run really asks for (the staged HOME over the real one,
-            # and everything bound back over that).
             base = pathlib.Path(tempfile.mkdtemp(prefix="agent-e2e-probe-"))
-            run = base / "run"
-            for d in (run / "home", run / "work", base / "shared"):
-                d.mkdir(parents=True)
-            argv = _harness_module().sandboxed(
-                ["true"], claude=str(pathlib.Path(_sh.which("true")).resolve()),
-                run=run, shared=base / "shared", work=run / "work")
             try:
+                for d in ("src", "dst", "ro", "hidden"):
+                    (base / d).mkdir()
+                (base / "src/file").write_text("x\n")
+                argv = [bwrap, "--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc",
+                        "--die-with-parent", "--tmpfs", str(base / "hidden"),
+                        "--bind", str(base / "src"), str(base / "dst"),
+                        "--ro-bind", str(base / "ro"), str(base / "ro"),
+                        "--symlink", "file", str(base / "dst/link"),
+                        "--setenv", "E2E_PROBE", "1", "--chdir", str(base / "dst"),
+                        "--", _sh.which("true") or "/bin/true"]
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
                 _SANDBOX_OK = (
                     p.returncode == 0,
-                    "bubblewrap is present but cannot build the harness's "
-                    "sandbox here (restricted user namespaces, or a mount it "
-                    "refuses): "
+                    "bubblewrap is present but cannot build a sandbox here "
+                    "(restricted user namespaces, or a mount kind it refuses): "
                     + (p.stderr.strip().splitlines() or ["no stderr"])[-1],
                 )
             except (OSError, subprocess.SubprocessError) as exc:
@@ -228,6 +229,19 @@ def _require_nested_sandbox():
     ok, why = _NESTED_SANDBOX_OK
     if not ok:
         pytest.skip(why)
+
+
+def test_the_sandbox_probe_asks_the_host_not_the_harness(monkeypatch):
+    """A defect in the harness's own mounts must fail the sandbox tests, not
+    skip them all: the probe asks only whether this host can build a sandbox,
+    so it never runs the argv sandboxed() builds."""
+    def broken(*_a, **_k):
+        raise AssertionError("the probe ran the harness's own argv")
+    import types
+    monkeypatch.setitem(globals(), "_harness_module",
+                        lambda: types.SimpleNamespace(sandboxed=broken))
+    monkeypatch.setitem(globals(), "_SANDBOX_OK", None)
+    _require_sandbox()
 
 
 def _run(tmp_path, sc, claude, n=1, **kw):
@@ -606,7 +620,8 @@ def test_a_config_bin_on_path_imports_its_own_tools(tmp_path):
 def test_an_absent_lend_is_inconclusive(tmp_path, in_real_home):
     """A scenario that lends a path the host does not have (a typo, `~/x`)
     asked for something the run will not get: no verdict, and the message
-    names the entry."""
+    names the entry. Under bwrap only: without it nothing is lent."""
+    _require_sandbox()
     claude = fake_claude(tmp_path, _ok())
     sc = _scenario(tmp_path, "exit 0")
     rel = (in_real_home / "not-there").relative_to(_harness_module().REAL_HOME)
@@ -643,6 +658,75 @@ def test_a_staged_plugins_dir_is_not_shadowed(tmp_path):
     with pytest.raises(mod.Unexposable, match=r"\.claude/plugins.*staged HOME"):
         mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
                       work=run / "work")
+
+
+def _bare_run(tmp_path) -> pathlib.Path:
+    run = tmp_path / "out/sc/new/1"
+    for d in (run / "home", run / "work", run / "shared"):
+        d.mkdir(parents=True)
+    return run
+
+
+@pytest.mark.parametrize("target", ["../..", "../../.."], ids=["home", "above-home"])
+def test_a_lend_that_lands_on_the_real_home_is_refused(tmp_path, target):
+    """A row is judged by where it lands, not how it is spelled: a link in the
+    real HOME back up to it (.local/state/h -> ../..) would bind all of the
+    real HOME, or what holds it, over the staged one."""
+    mod = _harness_module()
+    mod.REAL_HOME = tmp_path / "realhome"
+    (mod.REAL_HOME / ".local/state").mkdir(parents=True)
+    (mod.REAL_HOME / ".local/state/h").symlink_to(target)
+    run = _bare_run(tmp_path)
+    with pytest.raises(mod.Unexposable, match="real HOME"):
+        mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                      work=run / "work", lend=[".local/state/h"])
+
+
+def test_a_claude_that_is_not_on_path_is_refused(tmp_path):
+    """A --claude that PATH does not resolve stays a relative name; walked
+    from `/` it named the root, and `--ro-bind / /` after the HOME mount put
+    the real HOME back."""
+    mod = _harness_module()
+    run = _bare_run(tmp_path)
+    with pytest.raises(mod.Unexposable, match="absolute"):
+        mod.sandboxed(["true"], claude="e2e-no-such-claude", run=run,
+                      shared=run / "shared", work=run / "work")
+
+
+def test_no_mount_is_buried_by_a_later_one_over_it(tmp_path):
+    """bwrap mounts in argv order and a mount covers every earlier one under
+    it. So no mount may follow one beneath it, and a tmpfs that hides a path
+    may not be followed by a bind of that same path: claude's own directory
+    lent after the out-dir tmpfs brought the sibling runs back whenever --out
+    sat inside it (a claude in tmp_path, --out tmp_path/out)."""
+    mod = _harness_module()
+    run = _bare_run(tmp_path)
+    claude = fake_claude(tmp_path, "exit 0\n")
+    argv = mod.sandboxed(["true"], claude=str(claude), run=run, shared=run / "shared",
+                         work=run / "work")
+    seen = mod.mounts(argv)[1:]  # past `--dev-bind / /`
+    for i, (earlier, host) in enumerate(seen):
+        for later, _ in seen[i + 1:]:
+            assert not (later != earlier and _within(earlier, later)), (earlier, later, argv)
+            assert not (later == earlier and host is None), (earlier, argv)
+
+
+def _within(path: str, root: str) -> bool:
+    return pathlib.PurePosixPath(path).is_relative_to(root)
+
+
+def test_a_sibling_run_under_claudes_own_dir_is_unreachable(tmp_path):
+    """The same, measured inside: claude in tmp_path, --out tmp_path/out, as
+    every test here lays it out."""
+    _require_sandbox()
+    sibling = tmp_path / "out/sc/old/1/home/.claude.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("{}\n")
+    claude = fake_claude(tmp_path, _ok(
+        f'echo "sibling=$(test -e {sibling} && echo seen || echo hidden)" > "$E2E_SHARED/report"'))
+    _, out, verdicts = _run(tmp_path, _scenario(tmp_path, "exit 0"), claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
+    assert _report(out) == {"sibling": "hidden"}
 
 
 def test_the_run_dir_holds_no_second_name_for_home(tmp_path):
@@ -886,11 +970,15 @@ def test_secrets_outside_home_are_scrubbed_too(tmp_path):
     _assert_scrubbed(out / "sc/new/1")
 
 
+# Each swap proves its link landed (exit 9 otherwise, INCONCLUSIVE): swapping
+# RUN/home was a silent no-op under bwrap, where it is a tmpfs mountpoint (mv
+# gets EBUSY, ln lands inside it), so the case attacks RUN/work instead.
 @pytest.mark.parametrize("swap", [
-    'cd /; mv "$E2E_RUN/home" "$E2E_RUN/h2"; ln -s {decoy} "$E2E_RUN/home"',
-    'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"',
-    'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"',
-    'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"',
+    'cd /; mv "$E2E_RUN/work" "$E2E_RUN/w2"; ln -s {decoy} "$E2E_RUN/work"; test -L "$E2E_RUN/work" || exit 9',
+    'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"; test -L "$HOME/.claude" || exit 9',
+    'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"; test -L "$HOME/x/y" || exit 9',
+    'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"; '
+    'test -L "$E2E_RUN/final.txt" || exit 9',
 ])
 def test_scrub_and_writes_never_follow_a_link_the_run_planted(tmp_path, swap):
     _require_sandbox()

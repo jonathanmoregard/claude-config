@@ -32,7 +32,9 @@ SCENARIO is a directory holding:
                 real-HOME state an MCP server in the sandbox needs, bound
                 read-only at their own path under bwrap (e.g. a broker's
                 GitHub token). The agent can read them too: lend no more.
-                An entry the host lacks makes the run INCONCLUSIVE.
+                Under bwrap an entry the host lacks makes the run
+                INCONCLUSIVE; without it the real HOME is all there and
+                `lend` is not consulted.
     check.sh    `check.sh RUN` grades one run: exit 0 PASS, 1 FAIL, anything
                 else INCONCLUSIVE. RUN holds final.txt (the agent's last message),
                 commands.txt (every Bash command the agent issued, one per
@@ -694,7 +696,7 @@ def mounts(argv: list[str]) -> list[tuple[str, str | None]]:
     return out
 
 
-def path_guard() -> list[str]:
+def path_guard() -> list[list[str]]:
     """Bind every directory on the harness's own PATH outside the real HOME
     read-only.
 
@@ -725,7 +727,7 @@ def path_guard() -> list[str]:
             continue
         if real.is_dir() and str(real) not in seen:
             seen.append(str(real))
-    return [arg for d in seen for arg in ("--ro-bind", d, d)]
+    return [["--ro-bind", d, d] for d in seen]
 
 
 class Unexposable(Exception):
@@ -787,22 +789,44 @@ def _hops(path: pathlib.Path, staged: pathlib.Path) -> tuple[list[str], pathlib.
     return links, cur
 
 
-def expose(path: pathlib.Path, mode: str, staged: pathlib.Path) -> list[str]:
-    """The bwrap args that make host PATH reachable inside the sandbox at its
+def expose(path: pathlib.Path, mode: str, staged: pathlib.Path) -> list[list[str]]:
+    """The bwrap ops that make host PATH reachable inside the sandbox at its
     own path, the one routine every row of the expose table goes through (the
     pattern of Flatpak's FlatpakExports): each symlink on the way is recreated
     as the same link (`_hops()`), and its final target is bound -- `ro`
     read-only, `rw` writable -- or, for `tmpfs`, hidden under an empty one.
-    Raises Unexposable when that cannot be done faithfully, and for the real
-    HOME or anything holding it: a row lends a path inside it, never all of it.
+    One op per list; sandboxed() puts them in mount order.
+
+    Raises Unexposable when that cannot be done faithfully: PATH is not
+    absolute, or where it lands, every link on the way followed, is the real
+    HOME or holds it -- a row lends a path inside it, never all of it, and
+    the spelling (`.local/state/h` -> `../..`) is not what gets mounted.
     """
-    if _within(REAL_HOME, path):
-        raise Unexposable(path, "is the real HOME or holds it; a row lends "
-                                "a path inside it, never all of it")
+    if not path.is_absolute():
+        raise Unexposable(path, "is not an absolute path (a --claude PATH "
+                                "does not resolve?)")
     links, real = _hops(path, staged)
+    if any(_within(home, real) for home in (REAL_HOME, REAL_HOME.resolve())):
+        raise Unexposable(path, f"lands on {real}, the real HOME or what holds "
+                                "it; a row lends a path inside it, never all of it")
+    ops = [links[i:i + 3] for i in range(0, len(links), 3)]
     if mode == "tmpfs":
-        return [*links, "--tmpfs", str(real)]
-    return [*links, "--bind" if mode == "rw" else "--ro-bind", str(real), str(real)]
+        return [*ops, ["--tmpfs", str(real)]]
+    return [*ops, ["--bind" if mode == "rw" else "--ro-bind", str(real), str(real)]]
+
+
+def _mount_order(op: list[str]) -> tuple[int, bool]:
+    """Sort key putting bwrap ops in an order where none buries another:
+    shallower destinations first, and at one destination a tmpfs last.
+
+    bwrap mounts in argv order, and a mount covers whatever was mounted
+    beneath it before. In this order a mount is never followed by one over
+    it, so what is visible at any path is the deepest row holding it, which
+    is what the table means, whatever order it lists rows in. Without it a
+    bind could re-expose what a hiding row had hidden: claude's own directory,
+    lent after the out-dir tmpfs, brought the sibling runs back whenever --out
+    lay inside it."""
+    return len(pathlib.PurePosixPath(op[-1]).parts), op[0] == "--tmpfs"
 
 
 def _path_in_home() -> list[pathlib.Path]:
@@ -829,9 +853,11 @@ def _path_in_home() -> list[pathlib.Path]:
 def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
                  lend: list[str] | tuple[str, ...] = ()
                  ) -> list[tuple[pathlib.Path, str, bool]]:
-    """What the sandbox lends back over the staged HOME and the private /tmp,
-    in mount order: (host path, mode, required). Each row goes through
-    expose(). A required row the host lacks makes the run INCONCLUSIVE; an
+    """What the sandbox lends back over the staged HOME and the private /tmp:
+    (host path, mode, required). Each row goes through expose(); the order
+    here is not the mount order, which sandboxed() derives from where each
+    row lands (`_mount_order()`), so the deepest row holding a path decides
+    what is there. A required row the host lacks makes the run INCONCLUSIVE; an
     optional one is skipped, which is no loss: the agent then finds nothing
     there, as it would on the host. A row whose destination the staged HOME
     already provides is INCONCLUSIVE either way.
@@ -901,7 +927,8 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     That mount hides all of the real HOME -- ~/.ssh, the account's state,
     every other run under the broker's state dir. What a run needs of it, and
     of the private /tmp, is lent back by one table (`expose_table()`) through
-    one routine (`expose()`). check.sh, on the host, gets the mounts as
+    one routine (`expose()`), and every mount goes in by depth
+    (`_mount_order()`), so none buries another. check.sh, on the host, gets the mounts as
     E2E_MOUNTS (`mounts()`), so a path the agent saw can be told apart from
     the host file at that path (`_lib/sandbox_paths.py`).
 
@@ -912,14 +939,16 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # file, one that writes a temp file and renames it over gets EBUSY.
     # Measured with a decoy in its place: `mv ~/x ~/.claude/.credentials.json`
     # -> "Device or resource busy", `echo > ~/.claude/.credentials.json` -> ok.
-    staged, lent = run / "home", []
+    staged = run / "home"
+    ops = [["--tmpfs", "/tmp"], ["--bind", str(staged), str(REAL_HOME)], *path_guard()]
     for path, mode, required in expose_table(claude=claude, run=run, shared=shared,
                                              lend=lend):
         try:
-            lent += expose(path, mode, staged)
+            ops += expose(path, mode, staged)
         except Unexposable as exc:
             if required or not exc.absent:
                 raise
+    ops.sort(key=_mount_order)
     # A private pid namespace with its own procfs. Dropping a variable from
     # the child's environment is not isolation while the child can read it
     # back out of an ancestor's /proc entry: the harness itself holds what the
@@ -939,8 +968,7 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # with the token in hand; measured with a 3s timeout against `sleep 300`.
     return [shutil.which("bwrap"), "--dev-bind", "/", "/",
             "--unshare-pid", "--proc", "/proc", "--die-with-parent",
-            "--tmpfs", "/tmp", "--bind", str(staged), str(REAL_HOME),
-            *path_guard(), *lent,
+            *(arg for op in ops for arg in op),
             "--setenv", "HOME", str(REAL_HOME), "--chdir", str(work), "--", *argv]
 
 
