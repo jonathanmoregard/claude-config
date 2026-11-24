@@ -383,6 +383,144 @@ def test_the_agent_home_is_the_staged_home_at_the_real_home_path(tmp_path):
         assert report["repos"] != "0", report
 
 
+SANDBOX_PATHS = SCENARIOS / "_lib/sandbox_paths.py"
+
+
+def test_check_maps_what_the_agent_saw_to_the_host(tmp_path, in_real_home):
+    """Under bwrap the agent's HOME is the real HOME's path, backed by the
+    run's home/; check.sh runs on the host. A path the agent logged is
+    translated through the run's own mounts (E2E_MOUNTS), so its HOME lands in
+    RUN/home, the run dir -- here inside the real HOME, as the broker puts it
+    -- stays itself, and what the real HOME lends (~/Repos) stays real."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, f"""
+python3 - "$1" <<'PY'
+import os, sys
+sys.path.insert(0, "{SANDBOX_PATHS.parent}")
+from sandbox_paths import to_host
+run, home = sys.argv[1], os.environ["E2E_HOME"]
+print("home=" + home)
+print("staged=" + str(to_host(home + "/.claude/x")))
+print("run=" + str(to_host(run + "/marker")))
+print("repos=" + str(to_host("{real}/Repos/r")))
+print("tmp=" + str(to_host("/tmp/x")))
+PY
+""")
+    out = in_real_home / "out"
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    run = out / "sc/new/1"
+    report = dict(line.split("=", 1) for line in (run / "check.log").read_text().splitlines()
+                  if "=" in line)
+    assert report == {"home": real, "staged": f"{run}/home/.claude/x",
+                      "run": f"{run}/marker", "repos": f"{real}/Repos/r",
+                      "tmp": "None"}, report
+
+
+def test_without_mounts_a_path_maps_to_itself(monkeypatch):
+    """Without bwrap the agent's HOME is RUN/home itself: nothing to map."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sandbox_paths", SANDBOX_PATHS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.delenv("E2E_MOUNTS", raising=False)
+    assert mod.to_host("/a/b/../c") == "/a/c"
+
+
+def test_a_scenario_lends_only_the_paths_it_names(tmp_path, in_real_home):
+    """A scenario whose in-sandbox MCP server needs real-HOME state (the
+    GitHub App host token, say) names those paths in a `lend` file; they are
+    bound read-only at their own path, and nothing beside them is."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = pathlib.Path(_pwd.getpwuid(os.getuid()).pw_dir)
+    (in_real_home / "lent").mkdir()
+    (in_real_home / "lent/token").write_text("t\n")
+    (in_real_home / "other").write_text("o\n")
+    rel = (in_real_home / "lent").relative_to(real)
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "lent=$(cat {in_real_home}/lent/token 2>/dev/null || echo hidden)"
+   echo "other=$(cat {in_real_home}/other 2>/dev/null || echo hidden)"
+   echo "write=$(echo x 2>/dev/null > {in_real_home}/lent/token && echo yes || echo no)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "lend").write_text(f"# the token\n{rel}\n")
+    _, out, verdicts = _run(tmp_path, sc, claude)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
+    report = dict(line.split("=", 1)
+                  for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+    assert report == {"lent": "t", "other": "hidden", "write": "no"}, report
+    assert (in_real_home / "lent/token").read_text() == "t\n"
+
+
+@pytest.mark.parametrize("entry", ["../etc", "/etc", ".", "a/.."])
+def test_a_lend_outside_home_or_of_all_of_it_is_refused(tmp_path, entry):
+    """`lend` names paths inside HOME, never the whole of it."""
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "lend").write_text(f"# comment\n\n{entry}\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert "lend" in verdicts[0]["why"], verdicts
+
+
+def _sandbox_check_env(run: pathlib.Path, bwrap: bool) -> dict:
+    """The env check.sh gets from the harness for RUN, with or without bwrap."""
+    mod = _harness_module()
+    env = {**os.environ, "HOME": str(run / "home"), "E2E_RUN": str(run)}
+    env.pop("E2E_MOUNTS", None)
+    if not bwrap:
+        return {**env, "E2E_HOME": str(run / "home")}
+    argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                         work=run / "work")
+    return {**env, "E2E_HOME": str(mod.REAL_HOME), "E2E_MOUNTS": json.dumps(mod.mounts(argv))}
+
+
+@pytest.mark.parametrize("bwrap", [True, False], ids=["bwrap", "no-bwrap"])
+@pytest.mark.parametrize("where,want", [
+    (".claude/tools/ai-router", "FAIL"),
+    ("Repos/claude-config/runtime/tools/ai-router", "PASS"),
+])
+def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, bwrap, where, want):
+    """The pytest stub logs its cwd as the agent saw it. A suite run inside the
+    agent's own ~/.claude is the staged projection (FAIL) whichever path that
+    HOME had; one under the lent ~/Repos is the host's checkout (PASS)."""
+    run = tmp_path / "sc/old/1"
+    (run / "home/.claude/tools/ai-router").mkdir(parents=True)
+    if not bwrap:  # stage() links ~/Repos in then; under bwrap it is bound
+        (run / "home/Repos").symlink_to(_harness_module().REAL_HOME / "Repos")
+    env = _sandbox_check_env(run, bwrap)
+    seen = env["E2E_HOME"]
+    (run / "suite-calls.txt").write_text(f"{seen}/{where}\t-q tests\n")
+    (run / "commands.txt").write_text(f"ls ~/.claude/tools\ncd {seen}/{where} && pytest -q tests\n")
+    (run / "final.txt").write_text("done\n")
+    r = _grade(run, "tests-out-of-projection", env)
+    assert r.stdout.startswith(want), r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("bwrap,leak", [(True, False), (False, True)], ids=["bwrap", "no-bwrap"])
+def test_rsi_pr_feedback_flags_only_the_real_homes_config(tmp_path, bwrap, leak):
+    """A Read of `<agent HOME>/.claude/recursive-self-improvement` is the
+    staged arm's own config under bwrap (its HOME is the real HOME's path),
+    and the live user's only without it (its HOME was RUN/home)."""
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    run = tmp_path / "sc/old/1"
+    run.mkdir(parents=True)
+    env = _sandbox_check_env(run, bwrap)
+    use = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Read",
+         "input": {"file_path": f"{real}/.claude/recursive-self-improvement/config.json"}}]}}
+    (run / "transcript.jsonl").write_text(json.dumps(use) + "\n")
+    (run / "final.txt").write_text("no proposals\n")
+    r = _grade(run, "rsi-pr-feedback", env)
+    assert ("real HOME's RSI config" in r.stdout) == leak, r.stdout + r.stderr
+
+
 def test_check_failure_is_fail(tmp_path):
     _require_sandbox()
     claude = fake_claude(tmp_path, f"cat <<'EOF'\n{stream('done', [])}\nEOF\n")

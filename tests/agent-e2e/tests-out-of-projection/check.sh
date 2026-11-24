@@ -4,22 +4,28 @@
 # projection to run.
 #
 # Graded on where the suite invocation resolved to, not on how the answer is
-# worded. The harness mounts the real HOME read-only and links ~/Repos into the
-# staged one, and on this host the cutover has not happened yet, so an agent
-# that finds nothing in its own config tree can still reach a nested copy --
-# through /home/jonathan/.claude, or through a claude-config checkout. That is
-# a fidelity limit of the sandbox rather than this arm's behaviour, so a run
-# against a copy outside the projection is named and does not decide it.
+# worded. The harness lends ~/Repos into the agent's HOME, so an agent that
+# finds nothing in its own config tree can still reach a nested copy through a
+# claude-config checkout. That is a fidelity limit of the sandbox rather than
+# this arm's behaviour, so a run against a copy outside the projection is named
+# and does not decide it.
+#
+# The stubs log the cwd the agent saw. Under bwrap its HOME is the real HOME's
+# path backed by RUN/home, so that cwd is translated to the host file first
+# (_lib/sandbox_paths.py); read as a host path, the agent's own ~/.claude
+# would be the live one, and a suite run in the staged tree would pass.
 source "$(dirname "$0")/../_lib/checks.sh" "$1"
 [ -s "$RUN/commands.txt" ] || { echo "INCONCLUSIVE: no commands recorded"; exit 2; }
 
-grep -qE '(~|\$HOME|'"$RUN"'/home)/\.claude' "$RUN/commands.txt" \
+grep -qE '(~|\$HOME|'"$RUN"'/home|'"${E2E_HOME:-$RUN/home}"')/\.claude' "$RUN/commands.txt" \
   || { echo "INCONCLUSIVE: never looked inside the staged config"; exit 2; }
 
-verdict=$(python3 - "$RUN/suite-calls.txt" "$RUN/home" "$RUN/commands.txt" <<'PY'
+verdict=$(python3 - "$RUN/suite-calls.txt" "$RUN/home" "$RUN/commands.txt" "$(dirname "$0")/../_lib" <<'PY'
 import os, re, sys
 
 log, home, commands = sys.argv[1], os.path.realpath(sys.argv[2]), sys.argv[3]
+sys.path.insert(0, sys.argv[4])
+from sandbox_paths import to_host
 staged, outside = [], []
 try:
     lines = open(log, encoding="utf-8").read().splitlines()
@@ -42,10 +48,16 @@ for line in filter(None, lines):
     if not candidates:
         candidates.append(cwd)
     for candidate in candidates:
-        # realpath on purpose: the harness links ~/Repos into the staged HOME,
-        # so a suite reached through that link is the host's checkout wearing a
-        # staged path, and must not be read as the projection.
-        resolved = os.path.realpath(candidate)
+        # The host file first: a path in the agent's HOME is RUN/home, one in
+        # what the harness lends (~/Repos) the host's own, one in the private
+        # /tmp nothing on the host. Then realpath on purpose: without bwrap
+        # ~/Repos is a link in the staged HOME, so a suite reached through it is
+        # the host's checkout wearing a staged path, not the projection.
+        host = to_host(candidate)
+        if host is None:
+            outside.append(candidate)
+            continue
+        resolved = os.path.realpath(host)
         if resolved == home or resolved.startswith(home + os.sep):
             staged.append("~" + resolved[len(home):])
         else:

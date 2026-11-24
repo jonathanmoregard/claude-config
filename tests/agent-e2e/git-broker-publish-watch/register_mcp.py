@@ -39,7 +39,8 @@ def github_entry(arm_servers: dict, home: Path, run: Path,
         cfg = dict(arm_servers["github"])
         cfg["args"] = [arm_path(arg, home) for arg in cfg.get("args", [])]
     cfg = dict(cfg)
-    # The harness mounts the real HOME read-only, so uv's default cache is unwritable.
+    # HOME is the live path, where the scenario's `lend` puts the credentials
+    # under bwrap; uv's cache stays in the run rather than in either HOME.
     cfg["env"] = {**(cfg.get("env") or {}), "HOME": LIVE_HOME,
                   "UV_CACHE_DIR": str(run / "uv-cache")}
     return cfg

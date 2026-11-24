@@ -5,9 +5,9 @@
 # `nix` and `pytest` are stubbed so the run makes no network call and does not
 # depend on a pytest being installed. Each logs its CWD with its argv, because
 # the grader has to resolve `pytest tools/ai-router/tests` against the
-# directory it ran in: the harness mounts the real HOME read-only, so the same
-# relative path means the staged projection or the host's own ~/.claude
-# depending only on where the agent stood.
+# directory it ran in: the same relative path means the staged projection or a
+# claude-config checkout under the lent ~/Repos depending only on where the
+# agent stood.
 #
 # The pytest stub answers honestly about whether the path it was handed exists.
 # That is the whole difference between the arms -- on the old arm a suite sits

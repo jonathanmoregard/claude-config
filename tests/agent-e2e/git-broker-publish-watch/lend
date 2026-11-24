@@ -1,0 +1,9 @@
+# Real-HOME state the brokers need inside the sandbox, bound read-only at its
+# own path (agent_e2e.py read_lend). The agent's own Bash is kept off the token
+# by the deny rule setup.sh adds, as in a real session.
+# The gh credential wrapper's GitHub App host token (git_broker, check runs).
+.cache/gh-tokens/host
+# github-app-mcp-server's installation listing (the github server).
+.config/github-app/config
+# git_broker's trustedHooksDir; it refuses to run without it.
+.config/git/hooks

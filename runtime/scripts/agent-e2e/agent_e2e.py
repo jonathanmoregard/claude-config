@@ -25,10 +25,16 @@ SCENARIO is a directory holding:
                 may be called from a nested harness run.
     persist-session  optional, empty: keep the session transcript (for hooks
                 that read `transcript_path`); default is --no-session-persistence
+    lend        optional: HOME-relative paths, one per line (# comments), of
+                real-HOME state an MCP server in the sandbox needs, bound
+                read-only at their own path under bwrap (e.g. a broker's
+                GitHub token). The agent can read them too: lend no more.
     check.sh    `check.sh RUN` grades one run: exit 0 PASS, 1 FAIL, anything
                 else INCONCLUSIVE. RUN holds final.txt (the agent's last message),
                 commands.txt (every Bash command the agent issued, one per
                 line, in order), transcript.jsonl and whatever setup.sh logged.
+                Paths the agent saw are in its HOME (E2E_HOME), not the staged
+                dir check.sh gets as HOME: map them with _lib/sandbox_paths.py.
 
 A run whose agent exits non-zero, reports an error or ends without a final
 message is INCONCLUSIVE: excluded from the denominator, reported separately,
@@ -45,15 +51,20 @@ FIDELITY
     permissions, defaultMode), skills, agents and commands, so hooks referencing
     $HOME/.claude run the candidate's scripts. Under bwrap it is mounted at the
     real HOME's own path, so path rules in the settings mean there what they
-    mean in a real session, whatever --out the run dir sits under; credentials,
-    the plugin cache, ~/Repos (the target of relative skill symlinks) and,
-    read-only, ~/worktrees are bound in from the real HOME, and nothing else
-    of it is. Without bwrap HOME is the staged dir itself and the first three
-    are links. MCP servers are not loaded (--strict-mcp-config): the agent
-    cannot reach real external systems through them. A scenario that needs an
-    MCP tool has setup.sh write RUN/mcp.json naming a local STUB server; that
-    file, and only that file, is passed as --mcp-config. Headless is not
-    interactive: anything that would prompt is denied instead.
+    mean in a real session, whatever --out the run dir sits under. Bound back
+    in from the real HOME, at their own paths: credentials, the plugin cache,
+    ~/Repos (the target of relative skill symlinks), ~/.config/caveman and
+    ~/worktrees; what the scenario's `lend` names; the directories on the
+    harness's PATH that lie in it (~/.local/bin, ~/.claude/runtime/bin); the
+    claude binary's directory and the link it is run by; and the run and
+    shared dirs. Only the credentials, the run and the shared dir are
+    writable, and nothing else of the real HOME is visible (sandboxed()).
+    Without bwrap HOME is the staged dir itself and LINKS are links. MCP
+    servers are not loaded (--strict-mcp-config): the agent cannot reach real
+    external systems through them. A scenario that needs an MCP tool has
+    setup.sh write RUN/mcp.json naming a local STUB server; that file, and
+    only that file, is passed as --mcp-config. Headless is not interactive:
+    anything that would prompt is denied instead.
 """
 
 from __future__ import annotations
@@ -585,8 +596,52 @@ def path_guard() -> list[str]:
     return [arg for d in seen for arg in ("--ro-bind", d, d)]
 
 
+def read_lend(scenario: pathlib.Path) -> list[str]:
+    """HOME-relative paths the scenario's `lend` file names, one per line.
+
+    Raises ValueError for an entry outside HOME or naming all of it: a lend is
+    a specific path, never the real HOME back."""
+    path = scenario / "lend"
+    if not path.is_file():
+        return []
+    lend = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        rel = os.path.normpath(entry)
+        if os.path.isabs(rel) or rel == "." or rel == ".." or rel.startswith("../"):
+            raise ValueError(f"lend: {entry!r} is not a path inside HOME")
+        lend.append(rel)
+    return lend
+
+
+def mounts(argv: list[str]) -> list[tuple[str, str | None]]:
+    """(path inside, host path) of every mount in a sandboxed() ARGV, in
+    order; None for a tmpfs, which has no host path. What check.sh gets as
+    E2E_MOUNTS, so a grader can tell which file a path the agent saw was."""
+    out: list[tuple[str, str | None]] = []
+    i = 1
+    while i < len(argv) and argv[i] != "--":
+        op = argv[i]
+        if op in ("--bind", "--ro-bind", "--dev-bind"):
+            out.append((argv[i + 2], argv[i + 1]))
+            i += 3
+        elif op == "--tmpfs":
+            out.append((argv[i + 1], None))
+            i += 2
+        elif op in ("--symlink", "--setenv"):
+            i += 3
+        elif op in ("--proc", "--chdir"):
+            i += 2
+        else:
+            i += 1
+    return out
+
+
 def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
-              shared: pathlib.Path, work: pathlib.Path) -> list[str]:
+              shared: pathlib.Path, work: pathlib.Path,
+              lend: list[str] | tuple[str, ...] = ()) -> list[str]:
     """Wrap ARGV in the bubblewrap confinement a run executes under.
 
     The confinement binds `/` read-write, so what a run cannot write is
@@ -614,9 +669,12 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     That mount hides all of the real HOME -- ~/.ssh, the account's state,
     every other run under the broker's state dir. What a run needs of it is
     bound back after it, at its own path: LINKS and CHECKOUT_ROOTS read-only
-    except the credentials file, writable as before for token refresh, the
-    harness's PATH (`path_guard()`), the claude binary, and last the run and
-    the shared log dir, which may themselves sit in the real HOME.
+    except the credentials file, writable as before for token refresh, what
+    the scenario's `lend` file names (`read_lend()`), the harness's PATH
+    (`path_guard()`), the claude binary, and last the run and the shared log
+    dir, which may themselves sit in the real HOME. check.sh, on the host,
+    gets these mounts as E2E_MOUNTS (`mounts()`), so a path the agent saw can
+    be told apart from the host file at that path (`_lib/sandbox_paths.py`).
     """
     home = REAL_HOME
     lent = []
@@ -627,6 +685,14 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     for root in CHECKOUT_ROOTS:
         if root.is_dir():
             lent += ["--ro-bind", str(root), str(root)]
+    # What the scenario's own `lend` file names (read_lend()): real-HOME state
+    # an MCP server inside the sandbox needs, the GitHub App host token for a
+    # broker, say. Only on request, never for every run: the agent under test
+    # can read whatever its servers can, and sandbox-canary plants a canary at
+    # that very token path in the staged HOME.
+    for rel in lend:
+        if (REAL_HOME / rel).exists():
+            lent += ["--ro-bind", str(REAL_HOME / rel), str(home / rel)]
     # Hidden by the private /tmp or by the HOME mount otherwise: the binary's
     # real directory, and the path bwrap execs, usually a link to it
     # (~/.local/bin/claude). Straight in either, the binary alone comes back:
@@ -856,11 +922,25 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     # the honeypot's own grader shells out to `python3`. They still get
     # $E2E_BIN as a variable, which is how setup.sh writes stubs; no grader
     # reads it, and the one grader that calls `gh` wants the real one.
-    script_env = {**env, "PATH": HARNESS_PATH}
+    #
+    # E2E_HOME is the HOME the agent sees: the real HOME's path under bwrap,
+    # where setup.sh and check.sh still get the staged dir as HOME, so a path
+    # the agent wrote in terms of its HOME is not one in theirs. check.sh also
+    # gets the mounts behind it (E2E_MOUNTS, set below; never inherited from
+    # an outer run) to translate such a path, `_lib/sandbox_paths.py`.
+    env.pop("E2E_MOUNTS", None)
+    script_env = {**env, "PATH": HARNESS_PATH,
+                  "E2E_HOME": str(REAL_HOME if bwrap else home)}
+    verdict = {"arm": arm, "run": idx, "config": provenance, "resume_key": key}
+    try:
+        lend = read_lend(scenario)
+    except ValueError as exc:
+        verdict.update(verdict="INCONCLUSIVE", why=str(exc))
+        write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
+        return verdict
     setup = subprocess.run([BASH, str(scenario / "setup.sh"), str(work), str(run)],
                            env=script_env, capture_output=True, text=True)
     write_run_file(run, "setup.log", setup.stdout + setup.stderr)
-    verdict = {"arm": arm, "run": idx, "config": provenance, "resume_key": key}
     if setup.returncode != 0:
         verdict.update(verdict="INCONCLUSIVE", why=f"setup.sh exit {setup.returncode}")
         write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
@@ -880,7 +960,9 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     if (run / "mcp.json").is_file():
         argv += ["--mcp-config", str(run / "mcp.json")]
     if bwrap:
-        argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work)
+        argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work,
+                         lend=lend)
+        script_env["E2E_MOUNTS"] = json.dumps(mounts(argv))
     verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()
     try:
