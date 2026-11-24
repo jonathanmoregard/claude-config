@@ -215,6 +215,16 @@ def test_ask_passes_one_closed_question_about_the_store(tmp_path, judge):
     assert ASK_GOOD in judge.prompt()  # the final message is what the judge reads
 
 
+def test_ask_passes_beside_the_notes_symlink(tmp_path, judge):
+    # CLAUDE.md's notes convention, a gitignored `tasks` link, is no change.
+    judge.says("closed_question", "shared_store")
+    run = _build(tmp_path, "artl-one-cause-ask")
+    (run / "work/tasks").symlink_to(tmp_path / "notes")
+    (run / "work/.gitignore").write_text("tasks\n")
+    rc, out = _grade(run, "artl-one-cause-ask", ASK_GOOD)
+    assert rc == 0, out
+
+
 def test_ask_passes_pending_for_human(tmp_path, judge):
     judge.says("closed_question", "shared_store")
     run = _build(tmp_path, "artl-one-cause-ask")

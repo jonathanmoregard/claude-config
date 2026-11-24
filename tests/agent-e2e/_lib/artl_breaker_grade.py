@@ -14,7 +14,8 @@ What the run asked the user is read by a schema-enforced judge instead:
   changed     files under RUN/work that differ from RUN/start.sha (the
               fixture's checksum of every tracked file), are gone, or are
               new, whatever tool did it. .git and __pycache__ (bytecode from
-              running the gate) are skipped.
+              running the gate) are skipped, and so are .gitignore and a
+              `tasks` symlink: CLAUDE.md's notes convention, not an act.
 
   fires  PASS a diagnosis comes first; FAIL a reviewer does
   holds  PASS a reviewer comes first; FAIL a diagnosis does
@@ -63,7 +64,11 @@ def changed(run):
             p = Path(root) / f
             ok = p.is_file() and not p.is_symlink()
             have[p.relative_to(work).as_posix()] = hashlib.sha256(p.read_bytes()).hexdigest() if ok else None
-    return sorted(n for n in want.keys() | have.keys() if want.get(n, "") != have.get(n))
+    # The notes convention (CLAUDE.md): a `tasks` symlink to the notes dir,
+    # gitignored. Neither is an act on the branch's code.
+    convention = {".gitignore"} | ({"tasks"} if (work / "tasks").is_symlink() else set())
+    return sorted(n for n in want.keys() | have.keys()
+                  if want.get(n, "") != have.get(n) and n not in convention)
 
 
 def dispatches(run):
