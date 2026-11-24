@@ -43,13 +43,17 @@ COST
 FIDELITY
     The staged HOME carries the candidate CLAUDE.md, settings.json (hooks,
     permissions, defaultMode), skills, agents and commands, so hooks referencing
-    $HOME/.claude run the candidate's scripts. Credentials, the plugin cache and
-    ~/Repos (the target of relative skill symlinks) are linked from the real
-    HOME. MCP servers are not loaded (--strict-mcp-config): the agent cannot
-    reach real external systems through them. A scenario that needs an MCP
-    tool has setup.sh write RUN/mcp.json naming a local STUB server; that file,
-    and only that file, is passed as --mcp-config. Headless is not interactive:
-    anything that would prompt is denied instead.
+    $HOME/.claude run the candidate's scripts. Under bwrap it is mounted at the
+    real HOME's own path, so path rules in the settings mean there what they
+    mean in a real session, whatever --out the run dir sits under; credentials,
+    the plugin cache, ~/Repos (the target of relative skill symlinks) and,
+    read-only, ~/worktrees are bound in from the real HOME, and nothing else
+    of it is. Without bwrap HOME is the staged dir itself and the first three
+    are links. MCP servers are not loaded (--strict-mcp-config): the agent
+    cannot reach real external systems through them. A scenario that needs an
+    MCP tool has setup.sh write RUN/mcp.json naming a local STUB server; that
+    file, and only that file, is passed as --mcp-config. Headless is not
+    interactive: anything that would prompt is denied instead.
 """
 
 from __future__ import annotations
@@ -83,14 +87,21 @@ REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 # FAIL into `PASS: no canary was touched`, exit 0.
 HARNESS_PATH = os.environ.get("PATH", "")
 BASH = shutil.which("bash") or "/bin/bash"
-# Linked, never copied: auth, the plugin cache and the tree relative skill
-# symlinks (`../../Repos/router-agent/...`) resolve into.
+# Lent, never copied: auth, the plugin cache and the tree relative skill
+# symlinks (`../../Repos/router-agent/...`) resolve into. Linked from the
+# staged HOME without bwrap; under it, bound at their own paths instead
+# (sandboxed()), where a link to the real HOME path would point at itself.
 LINKS = {
     ".claude/.credentials.json": REAL_HOME / ".claude/.credentials.json",
     ".claude/plugins": REAL_HOME / ".claude/plugins",
     "Repos": REAL_HOME / "Repos",
     ".config/caveman": REAL_HOME / ".config/caveman",
 }
+# Lent read-only under bwrap only (without it the real HOME is there anyway):
+# the other checkout root beside ~/Repos, which scenarios, their MCP servers
+# (the klaffat app runner resolves it strictly) and a nested harness name by
+# absolute path.
+CHECKOUT_ROOTS = (REAL_HOME / "worktrees",)
 # Credentials and agents a run must not inherit: with them, an agent in the
 # sandbox could push a real checkout under the linked ~/Repos, or call GitHub
 # with the user's token, past every stub. The ACTIONS_ID_TOKEN_REQUEST_* pair
@@ -232,10 +243,12 @@ def config_id(src: str) -> str | None:
     return sh(["git", "-C", str(REPO), "rev-parse", src]).stdout.strip()
 
 
-def stage(src: str, home: pathlib.Path) -> str:
-    """Build a sandbox HOME whose ~/.claude is config SRC."""
+def stage(src: str, home: pathlib.Path, *, links: bool = True) -> str:
+    """Build a sandbox HOME whose ~/.claude is config SRC. LINKS are linked in
+    unless LINKS is false: a HOME bwrap mounts at the real HOME's path gets
+    them bound in by sandboxed()."""
     provenance = copy_config(src, home / ".claude")
-    for rel, target in LINKS.items():
+    for rel, target in LINKS.items() if links else ():
         link = home / rel
         if link.exists() or link.is_symlink():
             continue
@@ -588,28 +601,45 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     runs sharing the real one leaked into each other: two dogfood runs picked
     the same /tmp output dir and one "ran" its e2e by reusing the other's
     verdict. Only this run's own directory is bound back in.
+
+    The staged HOME (RUN/home) is mounted at the real HOME's own path, and
+    HOME names that path. The settings under test are written for the host
+    layout -- `~/` and absolute `//home/<user>/...` rules alike -- so that is
+    the layout they must see, never wherever --out put the run dir: a deny of
+    every staged HOME under the broker's state dir, there for reviewers of run
+    dirs, would otherwise deny the agent its own HOME. Docker, Flatpak and
+    Bazel's linux-sandbox do the same: a mount whose destination is not its
+    source, so the policy never sees where the source lives.
+
+    That mount hides all of the real HOME -- ~/.ssh, the account's state,
+    every other run under the broker's state dir. What a run needs of it is
+    bound back after it, at its own path: LINKS and CHECKOUT_ROOTS read-only
+    except the credentials file, writable as before for token refresh, the
+    harness's PATH (`path_guard()`), the claude binary, and last the run and
+    the shared log dir, which may themselves sit in the real HOME.
     """
-    binds = []
-    exe_dir = pathlib.Path(claude).resolve().parent
-    if str(exe_dir).startswith("/tmp"):  # else hidden by the private /tmp
-        binds += ["--ro-bind", str(exe_dir), str(exe_dir)]
-    # Last, so a read-only ancestor bind above cannot shadow them.
-    binds += ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
-    # The real HOME is read-only (linked ~/Repos and ~/.claude/plugins
-    # included) and ~/.ssh is hidden; only the run, the shared log dir and
-    # the credentials file (token refresh) stay writable.
-    creds = REAL_HOME / ".claude/.credentials.json"
-    home_guard = ["--ro-bind", str(REAL_HOME), str(REAL_HOME)]
-    # Hiding ~/.ssh only when there is one. bwrap creates a mount point
-    # before mounting, and the read-only bind above makes that mkdir fail
-    # on a host without the directory -- a CI runner -- taking down every
-    # run with "Can't mkdir: Read-only file system". Nothing is left
-    # unguarded by skipping it: that same read-only bind means no ~/.ssh
-    # can appear during the run either.
-    if (REAL_HOME / ".ssh").is_dir():
-        home_guard += ["--tmpfs", str(REAL_HOME / ".ssh")]
-    if creds.is_file():
-        home_guard += ["--bind", str(creds), str(creds)]
+    home = REAL_HOME
+    lent = []
+    for rel, target in LINKS.items():
+        if target.exists():
+            mode = "--bind" if rel == ".claude/.credentials.json" else "--ro-bind"
+            lent += [mode, str(target), str(home / rel)]
+    for root in CHECKOUT_ROOTS:
+        if root.is_dir():
+            lent += ["--ro-bind", str(root), str(root)]
+    # Hidden by the private /tmp or by the HOME mount otherwise: the binary's
+    # real directory, and the path bwrap execs, usually a link to it
+    # (~/.local/bin/claude). Straight in either, the binary alone comes back:
+    # its directory would be all of it.
+    exe_bind = []
+    hidden = (pathlib.Path("/tmp"), home)
+    real = pathlib.Path(claude).resolve()
+    run_by = [pathlib.Path(claude)] if os.path.isabs(claude) else []
+    for path in dict.fromkeys([real if real.parent in hidden else real.parent, *run_by]):
+        if any(path.is_relative_to(h) for h in hidden):
+            exe_bind += ["--ro-bind", str(path), str(path)]
+    # Last, so neither mount above nor a read-only ancestor bind shadows them.
+    binds = ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
     # A private pid namespace with its own procfs. Dropping a variable from
     # the child's environment is not isolation while the child can read it
     # back out of an ancestor's /proc entry: the harness itself holds what the
@@ -629,8 +659,9 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # with the token in hand; measured with a 3s timeout against `sleep 300`.
     return [shutil.which("bwrap"), "--dev-bind", "/", "/",
             "--unshare-pid", "--proc", "/proc", "--die-with-parent",
-            *home_guard, *path_guard(), "--tmpfs", "/tmp",
-            *binds, "--chdir", str(work), "--", *argv]
+            "--bind", str(run / "home"), str(home), *lent, *path_guard(),
+            "--tmpfs", "/tmp", *exe_bind, *binds,
+            "--setenv", "HOME", str(home), "--chdir", str(work), "--", *argv]
 
 
 def events_of(text: str) -> list[dict]:
@@ -788,7 +819,8 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     home, work, bindir = run / "home", run / "work", run / "bin"
     for d in (home, work, bindir):
         d.mkdir(parents=True)
-    provenance = stage(src, home)
+    bwrap = shutil.which("bwrap")
+    provenance = stage(src, home, links=not bwrap)
     # E2E_SHARED is the one directory every nesting level keeps writable: a
     # scenario whose agent runs this harness itself (the dogfood) gets a
     # private /tmp inside the inner run too, and a stub logging to the outer
@@ -839,7 +871,6 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     # --strict-mcp-config: nothing from the real HOME's MCP config loads.
     if (run / "mcp.json").is_file():
         argv += ["--mcp-config", str(run / "mcp.json")]
-    bwrap = shutil.which("bwrap")
     if bwrap:
         argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work)
     verdict["isolated_tmp"] = bool(bwrap)

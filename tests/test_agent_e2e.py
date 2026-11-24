@@ -244,6 +244,93 @@ EOF
     assert [v["verdict"] for v in verdicts] == ["PASS"], r.stdout
 
 
+def _harness_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_e2e_under_test", HARNESS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _ops(argv: list[str], flag: str) -> list[tuple[int, str, str]]:
+    """(position, first, second) of every two-argument FLAG in ARGV."""
+    return [(i, argv[i + 1], argv[i + 2]) for i, a in enumerate(argv[:-2]) if a == flag]
+
+
+def test_the_sandbox_mounts_the_staged_home_at_the_real_home_path(tmp_path):
+    """The agent's HOME is the account's real HOME path, with the staged HOME
+    mounted there, so the policy under test sees the host layout it was
+    written for, never the run dir. Every bind back in (the run, the shared
+    dir, what the real HOME lends) comes after that mount: under it, one
+    whose path is in the real HOME -- a broker run is -- would be hidden."""
+    mod = _harness_module()
+    run = tmp_path / "run"
+    shared = tmp_path / "shared"
+    argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=shared,
+                         work=run / "work")
+    real = str(mod.REAL_HOME)
+    home = [i for i, src, dst in _ops(argv, "--bind") if (src, dst) == (str(run / "home"), real)]
+    assert home, argv
+    assert ("HOME", real) in [(k, v) for _, k, v in _ops(argv, "--setenv")], argv
+    later = [i for flag in ("--bind", "--ro-bind") for i, src, _ in _ops(argv, flag)
+             if src in (str(run), str(shared)) or src.startswith(real + "/")]
+    assert later and min(later) > home[0], argv
+
+
+def test_the_claude_binary_is_bound_at_the_path_it_is_run_by(tmp_path):
+    """`claude` is usually a link (~/.local/bin/claude -> a versioned binary)
+    in a directory the sandbox hides. bwrap execs the path it was given, so
+    that path comes back as well as the binary's real directory -- whether or
+    not the link's directory happens to be on the harness's PATH."""
+    mod = _harness_module()
+    (tmp_path / "versions").mkdir()
+    (tmp_path / "versions/1.0").write_text("#!/bin/sh\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/claude").symlink_to(tmp_path / "versions/1.0")
+    run = tmp_path / "run"
+    argv = mod.sandboxed(["true"], claude=str(tmp_path / "bin/claude"), run=run,
+                         shared=run / "shared", work=run / "work")
+    bound = [(src, dst) for _, src, dst in _ops(argv, "--ro-bind")]
+    assert (str(tmp_path / "bin/claude"),) * 2 in bound, argv
+    assert (str(tmp_path / "versions"),) * 2 in bound, argv
+
+
+def test_the_agent_home_is_the_staged_home_at_the_real_home_path(tmp_path):
+    """Inside the sandbox the real HOME path holds the staged HOME: its
+    settings are the candidate's, what the agent writes there lands in the
+    run's home/, ~/.ssh is empty, and what the real HOME lends on purpose
+    (~/Repos) is still there."""
+    _require_sandbox()
+    import pwd as _pwd
+    real = _pwd.getpwuid(os.getuid()).pw_dir
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "settings.json").write_text('{"e2e-marker": "staged-copy"}\n')
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "home=$HOME"
+   echo "realpath=$(realpath "$HOME")"
+   echo "settings=$(head -c 200 {real}/.claude/settings.json | tr -d '\\n')"
+   echo "ssh=$(ls -A {real}/.ssh 2>/dev/null | wc -l)"
+   echo "repos=$(ls -A {real}/Repos 2>/dev/null | wc -l)"
+   echo w > {real}/written-by-agent; }} > "$E2E_SHARED/report" 2> "$E2E_SHARED/errors"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    run = out / "sc/new/1"
+    report = dict(line.split("=", 1)
+                  for line in (run / "shared/report").read_text().splitlines())
+    assert report["home"] == real and report["realpath"] == real, report
+    assert report["settings"] == '{"e2e-marker": "staged-copy"}', report
+    assert report["ssh"] == "0", report
+    assert (run / "home/written-by-agent").read_text() == "w\n"
+    assert not pathlib.Path(real, "written-by-agent").exists()
+    if pathlib.Path(real, "Repos").is_dir() and any(pathlib.Path(real, "Repos").iterdir()):
+        assert report["repos"] != "0", report
+
+
 def test_check_failure_is_fail(tmp_path):
     _require_sandbox()
     claude = fake_claude(tmp_path, f"cat <<'EOF'\n{stream('done', [])}\nEOF\n")
@@ -267,12 +354,15 @@ def test_broken_runs_are_inconclusive_never_pass(tmp_path, body):
 
 _SECRETS = (".claude.json", ".claude.json.backup", ".claude/backups/.claude.json.backup.1",
             ".ssh/id_x", ".codex/auth.json", ".claude/.credentials.json")
-# Plants every secret in $HOME. The credentials entry is a link to the REAL
-# file, so it is removed first: writing through it would overwrite the real one.
-# A token refresh leaves it a regular file, which is what this plants.
+# Plants every secret in $HOME. The credentials entry is the REAL file and is
+# never written: without bwrap a link to it, removed first and replaced by a
+# regular file (what a token refresh leaves); in the sandbox a bind mount of
+# it, which no rm removes, so it is left alone and the empty file bwrap made
+# for the mount is what the scrub must take.
 _PLANT = "\n".join(
-    ['rm -f "$HOME/.claude/.credentials.json"']
-    + [f'mkdir -p "$(dirname "$HOME/{rel}")"; echo s > "$HOME/{rel}"' for rel in _SECRETS]
+    ['[ -L "$HOME/.claude/.credentials.json" ] && rm -f "$HOME/.claude/.credentials.json"']
+    + [f'mkdir -p "$(dirname "$HOME/{rel}")"; [ -e "$HOME/{rel}" ] || echo s > "$HOME/{rel}"'
+       for rel in _SECRETS]
     + ['ln -s / "$HOME/.local-root"', 'ln -s /etc/hostname "$HOME/.claude/out-link"'])
 
 
@@ -353,7 +443,7 @@ def test_secrets_outside_home_are_scrubbed_too(tmp_path):
 
 
 @pytest.mark.parametrize("swap", [
-    'cd /; mv "$HOME" "$E2E_RUN/h2"; ln -s {decoy} "$E2E_RUN/home"',
+    'cd /; mv "$E2E_RUN/home" "$E2E_RUN/h2"; ln -s {decoy} "$E2E_RUN/home"',
     'mv "$HOME/.claude" "$HOME/.claude-old"; ln -s {decoy} "$HOME/.claude"',
     'mkdir -p "$HOME/x"; ln -s {decoy} "$HOME/x/y"; ln -s {decoy}/.ssh "$HOME/.ssh"',
     'ln -s {decoy}/f "$E2E_RUN/final.txt"; ln -s {decoy}/.claude.json "$E2E_RUN/verdict.json"',
@@ -1234,7 +1324,8 @@ def test_run_cannot_reach_ssh_agent_keys_or_write_real_home(tmp_path):
         f'[ -z "$SSH_AUTH_SOCK$GH_TOKEN$GITHUB_TOKEN" ] || exit 11\n'
         f'[ "$GIT_SSH_COMMAND" = false ] || exit 12\n'
         f'[ -z "$(ls -A {real}/.ssh 2>/dev/null)" ] || exit 13\n'
-        f'touch {real}/.agent-e2e-escape 2>/dev/null && exit 14\n'
+        # The staged HOME is mounted at this path, so the touch lands there.
+        f'touch {real}/.agent-e2e-escape 2>/dev/null\n'
         "cat <<'EOF'\n" + stream("contained", []) + "\nEOF\n")
     claude = fake_claude(tmp_path, body)
     sc = _scenario(tmp_path, "exit 0")

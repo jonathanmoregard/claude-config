@@ -76,7 +76,7 @@ def attack(tmp_path: pathlib.Path, script: str) -> subprocess.CompletedProcess:
     # that cannot start proves nothing.
     run, shared = tmp_path / "run", tmp_path / "shared"
     work = run / "work"
-    for d in (run, shared, work):
+    for d in (run, shared, work, run / "home"):
         d.mkdir()
     argv = harness().sandboxed(
         ["sh", "-c", f"{script}; echo {RAN}"], claude=shutil.which("sh"),
