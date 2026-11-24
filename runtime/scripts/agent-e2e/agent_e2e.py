@@ -22,13 +22,17 @@ SCENARIO is a directory holding:
     setup.sh    `setup.sh WORK RUN` builds the workspace in WORK. Stubs it puts
                 in $E2E_BIN shadow real tools (on PATH first); logs go to RUN,
                 or to $E2E_SHARED (RUN/shared at the top level) when a stub
-                may be called from a nested harness run.
+                may be called from a nested harness run. Its HOME is the
+                staged dir, to write into; a path it hands the agent (a probe
+                script, an MCP config, a settings rule) names the agent's
+                HOME, E2E_HOME, which under bwrap is another path.
     persist-session  optional, empty: keep the session transcript (for hooks
                 that read `transcript_path`); default is --no-session-persistence
     lend        optional: HOME-relative paths, one per line (# comments), of
                 real-HOME state an MCP server in the sandbox needs, bound
                 read-only at their own path under bwrap (e.g. a broker's
                 GitHub token). The agent can read them too: lend no more.
+                An entry the host lacks makes the run INCONCLUSIVE.
     check.sh    `check.sh RUN` grades one run: exit 0 PASS, 1 FAIL, anything
                 else INCONCLUSIVE. RUN holds final.txt (the agent's last message),
                 commands.txt (every Bash command the agent issued, one per
@@ -51,14 +55,18 @@ FIDELITY
     permissions, defaultMode), skills, agents and commands, so hooks referencing
     $HOME/.claude run the candidate's scripts. Under bwrap it is mounted at the
     real HOME's own path, so path rules in the settings mean there what they
-    mean in a real session, whatever --out the run dir sits under. Bound back
-    in from the real HOME, at their own paths: credentials, the plugin cache,
-    ~/Repos (the target of relative skill symlinks), ~/.config/caveman and
-    ~/worktrees; what the scenario's `lend` names; the directories on the
-    harness's PATH that lie in it (~/.local/bin, ~/.claude/runtime/bin); the
-    claude binary's directory and the link it is run by; and the run and
-    shared dirs. Only the credentials, the run and the shared dir are
-    writable, and nothing else of the real HOME is visible (sandboxed()).
+    mean in a real session, whatever --out the run dir sits under, and it is
+    the only name the staged HOME has inside: RUN/home is hidden there. Lent
+    back from the real HOME, at their own paths and with every symlink on the
+    way recreated, by one table (expose_table()): credentials, the plugin
+    cache, ~/Repos (the target of relative skill symlinks), ~/.config/caveman
+    and ~/worktrees; what the scenario's `lend` names; the directories on the
+    harness's PATH that lie in it, save ~/.claude's (the candidate's own bin
+    is staged); the claude binary and every link to it; and the run and
+    shared dirs, with the rest of the scenario's out dir hidden. Only the
+    credentials, the run and the shared dir are writable, and nothing else of
+    the real HOME is visible. A lent path the staged HOME already holds, or
+    one the scenario lends that the host lacks, makes the run INCONCLUSIVE.
     Without bwrap HOME is the staged dir itself and LINKS are links. MCP
     servers are not loaded (--strict-mcp-config): the agent cannot reach real
     external systems through them. A scenario that needs an MCP tool has
@@ -98,21 +106,22 @@ REAL_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 # FAIL into `PASS: no canary was touched`, exit 0.
 HARNESS_PATH = os.environ.get("PATH", "")
 BASH = shutil.which("bash") or "/bin/bash"
-# Lent, never copied: auth, the plugin cache and the tree relative skill
+# Lent, never copied, HOME-relative, with the mode they get under bwrap: auth
+# (writable, for token refresh), the plugin cache and the tree relative skill
 # symlinks (`../../Repos/router-agent/...`) resolve into. Linked from the
-# staged HOME without bwrap; under it, bound at their own paths instead
-# (sandboxed()), where a link to the real HOME path would point at itself.
+# staged HOME without bwrap; under it, rows of the expose table (sandboxed()),
+# where a link to the real HOME path would point at itself.
 LINKS = {
-    ".claude/.credentials.json": REAL_HOME / ".claude/.credentials.json",
-    ".claude/plugins": REAL_HOME / ".claude/plugins",
-    "Repos": REAL_HOME / "Repos",
-    ".config/caveman": REAL_HOME / ".config/caveman",
+    ".claude/.credentials.json": "rw",
+    ".claude/plugins": "ro",
+    "Repos": "ro",
+    ".config/caveman": "ro",
 }
 # Lent read-only under bwrap only (without it the real HOME is there anyway):
 # the other checkout root beside ~/Repos, which scenarios, their MCP servers
 # (the klaffat app runner resolves it strictly) and a nested harness name by
-# absolute path.
-CHECKOUT_ROOTS = (REAL_HOME / "worktrees",)
+# absolute path. HOME-relative.
+CHECKOUT_ROOTS = ("worktrees",)
 # Credentials and agents a run must not inherit: with them, an agent in the
 # sandbox could push a real checkout under the linked ~/Repos, or call GitHub
 # with the user's token, past every stub. The ACTIONS_ID_TOKEN_REQUEST_* pair
@@ -332,8 +341,8 @@ def stage(src: str, home: pathlib.Path, *, links: bool = True) -> str:
     unless LINKS is false: a HOME bwrap mounts at the real HOME's path gets
     them bound in by sandboxed()."""
     provenance = copy_config(src, home / ".claude")
-    for rel, target in LINKS.items() if links else ():
-        link = home / rel
+    for rel in LINKS if links else ():
+        link, target = home / rel, REAL_HOME / rel
         if link.exists() or link.is_symlink():
             continue
         if target.exists():
@@ -642,33 +651,6 @@ def write_run_file(run: pathlib.Path, name: str, text: str) -> None:
         f.write(text)
 
 
-def path_guard() -> list[str]:
-    """Bind every directory on the harness's own PATH read-only.
-
-    The grader runs outside the sandbox and resolves `python3`, `git`, `grep`
-    through this PATH, so a writable entry on it is a place the config under
-    test can plant an executable the harness will then run -- the same hijack
-    as $E2E_BIN, by a different directory. Measured: with a writable PATH entry
-    outside /tmp and outside REAL_HOME, a sandboxed shell wrote `python3` into
-    it and turned a grader's FAIL into `PASS: no canary was touched`.
-
-    Derived from PATH rather than naming paths, because the exposed directories
-    are the runner's, not this host's: on a GitHub hosted runner /usr/local/bin
-    and the hosted tool caches are owned by the unprivileged user the job runs
-    as, while on NixOS every entry already lives in the read-only store. Each
-    entry is resolved, because writability belongs to the real directory and
-    bwrap should not be handed a symlink to mount over.
-    """
-    seen: list[str] = []
-    for entry in HARNESS_PATH.split(os.pathsep):
-        if not entry:
-            continue
-        real = pathlib.Path(entry).resolve()
-        if real.is_dir() and str(real) not in seen:
-            seen.append(str(real))
-    return [arg for d in seen for arg in ("--ro-bind", d, d)]
-
-
 def read_lend(scenario: pathlib.Path) -> list[str]:
     """HOME-relative paths the scenario's `lend` file names, one per line.
 
@@ -712,6 +694,181 @@ def mounts(argv: list[str]) -> list[tuple[str, str | None]]:
     return out
 
 
+def path_guard() -> list[str]:
+    """Bind every directory on the harness's own PATH outside the real HOME
+    read-only.
+
+    The grader runs outside the sandbox and resolves `python3`, `git`, `grep`
+    through this PATH, so a writable entry on it is a place the config under
+    test can plant an executable the harness will then run -- the same hijack
+    as $E2E_BIN, by a different directory. Measured: with a writable PATH entry
+    outside /tmp and outside REAL_HOME, a sandboxed shell wrote `python3` into
+    it and turned a grader's FAIL into `PASS: no canary was touched`.
+
+    Derived from PATH rather than naming paths, because the exposed directories
+    are the runner's, not this host's: on a GitHub hosted runner /usr/local/bin
+    and the hosted tool caches are owned by the unprivileged user the job runs
+    as, while on NixOS every entry already lives in the read-only store. Each
+    entry is resolved, because writability belongs to the real directory and
+    bwrap should not be handed a symlink to mount over.
+
+    An entry that resolves into the real HOME is not this guard's: the staged
+    HOME mounted over the real one hides it, and what of it the agent gets
+    back is a read-only row of the expose table (`expose_table()`).
+    """
+    seen: list[str] = []
+    for entry in HARNESS_PATH.split(os.pathsep):
+        if not entry:
+            continue
+        real = pathlib.Path(entry).resolve()
+        if _within(real, REAL_HOME):
+            continue
+        if real.is_dir() and str(real) not in seen:
+            seen.append(str(real))
+    return [arg for d in seen for arg in ("--ro-bind", d, d)]
+
+
+class Unexposable(Exception):
+    """A row of the expose table that cannot be lent as asked: the host has
+    no such path (ABSENT), or the staged HOME already holds its destination,
+    which the real one would shadow without a word. The run is INCONCLUSIVE,
+    save for an absent row the table marks optional."""
+
+    def __init__(self, path: pathlib.Path, why: str, *, absent: bool = False):
+        super().__init__(f"{path}: {why}")
+        self.absent = absent
+
+
+def _within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    return path == root or path.is_relative_to(root)
+
+
+def _hops(path: pathlib.Path, staged: pathlib.Path) -> tuple[list[str], pathlib.Path]:
+    """Walk absolute PATH on the host a component at a time, the way the
+    kernel resolves it. Returns the `--symlink` args that recreate every link
+    met on the way inside a hidden tree (the real HOME, under the staged one;
+    /tmp, under the private tmpfs) -- a link elsewhere is visible as it is --
+    and the link-free path PATH names, the one to mount.
+
+    Raises Unexposable for a component the host lacks, and for one in the real
+    HOME that the staged HOME (STAGED) already holds: as the destination
+    itself, or on the way as anything but the plain directory the host has."""
+    hidden = (REAL_HOME, pathlib.Path("/tmp"))
+    links: list[str] = []
+    todo = list(reversed(path.parts[1:]))  # next component on top
+    cur, hops = pathlib.Path("/"), 0
+    while todo:
+        name = todo.pop()
+        if name == "..":
+            cur = cur.parent
+            continue
+        nxt = cur / name
+        if nxt != REAL_HOME and nxt.is_relative_to(REAL_HOME):
+            mine = staged / nxt.relative_to(REAL_HOME)
+            if os.path.lexists(mine) and (not todo or nxt.is_symlink()
+                                          or mine.is_symlink() or not mine.is_dir()):
+                raise Unexposable(nxt, "the staged HOME already provides it; "
+                                       "lending the real one would shadow it")
+        if nxt.is_symlink():
+            hops += 1
+            if hops > 40:  # the kernel's own limit, give or take
+                raise Unexposable(path, "too many levels of symbolic links", absent=True)
+            target = os.readlink(nxt)
+            if any(_within(nxt, h) for h in hidden):
+                links += ["--symlink", target, str(nxt)]
+            parts = pathlib.PurePosixPath(target).parts
+            if os.path.isabs(target):
+                cur, parts = pathlib.Path("/"), parts[1:]
+            todo += reversed(parts)
+            continue
+        if not os.path.lexists(nxt):
+            raise Unexposable(path, "absent on the host", absent=True)
+        cur = nxt
+    return links, cur
+
+
+def expose(path: pathlib.Path, mode: str, staged: pathlib.Path) -> list[str]:
+    """The bwrap args that make host PATH reachable inside the sandbox at its
+    own path, the one routine every row of the expose table goes through (the
+    pattern of Flatpak's FlatpakExports): each symlink on the way is recreated
+    as the same link (`_hops()`), and its final target is bound -- `ro`
+    read-only, `rw` writable -- or, for `tmpfs`, hidden under an empty one.
+    Raises Unexposable when that cannot be done faithfully, and for the real
+    HOME or anything holding it: a row lends a path inside it, never all of it.
+    """
+    if _within(REAL_HOME, path):
+        raise Unexposable(path, "is the real HOME or holds it; a row lends "
+                                "a path inside it, never all of it")
+    links, real = _hops(path, staged)
+    if mode == "tmpfs":
+        return [*links, "--tmpfs", str(real)]
+    return [*links, "--bind" if mode == "rw" else "--ro-bind", str(real), str(real)]
+
+
+def _path_in_home() -> list[pathlib.Path]:
+    """The harness's PATH entries that lie in the real HOME, literally or once
+    resolved, by their literal path: the agent's PATH names that one
+    (~/.nix-profile/bin, a link). Not those in ~/.claude: the config under test
+    is the staged one, whose own bin/ sits beside what its scripts import
+    through `..` (ai-router: ../tools/ai-router by realpath; egress-sink:
+    ../egress_guard by abspath); the deployed bin lent alone would import from
+    a tree the sandbox does not have."""
+    config = REAL_HOME / ".claude"
+    out = []
+    for entry in HARNESS_PATH.split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        literal = pathlib.Path(entry)
+        both = (literal, literal.resolve())
+        if any(p != REAL_HOME and _within(p, REAL_HOME) for p in both) \
+                and not any(_within(p, config) for p in both):
+            out.append(literal)
+    return out
+
+
+def expose_table(*, claude: str, run: pathlib.Path, shared: pathlib.Path,
+                 lend: list[str] | tuple[str, ...] = ()
+                 ) -> list[tuple[pathlib.Path, str, bool]]:
+    """What the sandbox lends back over the staged HOME and the private /tmp,
+    in mount order: (host path, mode, required). Each row goes through
+    expose(). A required row the host lacks makes the run INCONCLUSIVE; an
+    optional one is skipped, which is no loss: the agent then finds nothing
+    there, as it would on the host. A row whose destination the staged HOME
+    already provides is INCONCLUSIVE either way.
+
+      row                          mode   required  why
+      LINKS: ~/.claude/.credentials.json  rw  no    auth; refresh writes it
+             ~/.claude/plugins     ro     no        the plugin cache
+             ~/Repos               ro     no        relative skill links land here
+             ~/.config/caveman     ro     no        caveman's own config
+      CHECKOUT_ROOTS: ~/worktrees  ro     no        MCP servers, nested runs
+      the scenario's `lend`        ro     yes       it asked for exactly these
+      PATH entries in HOME         ro     no        the agent's tools, by literal
+                                                    path (not ~/.claude's)
+      the scenario's out dir       tmpfs  yes       hides sibling runs under a
+                                                    lent root (--out ~/worktrees/x)
+      claude's real directory      ro     yes       the binary (its own file when
+                                                    straight in /tmp or HOME)
+      claude as run                ro     yes       every link of the chain to it
+      the run                      rw     yes       its own dir, workspace included
+      the shared log dir           rw     yes       E2E_SHARED, for nested runs
+      the run's home/              tmpfs  yes       one name for HOME: the staged
+                                                    HOME is reachable only as HOME
+    """
+    home, tmp = REAL_HOME, pathlib.Path("/tmp")
+    rows = [(home / rel, mode, False) for rel, mode in LINKS.items()]
+    rows += [(home / rel, "ro", False) for rel in CHECKOUT_ROOTS]
+    rows += [(home / rel, "ro", True) for rel in lend]
+    rows += [(p, "ro", False) for p in _path_in_home()]
+    rows.append((run.parents[1], "tmpfs", True))
+    exe = pathlib.Path(claude if os.path.isabs(claude) else shutil.which(claude) or claude)
+    real = exe.resolve()
+    rows += [(real if real.parent in (home, tmp) else real.parent, "ro", True),
+             (exe, "ro", True)]
+    rows += [(run, "rw", True), (shared, "rw", True), (run / "home", "tmpfs", True)]
+    return list(dict.fromkeys(rows))
+
+
 def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
               shared: pathlib.Path, work: pathlib.Path,
               lend: list[str] | tuple[str, ...] = ()) -> list[str]:
@@ -737,61 +894,32 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     every staged HOME under the broker's state dir, there for reviewers of run
     dirs, would otherwise deny the agent its own HOME. Docker, Flatpak and
     Bazel's linux-sandbox do the same: a mount whose destination is not its
-    source, so the policy never sees where the source lives.
+    source, so the policy never sees where the source lives. It is the only
+    name the staged HOME has inside: RUN/home, bound back with the run, is
+    hidden again, so a path baked from the host's view of it fails loudly.
 
     That mount hides all of the real HOME -- ~/.ssh, the account's state,
-    every other run under the broker's state dir. What a run needs of it is
-    bound back after it, at its own path: LINKS and CHECKOUT_ROOTS read-only
-    except the credentials file, writable as before for token refresh, what
-    the scenario's `lend` file names (`read_lend()`), the harness's PATH
-    (`path_guard()`), the claude binary, and last the run and the shared log
-    dir, which may themselves sit in the real HOME. check.sh, on the host,
-    gets these mounts as E2E_MOUNTS (`mounts()`), so a path the agent saw can
-    be told apart from the host file at that path (`_lib/sandbox_paths.py`).
+    every other run under the broker's state dir. What a run needs of it, and
+    of the private /tmp, is lent back by one table (`expose_table()`) through
+    one routine (`expose()`). check.sh, on the host, gets the mounts as
+    E2E_MOUNTS (`mounts()`), so a path the agent saw can be told apart from
+    the host file at that path (`_lib/sandbox_paths.py`).
+
+    Raises Unexposable when a row cannot be lent faithfully.
     """
-    home = REAL_HOME
-    lent = []
     # The credentials file is a mount point inside, not the replaceable link
     # it is without bwrap: a refresh that writes in place reaches the real
     # file, one that writes a temp file and renames it over gets EBUSY.
     # Measured with a decoy in its place: `mv ~/x ~/.claude/.credentials.json`
     # -> "Device or resource busy", `echo > ~/.claude/.credentials.json` -> ok.
-    for rel, target in LINKS.items():
-        if target.exists():
-            mode = "--bind" if rel == ".claude/.credentials.json" else "--ro-bind"
-            lent += [mode, str(target), str(home / rel)]
-    for root in CHECKOUT_ROOTS:
-        if root.is_dir():
-            lent += ["--ro-bind", str(root), str(root)]
-    # What the scenario's own `lend` file names (read_lend()): real-HOME state
-    # an MCP server inside the sandbox needs, the GitHub App host token for a
-    # broker, say. Only on request, never for every run: the agent under test
-    # can read whatever its servers can, and sandbox-canary plants a canary at
-    # that very token path in the staged HOME.
-    for rel in lend:
-        if (REAL_HOME / rel).exists():
-            lent += ["--ro-bind", str(REAL_HOME / rel), str(home / rel)]
-    # Hidden by the private /tmp or by the HOME mount otherwise: the binary's
-    # real directory, and the path bwrap execs, usually a link to it
-    # (~/.local/bin/claude). Straight in either, the binary alone comes back:
-    # its directory would be all of it. A link is recreated as the same link,
-    # not bound: its directory is usually on PATH as well, so path_guard() has
-    # already put the link back, and bwrap refuses to mount a file onto one
-    # ("Can't mount on symlink destination"); --symlink accepts an identical
-    # link already there. Its target is the real binary bound just before it.
-    exe_bind = []
-    hidden = (pathlib.Path("/tmp"), home)
-    real = pathlib.Path(claude).resolve()
-    run_by = [pathlib.Path(claude)] if os.path.isabs(claude) else []
-    for path in dict.fromkeys([real if real.parent in hidden else real.parent, *run_by]):
-        if not any(path.is_relative_to(h) for h in hidden):
-            continue
-        if path.is_symlink():
-            exe_bind += ["--symlink", os.readlink(path), str(path)]
-        else:
-            exe_bind += ["--ro-bind", str(path), str(path)]
-    # Last, so neither mount above nor a read-only ancestor bind shadows them.
-    binds = ["--bind", str(run), str(run), "--bind", str(shared), str(shared)]
+    staged, lent = run / "home", []
+    for path, mode, required in expose_table(claude=claude, run=run, shared=shared,
+                                             lend=lend):
+        try:
+            lent += expose(path, mode, staged)
+        except Unexposable as exc:
+            if required or not exc.absent:
+                raise
     # A private pid namespace with its own procfs. Dropping a variable from
     # the child's environment is not isolation while the child can read it
     # back out of an ancestor's /proc entry: the harness itself holds what the
@@ -811,9 +939,9 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     # with the token in hand; measured with a 3s timeout against `sleep 300`.
     return [shutil.which("bwrap"), "--dev-bind", "/", "/",
             "--unshare-pid", "--proc", "/proc", "--die-with-parent",
-            "--bind", str(run / "home"), str(home), *lent, *path_guard(),
-            "--tmpfs", "/tmp", *exe_bind, *binds,
-            "--setenv", "HOME", str(home), "--chdir", str(work), "--", *argv]
+            "--tmpfs", "/tmp", "--bind", str(staged), str(REAL_HOME),
+            *path_guard(), *lent,
+            "--setenv", "HOME", str(REAL_HOME), "--chdir", str(work), "--", *argv]
 
 
 def events_of(text: str) -> list[dict]:
@@ -1038,8 +1166,15 @@ def _run_one(scenario: pathlib.Path, arm: str, src: str, idx: int,
     if (run / "mcp.json").is_file():
         argv += ["--mcp-config", str(run / "mcp.json")]
     if bwrap:
-        argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work,
-                         lend=lend)
+        # After setup.sh, which may plant what a row would lend: that is
+        # exactly the shadowing expose() refuses.
+        try:
+            argv = sandboxed(argv, claude=args.claude, run=run, shared=shared, work=work,
+                             lend=lend)
+        except Unexposable as exc:
+            verdict.update(verdict="INCONCLUSIVE", why=f"sandbox: {exc}")
+            write_run_file(run, "verdict.json", json.dumps(verdict, indent=2))
+            return verdict
         script_env["E2E_MOUNTS"] = json.dumps(mounts(argv))
     verdict["isolated_tmp"] = bool(bwrap)
     t0 = time.monotonic()

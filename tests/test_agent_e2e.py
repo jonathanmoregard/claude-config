@@ -273,8 +273,10 @@ def test_the_sandbox_mounts_the_staged_home_at_the_real_home_path(tmp_path):
     dir, what the real HOME lends) comes after that mount: under it, one
     whose path is in the real HOME -- a broker run is -- would be hidden."""
     mod = _harness_module()
-    run = tmp_path / "run"
+    run = tmp_path / "out/sc/new/1"
     shared = tmp_path / "shared"
+    for d in (run / "work", run / "home", shared):
+        d.mkdir(parents=True)
     argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=shared,
                          work=run / "work")
     real = str(mod.REAL_HOME)
@@ -342,7 +344,7 @@ def test_a_run_under_the_real_home_sees_no_sibling_and_no_account_state(tmp_path
 {{ echo "sibling=$(test -e {sibling} && echo seen || echo hidden)"
    echo "parent=$(ls -A {out} 2>/dev/null | tr '\\n' ' ')"
    echo "claude_json=$(test -e {real}/.claude.json && echo seen || echo hidden)"
-   echo "own=$(test -d "$E2E_RUN/home/.claude" && echo seen || echo hidden)"; }} > "$E2E_SHARED/report"
+   echo "own=$(test -d "$HOME/.claude" && echo seen || echo hidden)"; }} > "$E2E_SHARED/report"
 """))
     sc = _scenario(tmp_path, "exit 0")
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
@@ -432,10 +434,13 @@ def test_check_maps_what_the_agent_saw_to_the_host(tmp_path, in_real_home):
     run's home/; check.sh runs on the host. A path the agent logged is
     translated through the run's own mounts (E2E_MOUNTS), so its HOME lands in
     RUN/home, the run dir -- here inside the real HOME, as the broker puts it
-    -- stays itself, and what the real HOME lends (~/Repos) stays real."""
+    -- stays itself, a second name for RUN/home maps to nothing, and what the
+    real HOME lends (here the scenario's `lend`) stays real."""
     _require_sandbox()
     import pwd as _pwd
     real = _pwd.getpwuid(os.getuid()).pw_dir
+    lent = in_real_home / "lent"
+    lent.mkdir()
     claude = fake_claude(tmp_path, _ok())
     sc = _scenario(tmp_path, f"""
 python3 - "$1" <<'PY'
@@ -446,10 +451,12 @@ run, home = sys.argv[1], os.environ["E2E_HOME"]
 print("home=" + home)
 print("staged=" + str(to_host(home + "/.claude/x")))
 print("run=" + str(to_host(run + "/marker")))
-print("repos=" + str(to_host("{real}/Repos/r")))
+print("lent=" + str(to_host("{lent}/r")))
+print("second=" + str(to_host(run + "/home/.claude/x")))
 print("tmp=" + str(to_host("/tmp/x")))
 PY
 """)
+    (sc / "lend").write_text(f"{lent.relative_to(real)}\n")
     out = in_real_home / "out"
     r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
                 "--out", str(out), "--claude", str(claude))
@@ -458,8 +465,8 @@ PY
     report = dict(line.split("=", 1) for line in (run / "check.log").read_text().splitlines()
                   if "=" in line)
     assert report == {"home": real, "staged": f"{run}/home/.claude/x",
-                      "run": f"{run}/marker", "repos": f"{real}/Repos/r",
-                      "tmp": "None"}, report
+                      "run": f"{run}/marker", "lent": f"{lent}/r",
+                      "second": "None", "tmp": "None"}, report
 
 
 def test_without_mounts_a_path_maps_to_itself(monkeypatch):
@@ -509,11 +516,194 @@ def test_a_lend_outside_home_or_of_all_of_it_is_refused(tmp_path, entry):
     assert "lend" in verdicts[0]["why"], verdicts
 
 
-def _sandbox_check_env(run: pathlib.Path, bwrap: bool) -> dict:
-    """The env check.sh gets from the harness for RUN, with or without bwrap."""
+# What the sandbox lends back of the real HOME goes through one routine
+# (expose()): every symlink hop on the way is recreated inside, the target is
+# bound at its own path, and a source that is not there, or a destination the
+# staged HOME already holds, stops the run rather than being dropped.
+
+def _report(out: pathlib.Path) -> dict:
+    return dict(line.split("=", 1)
+                for line in (out / "sc/new/1/shared/report").read_text().splitlines())
+
+
+@pytest.mark.parametrize("on_path", [True, False], ids=["first-hop-on-PATH", "off-PATH"])
+def test_a_two_hop_claude_chain_execs(tmp_path, in_real_home, on_path):
+    """~/a/claude -> ~/b/claude -> the binary, with ~/b on no PATH: every
+    hop is in the hidden real HOME, so each one has to be recreated inside
+    or bwrap execs a dangling link."""
+    _require_sandbox()
+    (in_real_home / "versions").mkdir()
+    fake_claude(in_real_home / "versions", _ok(), name="1.0")
+    for d, target in (("b", "../versions/1.0"), ("a", "../b/claude")):
+        (in_real_home / d).mkdir()
+        (in_real_home / d / "claude").symlink_to(target)
+    path = os.environ.get("PATH", "")
+    env = {**os.environ, "PATH": f"{in_real_home / 'a'}:{path}" if on_path else path}
+    sc = _scenario(tmp_path, "exit 0")
+    r, out, verdicts = _run(tmp_path, sc, in_real_home / "a/claude", env=env)
+    stderr = [p.read_text() for p in out.glob("*/*/*/stderr.txt")]
+    assert [v["verdict"] for v in verdicts] == ["PASS"], (r.stdout, stderr)
+
+
+def test_a_symlinked_path_dir_in_home_stays_on_path(tmp_path, in_real_home):
+    """A PATH entry in the real HOME that is a link (~/.nix-profile/bin) is
+    on the agent's PATH by that literal name; lending only what it resolves
+    to takes its tools off PATH."""
+    _require_sandbox()
+    (in_real_home / "realbin").mkdir()
+    tool = in_real_home / "realbin/e2e-pathtool"
+    tool.write_text("#!/bin/sh\necho pathtool-ok\n")
+    tool.chmod(0o755)
+    (in_real_home / "linkbin").symlink_to("realbin")
+    env = {**os.environ, "PATH": f"{in_real_home / 'linkbin'}:{os.environ.get('PATH', '')}"}
+    claude = fake_claude(tmp_path, _ok("""
+{ echo "found=$(command -v e2e-pathtool)"
+  echo "ran=$(e2e-pathtool 2>&1)"; } > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    _, out, verdicts = _run(tmp_path, sc, claude, env=env)
+    assert [v["verdict"] for v in verdicts] == ["PASS"], verdicts
+    assert _report(out) == {"found": str(in_real_home / "linkbin/e2e-pathtool"),
+                            "ran": "pathtool-ok"}
+
+
+def test_a_config_bin_on_path_imports_its_own_tools(tmp_path):
+    """~/.claude/bin is on PATH, and its scripts import their siblings through
+    `..`: ai-router by realpath (../tools/ai-router), egress-sink by abspath
+    (../egress_guard). Inside, that bin is the candidate's own, staged from the
+    same tree as what it imports, so both shapes resolve -- the deployed bin
+    lent alone would import from a tree that is not there."""
+    _require_sandbox()
+    real = _harness_module().REAL_HOME
+    cfg = tmp_path / "cfg"
+    (cfg / "bin").mkdir(parents=True)
+    (cfg / "tools/standin").mkdir(parents=True)
+    (cfg / "tools/standin/standin_real.py").write_text("VALUE = 'by-realpath'\n")
+    (cfg / "standin_abs").mkdir()
+    (cfg / "standin_abs/__init__.py").write_text("VALUE = 'by-abspath'\n")
+    for name, root in (("e2e-standin-real", 'os.path.join(os.path.dirname(os.path.dirname('
+                        'os.path.realpath(__file__))), "tools", "standin")'),
+                       ("e2e-standin-abs", 'os.path.dirname(os.path.dirname('
+                        'os.path.abspath(__file__)))')):
+        mod_name = "standin_real" if name.endswith("real") else "standin_abs"
+        script = cfg / "bin" / name
+        script.write_text(f"#!/usr/bin/env python3\nimport os, sys\nsys.path.insert(0, {root})\n"
+                          f"import {mod_name}\nprint({mod_name}.VALUE)\n")
+        script.chmod(0o755)
+    env = {**os.environ, "PATH": f"{real}/.claude/bin:{os.environ.get('PATH', '')}"}
+    claude = fake_claude(tmp_path, _ok("""
+{ echo "real=$(e2e-standin-real 2>&1 | tail -1)"
+  echo "abs=$(e2e-standin-abs 2>&1 | tail -1)"; } > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude), env=env)
+    assert r.returncode == 0, r.stderr
+    assert _report(out) == {"real": "by-realpath", "abs": "by-abspath"}
+
+
+def test_an_absent_lend_is_inconclusive(tmp_path, in_real_home):
+    """A scenario that lends a path the host does not have (a typo, `~/x`)
+    asked for something the run will not get: no verdict, and the message
+    names the entry."""
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    rel = (in_real_home / "not-there").relative_to(_harness_module().REAL_HOME)
+    (sc / "lend").write_text(f"{rel}\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert str(rel) in verdicts[0]["why"] and "absent" in verdicts[0]["why"], verdicts
+
+
+def test_a_lend_the_staged_home_already_holds_is_inconclusive(tmp_path, in_real_home):
+    """setup.sh planted the path in the staged HOME and `lend` names it too:
+    binding the real one over it would shadow the plant without a word."""
+    _require_sandbox()
+    (in_real_home / "lent").mkdir()
+    rel = (in_real_home / "lent").relative_to(_harness_module().REAL_HOME)
+    claude = fake_claude(tmp_path, _ok())
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "setup.sh").write_text(f'#!/usr/bin/env bash\nmkdir -p "$HOME/{rel}"\n')
+    (sc / "lend").write_text(f"{rel}\n")
+    _, _, verdicts = _run(tmp_path, sc, claude)
+    assert verdicts[0]["verdict"] == "INCONCLUSIVE", verdicts
+    assert str(rel) in verdicts[0]["why"] and "staged HOME" in verdicts[0]["why"], verdicts
+
+
+def test_a_staged_plugins_dir_is_not_shadowed(tmp_path):
+    """An arm whose config carries plugins/ provides ~/.claude/plugins itself;
+    the real plugin cache is not bound over it."""
     mod = _harness_module()
+    mod.REAL_HOME = tmp_path / "realhome"
+    (mod.REAL_HOME / ".claude/plugins/real").mkdir(parents=True)
+    run = tmp_path / "out/sc/new/1"
+    (run / "home/.claude/plugins/staged").mkdir(parents=True)
+    (run / "work").mkdir()
+    with pytest.raises(mod.Unexposable, match=r"\.claude/plugins.*staged HOME"):
+        mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
+                      work=run / "work")
+
+
+def test_the_run_dir_holds_no_second_name_for_home(tmp_path):
+    """Only the real HOME's path names the staged HOME inside: RUN/home is
+    empty there, so a path baked from the host's view of it fails loudly
+    instead of reaching the same files off-policy. $HOME works, and what is
+    written there lands in RUN/home on the host."""
+    _require_sandbox()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "settings.json").write_text("{}\n")
+    claude = fake_claude(tmp_path, _ok("""
+{ echo "second=$(ls -A "$E2E_RUN/home" 2>/dev/null | wc -l)"
+  echo "home=$(test -f "$HOME/.claude/settings.json" && echo ok || echo missing)"
+  echo w > "$HOME/written"; } > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    out = tmp_path / "out"
+    r = harness("run", str(sc), "--arm", f"new={cfg}", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    assert _report(out) == {"second": "0", "home": "ok"}
+    assert (out / "sc/new/1/home/written").read_text() == "w\n"
+
+
+def test_a_sibling_run_under_a_lent_root_is_unreachable(tmp_path, in_real_home):
+    """--out under a lent root (~/worktrees, where git-broker-publish-watch
+    must run): the root comes back read-only, but the scenario's own out dir
+    is hidden again inside, save this run, so another arm's or sample's
+    staged home is not readable through the lend."""
+    _require_sandbox()
+    lent = in_real_home / "lent"
+    out = lent / "out"
+    sibling = out / "sc/old/1/home/.claude.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("{}\n")
+    (lent / "beside").write_text("b\n")
+    claude = fake_claude(tmp_path, _ok(f"""
+{{ echo "sibling=$(test -e {sibling} && echo seen || echo hidden)"
+   echo "lent=$(cat {lent}/beside 2>/dev/null || echo hidden)"
+   echo "own=$(test -d "$E2E_RUN/work" && echo seen || echo hidden)"; }} > "$E2E_SHARED/report"
+"""))
+    sc = _scenario(tmp_path, "exit 0")
+    (sc / "lend").write_text(f"{lent.relative_to(_harness_module().REAL_HOME)}\n")
+    r = harness("run", str(sc), "--arm", "new=HEAD", "--n", "1", "--jobs", "1",
+                "--out", str(out), "--claude", str(claude))
+    assert r.returncode == 0, r.stderr
+    assert _report(out) == {"sibling": "hidden", "lent": "b", "own": "seen"}
+
+
+def _sandbox_check_env(run: pathlib.Path, bwrap: bool,
+                       real_home: pathlib.Path | None = None) -> dict:
+    """The env check.sh gets from the harness for RUN, with or without bwrap,
+    on a host whose HOME is REAL_HOME (default: this account's)."""
+    mod = _harness_module()
+    if real_home is not None:
+        mod.REAL_HOME = real_home
     env = {**os.environ, "HOME": str(run / "home"), "E2E_RUN": str(run)}
     env.pop("E2E_MOUNTS", None)
+    for d in (run / "work", run / "home", run / "shared"):
+        d.mkdir(parents=True, exist_ok=True)
     if not bwrap:
         return {**env, "E2E_HOME": str(run / "home")}
     argv = mod.sandboxed(["true"], claude="/bin/sh", run=run, shared=run / "shared",
@@ -529,12 +719,16 @@ def _sandbox_check_env(run: pathlib.Path, bwrap: bool) -> dict:
 def test_tests_out_of_projection_places_the_suite_the_agent_ran(tmp_path, bwrap, where, want):
     """The pytest stub logs its cwd as the agent saw it. A suite run inside the
     agent's own ~/.claude is the staged projection (FAIL) whichever path that
-    HOME had; one under the lent ~/Repos is the host's checkout (PASS)."""
+    HOME had; one under the lent ~/Repos is the host's checkout (PASS). The
+    host is a staged one with its own ~/Repos, so the case holds on a runner
+    that has none."""
+    host = tmp_path / "realhome"
+    (host / "Repos/claude-config/runtime/tools/ai-router").mkdir(parents=True)
     run = tmp_path / "sc/old/1"
     (run / "home/.claude/tools/ai-router").mkdir(parents=True)
     if not bwrap:  # stage() links ~/Repos in then; under bwrap it is bound
-        (run / "home/Repos").symlink_to(_harness_module().REAL_HOME / "Repos")
-    env = _sandbox_check_env(run, bwrap)
+        (run / "home/Repos").symlink_to(host / "Repos")
+    env = _sandbox_check_env(run, bwrap, host)
     seen = env["E2E_HOME"]
     (run / "suite-calls.txt").write_text(f"{seen}/{where}\t-q tests\n")
     (run / "commands.txt").write_text(f"ls ~/.claude/tools\ncd {seen}/{where} && pytest -q tests\n")
