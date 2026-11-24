@@ -111,6 +111,29 @@ def test_grader_that_cannot_load_is_inconclusive(run, tmp_path) -> None:
     assert proc.returncode == 2, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("wrong,fault,want", [(None, False, 0), (2, False, 1), (None, True, 2)])
+def test_selftest_exit_code(monkeypatch, capsys, wrong, fault, want) -> None:
+    """judge_selftest.py: 0 when every case gets its fields, 1 on a wrong
+    verdict, 2 when the judge fails. The model is stubbed inside judge.py."""
+    monkeypatch.syspath_prepend(str(JUDGE.parent / ".." / "_lib"))
+    monkeypatch.syspath_prepend(str(JUDGE.parent))
+    monkeypatch.delitem(sys.modules, "judge", raising=False)
+    import judge as mod
+    selftest = JUDGE.parent / "judge_selftest.py"
+    cases = runpy.run_path(str(selftest), run_name="cases")["CASES"]
+
+    def stub(prompt, schema):
+        if fault:
+            raise mod.Inconclusive("stub")
+        i = next(n for n, (_, _, answer) in enumerate(cases) if answer in prompt)
+        repo, directory, _ = cases[i]
+        return {"repo": "other" if i == wrong else repo, "directory": directory, "quote": "q"}
+    monkeypatch.setattr(mod, "judge", stub)
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(selftest), run_name="__main__")
+    assert exc.value.code == want, capsys.readouterr().out
+
+
 @pytest.mark.parametrize("repo,code,want", [
     ("claude-config", 0, 0), ("ai-client-config", 0, 1), ("claude-config", 1, 2)])
 def test_check_sh_passes_the_exit_code_through(run, monkeypatch, tmp_path, repo, code, want) -> None:

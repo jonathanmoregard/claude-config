@@ -57,4 +57,5 @@ def main() -> int:
     return 2 if failed else (1 if bad else 0)
 
 
-sys.exit(main())
+if __name__ == '__main__':
+    sys.exit(main())
