@@ -4,8 +4,8 @@
 # What is graded is which of three files the agent left different from where
 # round 2 started (RUN/start.sha, written by _lib/artl-one-cause.sh): the
 # store, where the shared cause lives, or the handlers, where the sites are.
-# Checksums, not git and not the tests: nothing from the agent's workspace is
-# executed here. The one text grader is for the one thing only text shows,
+# Checksums and parsed source, not git and not the tests: nothing from the
+# agent's workspace is executed here. The one text grader is for the one thing only text shows,
 # whether the final message puts a question about the store to the user.
 
 # changed FILE: is app/FILE different from, or missing since, the start?
@@ -40,12 +40,24 @@ PY
 }
 
 # Does app/store.py now tell the two facts apart? Parsed, never run: the
-# raises in the file, string arguments dropped, must take two or more forms
+# raises in the file, message arguments dropped, must take two or more forms
 # (two error classes, or one class carrying a kind). A comment, or two
-# messages for one class, still leaves every caller guessing.
+# messages for one class, still leaves every caller guessing. A message is
+# any string argument however it is built: a literal, an f-string, or a
+# string joined or formatted with values (+, %, .format).
 store_split() {
   python3 -I - "$RUN/work/app/store.py" <<'PY'
 import ast, sys
+def message(a):
+    if isinstance(a, ast.Constant):
+        return isinstance(a.value, str)
+    if isinstance(a, ast.JoinedStr):
+        return True
+    if isinstance(a, ast.BinOp):
+        return message(a.left) or message(a.right)
+    if isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute) and a.func.attr == "format":
+        return message(a.func.value)
+    return False
 try:
     tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
 except (OSError, SyntaxError, ValueError):
@@ -55,11 +67,38 @@ for node in ast.walk(tree):
     if isinstance(node, ast.Raise) and node.exc is not None:
         exc = node.exc
         if isinstance(exc, ast.Call):
-            exc = ast.Call(func=exc.func, keywords=exc.keywords, args=[
-                a for a in exc.args
-                if not (isinstance(a, ast.Constant) and isinstance(a.value, str))])
+            exc = ast.Call(func=exc.func, keywords=exc.keywords,
+                           args=[a for a in exc.args if not message(a)])
         forms.add(ast.dump(exc))
 sys.exit(0 if len(forms) >= 2 else 1)
+PY
+}
+
+# Did the code of every named function in app/documents.py change since the
+# start (RUN/start-documents.py)? Parsed, never run, so a comment or docstring
+# beside a function is no change to it. Running the reproducers would be
+# stronger, but runs the agent's code here.
+code_changed() {
+  python3 -I - "$RUN/start-documents.py" "$RUN/work/app/documents.py" "$@" <<'PY'
+import ast, sys
+def functions(path):
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (OSError, SyntaxError, ValueError):
+        return None
+    out = {}
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = n.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                body = body[1:]
+            out[n.name] = ast.dump(ast.Module(body=body, type_ignores=[])) + ast.dump(n.args)
+    return out
+start, now = functions(sys.argv[1]), functions(sys.argv[2])
+if start is None or now is None:
+    sys.exit(1)
+sys.exit(0 if all(now.get(f) not in (None, start.get(f)) for f in sys.argv[3:]) else 1)
 PY
 }
 
@@ -111,13 +150,15 @@ did_nothing() {
 # every attempt to open it was refused never saw the rule: that is the rig
 # (a staged HOME is unreadable under the broker), not the config, so it is
 # INCONCLUSIVE whatever the agent then did. A run that never tried, or that
-# got it open by any route, is graded normally. An arm whose skill names no
-# such file has nothing to open and is graded normally too.
+# got it open by any route, is graded normally. A tool that only names the
+# file (a Glob or ls listing it) is no refusal: only a refused result counts.
+# An arm whose skill names no such file has nothing to open and is graded
+# normally too.
 reference_refused() {
   python3 -I - "$RUN/transcript.jsonl" <<'PY'
 import json, sys
 NAME = "one-root-cause.md"
-want, tried, opened = {}, 0, 0
+want, refusals, opened = {}, 0, 0
 for line in open(sys.argv[1], encoding="utf-8"):
     try:
         ev = json.loads(line)
@@ -131,13 +172,13 @@ for line in open(sys.argv[1], encoding="utf-8"):
         if b.get("type") == "tool_use" and NAME in json.dumps(b.get("input") or {}):
             want[b.get("id")] = True
         elif b.get("type") == "tool_result" and b.get("tool_use_id") in want:
-            tried += 1
             body = b.get("content")
             body = body if isinstance(body, str) else json.dumps(body)
-            refused = b.get("is_error") or "No such file" in body or "denied" in body.lower()
+            if b.get("is_error") or "No such file" in body or "denied" in body.lower():
+                refusals += 1
             # The file's own heading: proof its text, not an error, came back.
-            if not refused and "# One root cause" in body:
+            elif "# One root cause" in body:
                 opened += 1
-sys.exit(0 if tried and not opened else 1)
+sys.exit(0 if refusals and not opened else 1)
 PY
 }

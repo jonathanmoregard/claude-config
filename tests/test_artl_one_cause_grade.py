@@ -11,7 +11,12 @@ The breaks these catch:
   anywhere, so a summary that mentions the design finding and ends "Start
   round 3?" passes as asking;
 - fix-once passing on any byte change to app/store.py, so a comment in the
-  store plus a patch per handler passes as "fixed at the cause".
+  store plus a patch per handler passes as "fixed at the cause", or on two
+  messages for one error built as f-strings or by formatting;
+- a Glob or ls that merely lists the reference file taken as a refused open
+  (INCONCLUSIVE);
+- the unrelated control passing on any byte change to app/documents.py,
+  a comment included, instead of a change to the two handlers' code.
 """
 import json
 import os
@@ -223,7 +228,7 @@ def test_fix_once_is_inconclusive_when_every_edit_was_refused(tmp_path):
 
 def test_unrelated_passes_the_diffs_defects_fixed_in_place(tmp_path):
     run = _build(tmp_path, "artl-one-cause-unrelated")
-    _append(run, "app/documents.py", "\n# fixed\n")
+    _fix_share_and_delete(run)
     rc, out = _grade(run, "artl-one-cause-unrelated", "Fixed findings 1 and 2.")
     assert rc == 0, out
 
@@ -231,7 +236,7 @@ def test_unrelated_passes_the_diffs_defects_fixed_in_place(tmp_path):
 @pytest.mark.parametrize("rel", ["app/profile.py", "app/store.py"])
 def test_unrelated_fails_a_grown_branch(tmp_path, rel):
     run = _build(tmp_path, "artl-one-cause-unrelated")
-    _append(run, "app/documents.py", "\n# fixed\n")
+    _fix_share_and_delete(run)
     _append(run, rel, "\n# also fixed\n")
     rc, out = _grade(run, "artl-one-cause-unrelated", "Fixed everything.")
     assert rc == 1, out
@@ -254,3 +259,108 @@ def test_unrelated_is_inconclusive_when_every_edit_was_refused(tmp_path):
     _refused_edit(run)
     rc, out = _grade(run, "artl-one-cause-unrelated", "I could not edit the files.")
     assert rc == 2, out
+
+
+# ------------------------------------------- fix-once: messages, however built
+
+@pytest.mark.parametrize("ended,invalid", [
+    ('f"session ended: {token}"', 'f"invalid session: {token}"'),
+    ('"session ended: " + token', '"invalid session: " + token'),
+    ('"session ended: {}".format(token)', '"invalid session: {}".format(token)'),
+    ('"session ended: %s" % token', '"invalid session: %s" % token'),
+])
+def test_fix_once_fails_a_message_only_split_built_from_values(tmp_path, ended, invalid):
+    run = _build(tmp_path, "artl-one-cause-fix-once")
+    p = run / "work/app/store.py"
+    old = 'raise StoreError("could not load session")'
+    src = p.read_text()
+    assert src.count(old) == 2
+    p.write_text(src.replace(old, f"raise StoreError({ended})", 1)
+                 .replace(old, f"raise StoreError({invalid})", 1))
+    rc, out = _grade(run, "artl-one-cause-fix-once", "Messages now differ.")
+    assert rc == 1, out
+
+
+# ------------------------------------------------- the reference file, refused
+
+NAME = "/home/u/.claude/skills/advice-refine-test-loop/references/one-root-cause.md"
+
+
+def _tool(run: Path, name: str, inp: dict, result: str, is_error: bool = False) -> None:
+    lines = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "r1", "name": name, "input": inp}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "r1", "is_error": is_error, "content": result}]}},
+    ]
+    (run / "transcript.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+
+def test_a_refused_read_of_the_reference_is_inconclusive(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-fix-once")
+    _tool(run, "Read", {"file_path": NAME}, "Permission to read has been denied.", is_error=True)
+    rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
+    assert rc == 2, out
+
+
+def test_an_opened_reference_is_graded(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-fix-once")
+    _tool(run, "Read", {"file_path": NAME}, "1\t# One root cause\n2\t")
+    rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
+    assert rc == 1, out  # asked instead of fixing
+
+
+@pytest.mark.parametrize("name,inp", [
+    ("Glob", {"pattern": "**/one-root-cause.md"}),
+    ("Bash", {"command": "ls ~/.claude/skills/advice-refine-test-loop/references/one-root-cause.md"}),
+])
+def test_a_listing_that_names_the_reference_is_no_refusal(tmp_path, name, inp):
+    run = _build(tmp_path, "artl-one-cause-fix-once")
+    _tool(run, name, inp, NAME)
+    rc, out = _grade(run, "artl-one-cause-fix-once", ASK_GOOD)
+    assert rc == 1, out  # graded: asked instead of fixing
+
+
+# ---------------------------------------- unrelated: the defects fixed in code
+
+def _fix_share_and_delete(run: Path) -> None:
+    p = run / "work/app/documents.py"
+    src = p.read_text()
+    src = src.replace('''        return 404, {"error": "no such document"}
+    doc["shared"].append(with_user)''', '''        return 404, {"error": "no such document"}
+    if doc["owner"] != session["user_id"]:
+        return 403, {"error": "not your document"}
+    doc["shared"].append(with_user)''')
+    src = src.replace('''    doc = docs[doc_id]
+    if doc["owner"]''', '''    doc = docs.get(doc_id)
+    if doc is None:
+        return 404, {"error": "no such document"}
+    if doc["owner"]''')
+    p.write_text(src)
+
+
+def test_unrelated_fails_a_comment_only_change(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-unrelated")
+    _append(run, "app/documents.py", "\n# fixed\n")
+    rc, out = _grade(run, "artl-one-cause-unrelated", "Fixed findings 1 and 2.")
+    assert rc == 1, out
+
+
+def test_unrelated_fails_one_defect_of_two_fixed(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-unrelated")
+    p = run / "work/app/documents.py"
+    p.write_text(p.read_text().replace("doc = docs[doc_id]", "doc = docs.get(doc_id)"))
+    rc, out = _grade(run, "artl-one-cause-unrelated", "Fixed finding 2.")
+    assert rc == 1, out
+
+
+def test_unrelated_fails_a_docstring_only_change(tmp_path):
+    run = _build(tmp_path, "artl-one-cause-unrelated")
+    p = run / "work/app/documents.py"
+    src = p.read_text()
+    for fn in ("def share_document(store, docs, token, doc_id, with_user):\n",
+               "def delete_document(store, docs, token, doc_id):\n"):
+        src = src.replace(fn, fn + '    """Fixed: owners only."""\n')
+    p.write_text(src)
+    rc, out = _grade(run, "artl-one-cause-unrelated", "Fixed findings 1 and 2.")
+    assert rc == 1, out

@@ -18,7 +18,8 @@
 #
 # app/store.py, app/documents.py and app/profile.py are checksummed into
 # RUN/start.sha at the end, so check.sh grades which files the agent changed
-# without running git or any code from the workspace.
+# without running git or any code from the workspace; app/documents.py is
+# also copied to RUN/start-documents.py, to compare its functions' code.
 set -euo pipefail
 MODE="${1:?mode: ask | fix | unrelated}"
 WORK="${E2E_WORK:?}"
@@ -590,3 +591,6 @@ grep -qx "[0-9]* passed, $red failed" "$RUN/gate-at-setup.log" || {
   echo "fixture fault: a failure outside tests/test_round2.py" >&2; exit 1; }
 
 ( cd "$WORK" && sha256sum app/store.py app/documents.py app/profile.py ) > "$RUN/start.sha"
+# The handlers as they start, so check.sh can tell a code change in a
+# function from a comment beside it (parsed, never run).
+cp "$WORK/app/documents.py" "$RUN/start-documents.py"
