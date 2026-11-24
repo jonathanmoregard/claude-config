@@ -678,6 +678,11 @@ def sandboxed(argv: list[str], *, claude: str, run: pathlib.Path,
     """
     home = REAL_HOME
     lent = []
+    # The credentials file is a mount point inside, not the replaceable link
+    # it is without bwrap: a refresh that writes in place reaches the real
+    # file, one that writes a temp file and renames it over gets EBUSY.
+    # Measured with a decoy in its place: `mv ~/x ~/.claude/.credentials.json`
+    # -> "Device or resource busy", `echo > ~/.claude/.credentials.json` -> ok.
     for rel, target in LINKS.items():
         if target.exists():
             mode = "--bind" if rel == ".claude/.credentials.json" else "--ro-bind"

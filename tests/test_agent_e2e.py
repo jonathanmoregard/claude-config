@@ -151,8 +151,8 @@ def _scenario(tmp_path, check_body: str) -> pathlib.Path:
 # `--dev-bind / / --unshare-all` was measured succeeding on a runner that then
 # failed all eleven cases a second time: the binary is there, namespaces work,
 # and what the runner lacked was a `~/.ssh` for the harness to shadow. That was
-# the harness's defect, fixed where it lives; the probe now at least covers the
-# read-only bind of the real HOME that the shadowing stacks on.
+# the harness's defect, fixed where it lives; the probe now runs the argv
+# sandboxed() itself builds, so it covers every mount a run stacks.
 # Cached, because nine call sites would otherwise fork nine times.
 _SANDBOX_OK = None
 
@@ -161,17 +161,24 @@ def _require_sandbox():
     """Skip unless bubblewrap can really build a sandbox on this machine."""
     global _SANDBOX_OK
     if _SANDBOX_OK is None:
-        import pwd as _pwd
         import shutil as _sh
+        import tempfile
         bwrap = _sh.which("bwrap")
-        home = _pwd.getpwuid(os.getuid()).pw_dir
         if bwrap is None:
             _SANDBOX_OK = (False, "bubblewrap not on PATH")
         else:
+            # The harness's own argv, so the probe cannot drift from the
+            # mounts a run really asks for (the staged HOME over the real one,
+            # and everything bound back over that).
+            base = pathlib.Path(tempfile.mkdtemp(prefix="agent-e2e-probe-"))
+            run = base / "run"
+            for d in (run / "home", run / "work", base / "shared"):
+                d.mkdir(parents=True)
+            argv = _harness_module().sandboxed(
+                ["true"], claude=str(pathlib.Path(_sh.which("true")).resolve()),
+                run=run, shared=base / "shared", work=run / "work")
             try:
-                p = subprocess.run([bwrap, "--dev-bind", "/", "/",
-                                    "--ro-bind", home, home, "--tmpfs", "/tmp",
-                                    "true"], capture_output=True, text=True, timeout=30)
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
                 _SANDBOX_OK = (
                     p.returncode == 0,
                     "bubblewrap is present but cannot build the harness's "
@@ -181,6 +188,8 @@ def _require_sandbox():
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 _SANDBOX_OK = (False, f"bubblewrap probe failed: {exc!r}")
+            finally:
+                shutil.rmtree(base, ignore_errors=True)
     ok, why = _SANDBOX_OK
     if not ok:
         pytest.skip(why)

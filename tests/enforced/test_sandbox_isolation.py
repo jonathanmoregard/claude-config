@@ -207,7 +207,7 @@ def test_the_run_cannot_write_a_directory_on_the_graders_path(tmp_path, monkeypa
     # by the unprivileged user the job runs as, while here every PATH entry is
     # already in the read-only store. So the writable entry is supplied: made
     # outside /tmp, which the sandbox replaces with a private tmpfs, and
-    # outside the real HOME, which is bound read-only already.
+    # outside the real HOME, where the staged HOME is mounted over it.
     sysbin = pathlib.Path(tempfile.mkdtemp(prefix="e2e-path-probe-", dir="/var/tmp"))
     try:
         monkeypatch.setenv("PATH", f"{sysbin}{os.pathsep}{os.environ['PATH']}")
