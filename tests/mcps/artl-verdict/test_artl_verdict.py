@@ -123,3 +123,19 @@ def test_the_real_schema_is_fully_understood():
     sys.path.insert(0, str(REPO / "runtime" / "hooks"))
     import artl_verdict
     assert artl_verdict.problems(BLOCKS) == []
+
+
+# Break: an MCP tool an agent whitelists but settings never allow. Headless,
+# the call is denied (measured: artl-gate-no-evidence e2e, 2026-11-26, the
+# advisor's submit_verdict refused and no verdict recorded).
+def test_every_mcp_tool_an_agent_whitelists_is_allowed():
+    import fnmatch
+    import re
+    settings = json.loads((REPO / "runtime" / "settings.json").read_text())
+    allow = [r for r in settings["permissions"]["allow"] if r.startswith("mcp__")]
+    for agent in (REPO / "runtime" / "agents").glob("*.md"):
+        head = agent.read_text().split("---")[1]
+        tools = re.search(r"^tools:\s*(\[.*\])\s*$", head, re.M)  # regex-ok: frontmatter line we own
+        for tool in json.loads(tools.group(1)) if tools else []:
+            if tool.startswith("mcp__"):
+                assert any(fnmatch.fnmatchcase(tool, r) for r in allow), f"{agent.name}: {tool}"

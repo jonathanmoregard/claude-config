@@ -160,6 +160,7 @@
       "mcp__klaffat-app-runner__*",
       "mcp__git_broker__*",
       "mcp__agent_e2e_broker__run",
+      "mcp__artl_verdict__submit_verdict",
       "mcp__jobs_broker__*",
       "mcp__github__*",
       "mcp__home-assistant__ha_call_service",
