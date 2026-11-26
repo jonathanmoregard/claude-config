@@ -1,6 +1,6 @@
 ---
 name: fix-the-producer
-description: Use when code you own parses, or patches its parsing of, output that is messy, varies run to run, or misses a case — "my regex missed a case again", "the model added extra text", "it returned a label we don't handle", "I'll strip/normalize it first" — and especially when it reads a verdict, label, score or field out of a model's reply (`claude -p`, `codex exec`, an API completion, a subagent, an LLM classifier or judge) or another script's output, and you control the prompt or the call. Change the producer to answer through a schema-enforced channel; do not patch the reader.
+description: Use when code you own parses, or patches its parsing of, output that is messy, varies run to run, or misses a case — "my regex missed a case again", "the model added extra text", "it returned a label we don't handle", "I'll strip/normalize it first" — and especially when it reads a verdict, label, score or field out of a model's reply (`claude -p`, `codex exec`, an API completion, a subagent, an LLM classifier or judge) or another script's output, and you control the prompt or the call.
 ---
 
 # Fix the producer
