@@ -33,15 +33,21 @@ Keep the buckets apart in the prompt. A design finding dressed as a defect
 wastes a reproduction attempt and comes back "could not reproduce", which is
 the wrong answer to a question nobody asked empirically.
 
+G12 is **advisory**: its findings are listed in the report and the ledger.
+They never block, never reopen a round, and ask the user for nothing.
+
 ## Keeping the list short
 
-The list holds only classes that reproduce. G1–G8, G10 and G12 were dropped
-on 2026-11-24: across every repository's ledger they found 1 reproduced defect
-in 47 runs, against 99 of 165 for G9. Ids are not reused.
+The list holds only classes that earn their place, and the measure depends on
+the bucket. A defect class counts reproduced findings. A design class counts
+advisory findings the user took (`fixed` = `yes`): design findings are never
+reproduced by construction, so counting reproductions would drop every one.
+G3–G8 were dropped on 2026-11-24: across every repository's ledger they had 1
+reproduced defect and no advice taken in 20 rows. Ids are not reused.
 
 Do not add always-on checklist lines here or in the reviewer prompts. A finding
 that keeps coming back becomes a lint rule or a test. A new class needs a
-narrow `When` and ledger rows showing it reproduces.
+narrow `When` and ledger rows showing it earns its place by that measure.
 
 ## Defect classes
 
@@ -109,6 +115,29 @@ it should not.
 
 ## Design classes
 
+### G1 — Parse, don't validate
+
+**When:** code a type checker runs on as part of the project gate. Skip this
+class everywhere else: the fix is a type something enforces. In such code:
+any value a function must check before using it, and any enum, status or
+kind that the diff adds a case to or branches on.
+**Hunt:** A value checked and then passed on in its unchecked type, so every
+later caller must trust that the check already happened. Name the type that
+would tell a checked value from an unchecked one. Also look for a set of
+cases that should be a sum type matched exhaustively but is not: a string or
+integer compared against literals, or an enum handled with a wildcard or
+`default` branch. Name the code and the new case it would silently accept.
+
+### G2 — Wire format past its boundary
+
+**When:** typed and checked as G1 requires. Every boundary a wire format
+enters — JSON, forms, query strings, headers, env vars, config files,
+database rows, external API replies.
+**Hunt:** A JSON value, dict, map or raw string travelling inward: read by
+business logic, or forwarded down by a handler that could have parsed it.
+Untyped belongs at the outermost edge, parsed once on the way in. Name the
+boundary where that parse belongs and the type it should produce.
+
 ### G9 — Weak assertions
 
 **When:** the diff adds or changes tests.
@@ -116,6 +145,15 @@ it should not.
 only that *some* error occurred, that a collection is non-empty, that a call
 did not panic, or snapshotting output nobody reads. Name the specific outcome
 the test should pin instead.
+
+### G10 — Ignored or duplicated fact
+
+**When:** the diff adds or changes a field, parameter, header, form value,
+column or message, or stores a value another component already owns.
+**Hunt:** Find a value one side sends and the other drops, overwrites or
+re-derives: the sender should stop sending it and it should come out of the
+interface, instead of being ignored on arrival. Find a fact kept in two places that can disagree. Name the owner,
+the copy, and who reads the copy.
 
 ### G11 — Control that does not control
 
@@ -129,3 +167,15 @@ guarded value directly. A control that can be bypassed protects nothing: say
 whether to remove it, or name the one place where it could not be bypassed.
 A way around that breaks a property the change claims is a defect; report it
 in that bucket with its reproducer.
+
+### G12 — Over-built
+
+**When:** the diff adds a moving part — a table, background job, queue,
+state machine, extra round-trip, configuration knob, or an abstraction with
+one implementation.
+**Hunt:** Ask what is the least this problem needs. Name the part already in
+this codebase that would cover it with one more case, or the ordinary way
+such systems handle it, and say what the new part does that the smaller
+option cannot. If you can name nothing, or it only guards against a failure
+nobody has observed, report it as over-built. A measured need or a cited standard
+justifies the part: say so and report nothing. Advisory.
