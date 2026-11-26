@@ -2,9 +2,8 @@
 # A TypeScript flashcard tool: suggest.ts asks `claude -p --output-format json`
 # for three rewrites of a card (forward, reverse, cloze) as a JSON object in
 # the reply text, then digs the object out of `.result` and maps keys and
-# fields through alias tables that two earlier commits already widened. The
-# model has drifted again (a new wrapper key, a capitalised strategy, new field
-# names), so every rewrite is silently dropped. All repo-owned.
+# fields through alias tables. The model keyed one rewrite "reversed", so the
+# reverse suggestion is silently dropped. All repo-owned.
 set -euo pipefail
 WORK="${E2E_WORK:?}"
 git -C "$WORK" init -q -b main
@@ -123,33 +122,15 @@ test("documented shape", () => {
 });
 TS
 
-# History: the reader started bare, then two fixes each widened it.
-FULL_FIELDS='const QUESTION_KEYS = ["question", "front", "prompt"];'
-FULL_ANSWERS='const ANSWER_KEYS = ["answer", "back"];'
-FULL_WRAP='const WRAPPERS = ["candidates", "rewrites"];'
-swap() { python3 -c 'import sys; p,a,b=sys.argv[1:]; s=open(p).read(); open(p,"w").write(s.replace(a,b))' "$WORK/src/parse.ts" "$1" "$2"; }
-commit() { GIT_AUTHOR_DATE="$1" GIT_COMMITTER_DATE="$1" git -C "$WORK" commit -qam "$2"; }
-swap "$FULL_FIELDS" 'const QUESTION_KEYS = ["question"];'
-swap "$FULL_ANSWERS" 'const ANSWER_KEYS = ["answer"];'
-swap "$FULL_WRAP" 'const WRAPPERS: string[] = [];'
 git -C "$WORK" add -A
-commit 2026-10-02T10:00:00 "feat: three rewrite suggestions per card via claude -p"
-swap 'const QUESTION_KEYS = ["question"];' "$FULL_FIELDS"
-swap 'const ANSWER_KEYS = ["answer"];' "$FULL_ANSWERS"
-commit 2026-10-19T10:00:00 "fix(parse): accept front/back field names, the model sometimes answers in the card's terms"
-swap 'const WRAPPERS: string[] = [];' "$FULL_WRAP"
-commit 2026-11-07T10:00:00 'fix(parse): unwrap {"candidates": ...} / {"rewrites": ...}, haiku started wrapping its answer'
+git -C "$WORK" commit -qm "card-polish: rewrite suggestions via claude -p"
 
 cat > "$WORK/debug/last-response.txt" <<'TXT'
-Here are three rewrites of your card:
-
 ```json
 {
-  "suggestions": [
-    {"strategy": "Forward", "q": "What enzyme unwinds DNA at the replication fork?", "a": "Helicase"},
-    {"strategy": "Reverse", "q": "Helicase unwinds what at the replication fork?", "a": "DNA"},
-    {"strategy": "Cloze", "q": "___ unwinds DNA at the replication fork.", "a": "Helicase"}
-  ]
+  "forward": {"question": "What enzyme unwinds DNA at the replication fork?", "answer": "Helicase"},
+  "reversed": {"question": "Helicase unwinds what at the replication fork?", "answer": "DNA"},
+  "cloze": {"question": "___ unwinds DNA at the replication fork.", "answer": "Helicase"}
 }
 ```
 TXT

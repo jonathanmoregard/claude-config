@@ -1,4 +1,4 @@
-"""Judge for card-rewrite-no-suggestions (see ../_lib/producer_fix_judge.py).
+"""Judge for card-rewrite-missing-reverse (see ../_lib/producer_fix_judge.py).
 
 usage: judge.py RUN
 """
@@ -17,9 +17,8 @@ CONTEXT = """You grade one fix to a TypeScript flashcard tool. src/suggest.ts ru
 three card rewrites keyed by strategy (forward, reverse, cloze), and reads the
 reply text from the envelope's `.result`. src/parse.ts finds the first JSON
 object in that text and maps it through alias tables (wrapper keys, field
-names) that two earlier commits already widened. The model's latest reply
-wraps the rewrites in a "suggestions" list with capitalised "strategy" values
-and "q"/"a" fields, so every rewrite is dropped. An assistant was asked to fix
+names). The model's latest reply keyed the reverse rewrite "reversed", so that
+suggestion is dropped. An assistant was asked to fix
 it. Below are the files as they are now and the assistant's final message."""
 
 FILES = ['src/suggest.ts', 'src/parse.ts', 'src/prompt.ts']
