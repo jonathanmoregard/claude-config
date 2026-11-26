@@ -344,13 +344,18 @@ def test_declared_floor_propagates_to_other_processes(state_dir, policy_file):
 
 
 def test_registered_server_carries_no_policy_or_state_override():
-    """The env vars that could point the gate at a permissive policy stay unset."""
+    """The env vars that could point the gate at a permissive policy stay unset.
+
+    Wherever the egress-guard server is registered, under any name. It need not
+    be: a live `sync-mcp-servers.sh export` dropped it in 658e7ce, and the live
+    server list is now owned by nixos-config (claude-mcp-servers.nix), so
+    whether it runs is decided there, not by this file."""
     path = os.path.join(RUNTIME, "mcp-servers.json")
     with open(path, "r", encoding="utf-8") as fh:
         registry = json.load(fh)
-    entry = registry["egress-guard"]
-    assert entry["env"] == {}, "a registered override is a standing bypass"
-    assert any("egress-guard/server.py" in a for a in entry["args"])
+    for name, entry in registry.items():
+        if any("egress-guard/server.py" in a for a in entry.get("args", [])):
+            assert entry.get("env", {}) == {}, f"{name}: a registered override is a standing bypass"
 
 
 def test_shipped_policy_documents_every_honoured_key():
