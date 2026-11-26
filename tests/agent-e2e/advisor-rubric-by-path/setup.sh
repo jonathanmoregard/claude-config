@@ -3,6 +3,7 @@
 # tool on the new arm; it must still reach the insecure-defaults rubric.
 set -euo pipefail
 WORK="${E2E_WORK:?}"
+source "$(dirname "$0")/../_lib/artl-verdict-mcp.sh"
 cat > "$WORK/config.py" <<'P'
 import os
 

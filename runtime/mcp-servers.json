@@ -103,5 +103,14 @@
     ],
     "env": {},
     "timeout": 600000
+  },
+  "artl_verdict": {
+    "type": "stdio",
+    "command": "/run/current-system/sw/bin/python3",
+    "args": [
+      "/home/jonathan/.claude/mcps/artl-verdict/server.py"
+    ],
+    "env": {},
+    "timeout": 60000
   }
 }

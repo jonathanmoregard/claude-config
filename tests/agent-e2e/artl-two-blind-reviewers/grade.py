@@ -115,6 +115,15 @@ def spoken_text(ev):
     it had quoted A.
     """
     parts = [b.get("text", "") for b in blocks(ev) if b.get("type") == "text"]
+    # A reviewer reports through submit_verdict and replies one line naming the
+    # file: its findings are that call's input, which it said, not read.
+    for b in blocks(ev):
+        if b.get("type") == "tool_use" and str(b.get("name", "")).endswith("__submit_verdict"):
+            inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+            parts.append(str(inp.get("verdict_reason", "")))
+            for f in inp.get("findings") or []:
+                if isinstance(f, dict):
+                    parts.append(f"{f.get('file')}:{f.get('line')} {f.get('rationale', '')}")
     c = content(ev)
     if isinstance(c, str):
         parts.append(c)
@@ -149,7 +158,9 @@ def read(path):
             synthetic = (ev.get("message") or {}).get("model") == "<synthetic>" \
                 if isinstance(ev.get("message"), dict) else False
             if said.strip() and not synthetic:
-                report[parent] = said
+                # Accumulated: the one-line reply after a submit_verdict call
+                # must not replace the findings that call carried.
+                report[parent] = f"{report.get(parent, '')} {said}".strip()
             continue
 
         # Main-thread bookkeeping the harness emits about each subagent.

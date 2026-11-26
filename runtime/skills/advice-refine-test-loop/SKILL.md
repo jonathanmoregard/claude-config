@@ -7,7 +7,7 @@ description: Use when a finished, integrated non-trivial diff needs independent 
 
 Fresh blind reviewers propose falsifiable defects; observed behavior decides
 what gets fixed; the diff's risk tier sets the effort. Do not run per edit,
-task, or chunk; the project tests serve there.
+task, or chunk.
 
 ## Entry Gate
 
@@ -86,6 +86,8 @@ Beyond T3: only on the user's deep-audit request.
 
 ## Adjudicate, Then Act
 
+An advisor's reply names its verdict file; Read it.
+
 Every defect finding gets exactly one of three outcomes before any edit. Test
 the exact claimed path; record expected versus actual. Batch findings through
 one fresh verifier context, never the one that wrote the code.
@@ -153,5 +155,4 @@ appears that `references/exclusion-decisions.tsv` does not already decide
 (by meaning, not wording; see `references/ledger.md`), put it to the user as
 one closed question. Change nothing yourself.
 
-Never claim broad audit coverage from this close-out review. An
-empty round is one sample, not proof.
+Never claim broad audit coverage: an empty round is one sample, not proof.

@@ -24,6 +24,19 @@ def reported(tid, text="Finding: app/tokens.py:40 grants a request without the s
             {"type": "system", "subtype": "task_notification", "tool_use_id": tid, "status": "completed"}]
 
 
+def submitted(tid, rationale="grants a request without the scope"):
+    """A reviewer that reports through submit_verdict, then replies one line."""
+    verdict = {"verdict": "BLOCKS", "verdict_reason": "scope", "findings": [
+        {"severity": "HIGH", "autofix_class": "manual", "file": "app/tokens.py", "line": 40,
+         "rationale": rationale, "unverifiable": False}]}
+    return [{"type": "assistant", "parent_tool_use_id": tid, "message": {"content": [
+                {"type": "tool_use", "name": "mcp__artl_verdict__submit_verdict",
+                 "id": "v" + tid, "input": verdict}]}},
+            {"type": "assistant", "parent_tool_use_id": tid, "message": {"content": [
+                {"type": "text", "text": "BLOCKS, 1 finding: /h/.local/state/artl-verdicts/x.json"}]}},
+            {"type": "system", "subtype": "task_notification", "tool_use_id": tid, "status": "completed"}]
+
+
 def died(tid):
     # what the harness records: a synthetic API-error turn, then `failed`
     return [{"type": "assistant", "parent_tool_use_id": tid,
@@ -58,6 +71,10 @@ def grade(tmp_path, events):
     # graded no-hunt while its prompt listed "D1 — ...", "D2 — ...")
     ([dispatch(("a", A), ("b", "Hunt only the classes listed below.\nD1 — look for errors\nG11 — bypasses")),
       *reported("a"), *reported("b")], "pass"),
+    # A reports through submit_verdict; its findings are in the tool input, not
+    # its one-line reply. B quoting them after A reported is a leak.
+    ([dispatch(("a", A)), *submitted("a"), dispatch(("b", B + "\nSee app/tokens.py:40."))],
+     "leaked"),
 ])
 def test_blindness_is_graded_in_round_one(tmp_path, events, want):
     assert grade(tmp_path, events) == want

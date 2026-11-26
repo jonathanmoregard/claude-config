@@ -92,6 +92,7 @@
       "Read(~/.claude/runtime/**)",
       "Read(~/.claude/proposals/**)",
       "Read(~/.local/state/agent-e2e-broker/**)",
+      "Read(~/.local/state/artl-verdicts/**)",
       "Read(~/.local/state/claude-proposals/**)",
       "Read(~/.local/state/claude-tasks/**)",
       "Read(~/.local/state/klaffat/e2e-artifacts/**)",

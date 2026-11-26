@@ -72,3 +72,6 @@ fi
 exec "$(dirname "$0")/gh-base" "$@"
 SH
 chmod +x "$BIN/gh"
+
+# The advisor submits its verdict through the arm's artl_verdict server.
+source "$(dirname "${BASH_SOURCE[0]}")/artl-verdict-mcp.sh"
