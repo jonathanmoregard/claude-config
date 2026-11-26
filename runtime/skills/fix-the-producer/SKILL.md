@@ -44,7 +44,8 @@ word", or JSON you only asked for in the prompt — quick fixes included.
 | 2 | Workflow script | `agent(prompt, {schema})` | the returned object |
 | 3 | Anthropic API | a tool whose `input_schema` is the answer, with `tool_choice: {"type": "tool", "name": ...}` | the `tool_use` block's `input` |
 | 4 | Codex CLI | `codex exec --output-schema FILE` (confirm with `codex exec --help`) | the schema-shaped final message |
-| 5 | Grading free text you don't control (an e2e agent's final message, a file it wrote) | hand it to a no-tools judge model under a schema (#1); in claude-config use `tests/agent-e2e/_lib/structured_judge.py` | the judge's fields |
+| 5 | A subagent whose reply a hook or the parent reads | an MCP tool (e.g. `submit_verdict`) whose input schema is the answer; the prompt says to call it | what the tool recorded, never the reply, hand-back or transcript text |
+| 6 | Grading free text you don't control (an e2e agent's final message, a file it wrote) | hand it to a no-tools judge model under a schema (#1); in claude-config use `tests/agent-e2e/_lib/structured_judge.py` | the judge's fields |
 
 ## Common mistakes
 
@@ -56,3 +57,4 @@ word", or JSON you only asked for in the prompt — quick fixes included.
 | 4 | Your script prints prose, a caller greps it | make the script emit JSON |
 | 5 | `git status \| grep modified` | `git status --porcelain=v2 -z` |
 | 6 | Unknown value falls through to a default | fail loudly |
+| 7 | The reader broke because the reply moved (a hand-back call, another hook field, the transcript), so read the new place | the harness owns the channel, you own the prompt: make the producer call a schema tool |
