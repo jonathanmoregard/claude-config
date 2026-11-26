@@ -19,7 +19,7 @@
 #   D1 fail-open     missing scope is logged, then access granted anyway
 #   D2 leak          the cursor is left open on the integrity-error path
 #   D5 stated intent a test named for denial that asserts nothing about it
-#   G3 primitive     session/user ids are str in code and TEXT in the schema
+#   (G3 primitive: session/user ids as str; no longer a hunt class since 2026-11-24)
 # Nothing here hints at how many reviewers to use.
 #
 # The change sits on a branch off main, with __pycache__ ignored, so

@@ -33,9 +33,21 @@ Keep the buckets apart in the prompt. A design finding dressed as a defect
 wastes a reproduction attempt and comes back "could not reproduce", which is
 the wrong answer to a question nobody asked empirically.
 
-Some design classes are **advisory**: G8 and G12. Their findings are listed
-in the report and the ledger. They never block, never reopen a round, and
-ask the user for nothing.
+G12 is **advisory**: its findings are listed in the report and the ledger.
+They never block, never reopen a round, and ask the user for nothing.
+
+## Keeping the list short
+
+The list holds only classes that earn their place, and the measure depends on
+the bucket. A defect class counts reproduced findings. A design class counts
+advisory findings the user took (`fixed` = `yes`): design findings are never
+reproduced by construction, so counting reproductions would drop every one.
+G3–G8 were dropped on 2026-11-24: across every repository's ledger they had 1
+reproduced defect and no advice taken in 20 rows. Ids are not reused.
+
+Do not add always-on checklist lines here or in the reviewer prompts. A finding
+that keeps coming back becomes a lint rule or a test. A new class needs a
+narrow `When` and ledger rows showing it earns its place by that measure.
 
 ## Defect classes
 
@@ -125,62 +137,6 @@ database rows, external API replies.
 business logic, or forwarded down by a handler that could have parsed it.
 Untyped belongs at the outermost edge, parsed once on the way in. Name the
 boundary where that parse belongs and the type it should produce.
-
-### G3 — Primitive where a type belongs
-
-**When:** identifiers, keys, tokens, emails, URLs, durations, money, anything
-persisted, bounded quantities (brightness, percentages), and any "none" or
-"unknown" value. The newtype route needs G1's typed-and-checked code; the column
-route applies in any language, since the schema does the enforcing.
-**Hunt:** Find a domain value carried as `String`, `i64`, `uuid`-as-text, or a
-raw map — in a signature, a struct field, or a database column — where the
-schema or a newtype could carry it. Flag the definition, not every call site.
-Also a bounded quantity carried as a plain number where a range type
-belongs (a handful of named steps is a closed set: a labelled sum type, not a
-range), and a sentinel (-1, '', 0, an invented default) standing for "none" where an
-explicit case belongs.
-
-### G4 — Misuse resistance
-
-**When:** the diff adds or changes a public API, a wrapper type, a config
-surface, or anything with a "don't call this directly" rule.
-**Hunt:** Find the mistake this interface still permits: an unwrap any module
-can reach, a constructor that skips the invariant, a field settable after the
-value is sealed, a correct call that differs from an unsafe one by one
-argument. Ask what stops the next caller from getting it wrong by accident.
-
-### G5 — Homeless domain concept
-
-**When:** the diff repeatedly names something the codebase does not.
-**Hunt:** Find a concept the code talks about that has no type, module, or
-owner — one that lives implicitly, ambiently, or spread across call sites, and
-is reconstructed by hand wherever it is needed.
-
-### G6 — Abstraction-level bunching
-
-**When:** changed files over a few hundred lines, or a module whose name does
-not predict its contents.
-**Hunt:** Find a function or module mixing levels — transport parsing beside
-business rules, SQL beside policy, formatting beside decisions — and name the
-concern that has no separate home.
-
-### G7 — Hand-rolled where a readymade exists
-
-**When:** the diff implements a matcher, parser, tokenizer, cache, retry or
-backoff policy, rate limiter, date or duration handling, diff, or traversal.
-**Hunt:** Name the mainstream, trusted library this reimplements, and the
-behaviour the hand-rolled version gets wrong or omits. A heavy or unmaintained
-dependency is a reason to keep the hand-rolled code; say so rather than
-reporting the class.
-
-### G8 — Standards conformance
-
-**When:** HTTP surfaces, resource semantics, status codes, headers, auth
-flows, file formats, CLI conventions.
-**Hunt:** Find where this deviates from the ecosystem's standard way — a verb
-or status code that does not mean what it is used for, a bespoke envelope over
-a specified one, an RPC shape where resource semantics are expected. Name the
-standard, then the deviation.
 
 ### G9 — Weak assertions
 

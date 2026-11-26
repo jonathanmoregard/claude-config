@@ -235,11 +235,18 @@ def main():
     dispatches, bg, notify, result, turn_last, report = read(path)
     n = len(dispatches)
 
-    markers = class_markers()
+    # The arm's own staged copy first: the broker copies only tests/, so the
+    # repo-relative runtime/ path exists only when run from a checkout.
+    staged = (Path(path).resolve().parent / "home/.claude/skills"
+              / "advice-refine-test-loop/references/hunt-classes.md")
+    markers = class_markers(staged if staged.exists() else HUNTS)
     seen = set()
-    joined = norm(" ".join(p for _, _, p in dispatches))
+    raw = " ".join(p for _, _, p in dispatches)
+    joined = norm(raw)
     for cid, ms in markers.items():
-        if any(m in joined for m in ms) or re.search(rf"\b{re.escape(cid)}\b", joined):
+        # Ids are matched as written (uppercase) in the raw prompt; `joined`
+        # is lowercased, so an id search there never matched.
+        if any(m in joined for m in ms) or re.search(rf"\b{re.escape(cid)}\b", raw):  # regex-ok: class id in the dispatch input, an action record
             seen.add(cid)
     # Named classes only. The preamble alone used to satisfy this, which passed
     # exactly the "B became a second A, with a header" run `no-hunt` is for.
