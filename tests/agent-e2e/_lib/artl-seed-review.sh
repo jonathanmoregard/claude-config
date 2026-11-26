@@ -3,11 +3,12 @@
 # _lib/artl-gate.sh. The evidence is written by the candidate config's OWN
 # recorder, hooks/artl-evidence.py, fed the events the harness fires for one
 # advisor dispatch: PostToolUse on Agent at launch, PostToolUse on Read for
-# each file the advisor itself reads (agent_type advisor, measured), then
-# SubagentStop with the verdict -- so the record has exactly the shape a live
-# review leaves. A recorder that ignores Read events (an older arm) is fed
-# them harmlessly. A config without the recorder (the old arm) gets nothing
-# seeded and needs none.
+# each file the advisor itself reads (agent_type advisor, measured), then the
+# verdict -- so the record has exactly the shape a live review leaves. The
+# verdict goes both ways an arm may take it: PostToolUse on the advisor's
+# submit_verdict call (the current recorder's only channel), then SubagentStop
+# carrying it as text (an older recorder's). Each recorder ignores the other's
+# event. A config without the recorder gets nothing seeded and needs none.
 HOOK="$HOME/.claude/hooks/artl-evidence.py"
 [ -f "$HOOK" ] || exit 0
 python3 - "$HOOK" "$WORK" <<'PY'
@@ -33,6 +34,11 @@ steps += [{"session_id": "seed", "hook_event_name": "PostToolUse", "cwd": work,
            "tool_name": "Read", "tool_input": {"file_path": os.path.join(work, f)},
            "tool_response": {"type": "text"}, "agent_id": "seedreview1",
            "agent_type": "advisor"} for f in files]
+steps.append({"session_id": "seed", "hook_event_name": "PostToolUse", "cwd": work,
+              "tool_name": "mcp__artl_verdict__submit_verdict",
+              "tool_input": json.loads(verdict),
+              "tool_response": [{"type": "text", "text": "Verdict recorded."}],
+              "agent_id": "seedreview1", "agent_type": "advisor"})
 steps.append({"session_id": "seed", "hook_event_name": "SubagentStop", "cwd": work,
               "agent_id": "seedreview1", "agent_type": "advisor",
               "last_assistant_message": verdict})

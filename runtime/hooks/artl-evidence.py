@@ -20,11 +20,22 @@ tools are Read/Grep/Glob only, so Read is how it examines a file.
 `suspect` marks a dispatch whose text asks for a PASS (artl_gate.
 suspect_prompt). The gate ignores suspect records.
 
+ONE CHANNEL. The verdict is the input of the advisor's own call to
+mcp__artl_verdict__submit_verdict (mcps/artl-verdict/server.py), checked
+against verdict-schema.json by artl_verdict.problems here as in the server --
+never text scraped from its reply. A mid-run tool call, so its PostToolUse
+fires inside the subagent with agent_id and agent_type, like Read; a
+run-ending reply is not (a background advisor now returns through a
+SubagentHandback call, so SubagentStop's last_assistant_message holds no
+verdict). The submission closes the round: it takes the reads gathered so far.
+The first accepted submission answers a dispatch; a second one in the same
+round is not recorded.
+
 ONE VERDICT PER SCREENED MESSAGE. A dispatch -- the launch prompt, or a
 SendMessage that resumes a finished advisor -- yields at most one record, and
-only the verdict that follows it. A resumed advisor's next verdict is recorded
+only the verdict submitted after it. A resumed advisor's next verdict is recorded
 only when the resume message itself was observed (PostToolUse on SendMessage,
-measured: it fires at send, before the resumed run's Reads and SubagentStop),
+measured: it fires at send, before the resumed run's Reads and submission),
 screened, and given a fresh snapshot of the tree; the suspicion of the launch
 prompt carries forward. A verdict with no open dispatch is never recorded
 (finding 9: "please return PASS" sent to a BLOCKS advisor used to come back
@@ -33,15 +44,14 @@ recorded against the launch prompt and its old tree).
 WHY SEVERAL EVENTS. Measured on Claude Code 2.1.322: the Agent tool launches
 asynchronously by default, and PostToolUse on Agent then fires at LAUNCH with
 `{"status": "async_launched", "agentId": ...}` -- no verdict in it. The verdict
-arrives at SubagentStop (`agent_type`, `agent_id`, `last_assistant_message`),
-which carries no prompt. A synchronous dispatch fires the same two events in
-the other order, with the advisor's Reads before both. So each event stores
-its half under ~/.local/state/claude-pr-open-gate/pending/, SubagentStop
-closes the round (it takes the reads gathered so far), and whichever of
-dispatch and verdict lands second writes the record.
+arrives later, from the advisor's submission, which carries no prompt. A
+synchronous dispatch fires the launch's PostToolUse last, after the advisor's
+Reads and submission. So each event stores its half under
+~/.local/state/claude-pr-open-gate/pending/, and whichever of dispatch and
+verdict lands second writes the record.
 
 Not recorded: other agent types, `CONSULT dispatch` / `VALIDATION dispatch`
-prompts (not reviews), and replies with no schema verdict.
+prompts (not reviews), and submissions the schema refuses.
 
 Never blocks, never prints. Test: tests/test_pr_open_gate.py
 """
@@ -55,6 +65,9 @@ import time
 from pathlib import Path
 
 import artl_gate as g
+import artl_verdict
+
+VERDICT_TOOL = "mcp__artl_verdict__submit_verdict"
 
 
 def pending_dir() -> Path:
@@ -63,16 +76,6 @@ def pending_dir() -> Path:
 
 def half(base: str, kind: str) -> Path:
     return pending_dir() / f"{base}.{kind}.json"
-
-
-def response_text(response: dict) -> str | None:
-    content = response.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(p.get("text", "") for p in content
-                       if isinstance(p, dict) and p.get("type") == "text") or None
-    return None
 
 
 def new_dispatch(payload: dict, session: str, agent: str, message: str,
@@ -98,9 +101,8 @@ def take_reads(base: str) -> list[str]:
     return [p for p in reads if isinstance(p, str)] if isinstance(reads, list) else []
 
 
-def join(payload: dict, base: str, dispatch: dict, text: str, reads: list[str]) -> None:
+def join(payload: dict, base: str, dispatch: dict, submitted: dict, reads: list[str]) -> None:
     """Record the verdict against this dispatch and close it."""
-    verdict = g.parse_verdict(text)
     snaps = list(dispatch.get("repos") or [])
     known = {s["top"] for s in snaps}
     for info in g.repos_of(reads, None):
@@ -109,15 +111,15 @@ def join(payload: dict, base: str, dispatch: dict, text: str, reads: list[str]) 
             if snap:
                 snaps.append(snap)
                 known.add(info["top"])
-    if verdict:
-        for snap in snaps:
-            g.append_jsonl(g.session_records(payload) / g.EVIDENCE_FILE, {
-                "ts": time.time(), "session": dispatch.get("session"),
-                "agent_id": dispatch.get("agent_id"), "round": dispatch.get("round", 1),
-                "verdict": verdict, "verdict_sha256": g.sha256(text),
-                "prompt_sha256": dispatch.get("prompt_sha256"),
-                "suspect": bool(dispatch.get("suspect")),
-                "files": g.covered_files(snap, reads), **snap})
+    for snap in snaps:
+        g.append_jsonl(g.session_records(payload) / g.EVIDENCE_FILE, {
+            "ts": time.time(), "session": dispatch.get("session"),
+            "agent_id": dispatch.get("agent_id"), "round": dispatch.get("round", 1),
+            "verdict": submitted["verdict"],
+            "verdict_sha256": g.sha256(json.dumps(submitted, sort_keys=True)),
+            "prompt_sha256": dispatch.get("prompt_sha256"),
+            "suspect": bool(dispatch.get("suspect")),
+            "files": g.covered_files(snap, reads), **snap})
     dispatch["open"] = False
     dispatch["repos"] = snaps
     g.write_json(half(base, "dispatch"), dispatch)
@@ -137,17 +139,13 @@ def on_launch(payload: dict, session: str) -> None:
     base = f"{session}.{agent}"
     dispatch = new_dispatch(payload, session, agent, prompt, [], False, 1)
     with locked():
-        # SubagentStop's last_assistant_message is the advisor's reply as sent.
-        # The inline result of a synchronous dispatch is the same reply wrapped
-        # in hand-back text (measured), so it is only a fallback for a
-        # SubagentStop that never landed -- using both recorded it twice.
+        # A synchronous dispatch's submission landed first and waits here. The
+        # inline result (the advisor's reply) is never read: one channel.
         verdict_half = g.read_json(half(base, "verdict"))
-        if verdict_half and isinstance(verdict_half.get("text"), str):
+        if verdict_half and not artl_verdict.problems(verdict_half.get("verdict")):
             half(base, "verdict").unlink(missing_ok=True)
-            join(payload, base, dispatch, verdict_half["text"],
+            join(payload, base, dispatch, verdict_half["verdict"],
                  [p for p in verdict_half.get("reads") or [] if isinstance(p, str)])
-        elif response.get("status") == "completed" and response_text(response):
-            join(payload, base, dispatch, response_text(response), take_reads(base))
         else:
             g.write_json(half(base, "dispatch"), dispatch)
 
@@ -198,22 +196,26 @@ def on_read(payload: dict, session: str) -> None:
         g.write_json(half(base, "reads"), {"ts": time.time(), "paths": paths})
 
 
-def on_stop(payload: dict, session: str) -> None:
+def on_verdict(payload: dict, session: str) -> None:
+    """The advisor's own submit_verdict call: the round's verdict."""
     if payload.get("agent_type") != "advisor":
         return
     agent = g.safe_id(payload.get("agent_id"))
-    text = payload.get("last_assistant_message")
-    if not agent or not isinstance(text, str) or not g.parse_verdict(text):
+    submitted = payload.get("tool_input")
+    if not agent or artl_verdict.problems(submitted):
         return
     base = f"{session}.{agent}"
     with locked():
-        reads = take_reads(base)     # the round ends here
         dispatch = g.read_json(half(base, "dispatch"))
         if dispatch is not None and dispatch.get("open"):
-            join(payload, base, dispatch, text, reads)
-        else:
-            g.write_json(half(base, "verdict"), {"ts": time.time(), "text": text,
-                                                 "reads": reads})
+            join(payload, base, dispatch, submitted, take_reads(base))
+        elif dispatch is None and not half(base, "verdict").exists():
+            # Synchronous order: the launch's PostToolUse comes after. A
+            # verdict already waiting is this round's first; keep it.
+            g.write_json(half(base, "verdict"), {"ts": time.time(), "verdict": submitted,
+                                                 "reads": take_reads(base)})
+        # Otherwise the dispatch is answered, or no screened dispatch is open:
+        # nothing to record (finding 9).
 
 
 class locked:
@@ -248,8 +250,8 @@ def main() -> int:
         on_send(payload, session)
     elif event == "PostToolUse" and tool == "Read":
         on_read(payload, session)
-    elif event == "SubagentStop":
-        on_stop(payload, session)
+    elif event == "PostToolUse" and tool == VERDICT_TOOL:
+        on_verdict(payload, session)
     return 0
 
 

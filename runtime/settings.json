@@ -488,7 +488,7 @@
         ]
       },
       {
-        "matcher": "^(Agent|Read|SendMessage)$",
+        "matcher": "^(Agent|Read|SendMessage|mcp__artl_verdict__submit_verdict)$",
         "hooks": [
           {
             "type": "command",
@@ -852,15 +852,6 @@
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_ENTRYPOINT:-cli}\" = \"cli\" ] || exit 0; command -v agent-activity >/dev/null || exit 0; agent-activity mark SubagentStop",
             "timeout": 10
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 -S -E $HOME/.claude/hooks/artl-evidence.py",
-            "timeout": 30
           }
         ]
       }

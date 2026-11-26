@@ -5,10 +5,10 @@ The parent agent kept opening pull requests without running the
 advice-refine-test-loop (ARTL) close-out review. These hooks make the PR-open
 call itself depend on evidence the parent cannot write through its tools:
 
-  * artl-evidence.py (PostToolUse on Agent + SubagentStop) records one line
-    per `advisor` verdict into <notes>/artl-evidence.jsonl: branch, the tree
-    the reviewer saw, the verdict, the files the dispatch named, and a hash of
-    the dispatch prompt.
+  * artl-evidence.py (PostToolUse on Agent, Read, SendMessage and the
+    advisor's submit_verdict call) records one line per `advisor` verdict:
+    branch, the tree the reviewer saw, the verdict, the files the advisor
+    read, and a hash of the dispatch prompt.
   * pr-open-gate.py (PreToolUse) denies `gh pr create`, a POST to
     `gh api .../pulls` and mcp__github__create_pull_request unless the change
     is computed-exempt, the latest verdict for the branch passes, the reviewed
@@ -44,6 +44,18 @@ _spec = importlib.util.spec_from_file_location("artl_gate", HOOKS / "artl_gate.p
 artl_gate = importlib.util.module_from_spec(_spec)
 sys.modules["artl_gate"] = artl_gate
 _spec.loader.exec_module(artl_gate)
+
+VERDICT_TOOL = "mcp__artl_verdict__submit_verdict"
+FINDING = {"autofix_class": "manual", "file": "/abs/x.sh", "line": 1,
+           "rationale": "r", "unverifiable": False}
+
+
+def verdict_body(verdict: str) -> dict:
+    """A schema-valid submission for `verdict`: findings agree with it."""
+    sev = {"PASS": None, "PASS_WITH_FIXES": "LOW", "BLOCKS": "HIGH"}[verdict]
+    return {"verdict": verdict, "verdict_reason": "" if sev is None else "r",
+            "findings": [] if sev is None else [dict(FINDING, severity=sev)]}
+
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
@@ -131,11 +143,20 @@ class Sandbox:
                 "tool_response": {"type": "text", "file": {"filePath": path}},
                 "agent_id": agent, "agent_type": agent_type}
 
-    def stop_event(self, verdict: str, agent: str, session: str = "s1") -> dict:
-        result = json.dumps({"verdict": verdict, "verdict_reason": "", "findings": []})
+    def verdict_event(self, verdict: str | dict, agent: str, session: str = "s1",
+                      agent_type: str = "advisor") -> dict:
+        """PostToolUse for the advisor's own submit_verdict call (a mid-run
+        tool call, so it carries agent_id/agent_type like its Reads)."""
+        body = verdict_body(verdict) if isinstance(verdict, str) else verdict
+        return {"session_id": session, "hook_event_name": "PostToolUse",
+                "cwd": str(self.work), "tool_name": VERDICT_TOOL, "tool_input": body,
+                "tool_response": [{"type": "text", "text": "Verdict recorded."}],
+                "agent_id": agent, "agent_type": agent_type}
+
+    def stop_event(self, agent: str, session: str = "s1", text: str = "PASS, 0 findings") -> dict:
         return {"session_id": session, "hook_event_name": "SubagentStop",
                 "cwd": str(self.work), "agent_id": agent, "agent_type": "advisor",
-                "last_assistant_message": result, "stop_hook_active": False}
+                "last_assistant_message": text, "stop_hook_active": False}
 
     def review(self, verdict: str, prompt: str | None = None, agent: str = "a1",
                session: str = "s1", order: str = "async",
@@ -150,19 +171,19 @@ class Sandbox:
             reads = [str(p.relative_to(self.work)) for p in
                      (Path(t) for t in prompt.split()) if p.is_absolute()
                      and str(p).startswith(str(self.work) + "/") and p.is_file()]
-        result = json.dumps({"verdict": verdict, "verdict_reason": "",
-                             "findings": []})
+        result = "PASS, 0 findings: /home/u/.local/state/artl-verdicts/x.json"
         launch = {"session_id": session, "hook_event_name": "PostToolUse",
                   "cwd": str(self.work), "tool_name": "Agent",
                   "tool_input": {"subagent_type": "advisor", "prompt": prompt,
                                  "description": "review"},
                   "tool_use_id": "tu-" + agent}
-        stop = self.stop_event(verdict, agent, session)
+        submitted = self.verdict_event(verdict, agent, session)
+        stop = self.stop_event(agent, session)
         read_steps = [self.read_event(r, agent, session) for r in reads]
         if order == "async":
             launch["tool_response"] = {"isAsync": True, "status": "async_launched",
                                        "agentId": agent, "prompt": prompt}
-            steps = [launch, *read_steps, stop]
+            steps = [launch, *read_steps, submitted, stop]
         else:
             # Measured: the inline Agent result wraps the subagent's reply.
             wrapped = ("  <tools-used-before-summary>Read</tools-used-before-summary>\n"
@@ -171,7 +192,7 @@ class Sandbox:
             launch["tool_response"] = {"status": "completed", "agentId": agent,
                                        "agentType": "advisor", "prompt": prompt,
                                        "content": [{"type": "text", "text": wrapped}]}
-            steps = [*read_steps, stop, launch]
+            steps = [*read_steps, submitted, stop, launch]
         for step in steps:
             rc, out = self.run(EVIDENCE, step)
             assert rc == 0 and not out.strip(), out
@@ -185,14 +206,15 @@ class Sandbox:
                 "cwd": str(self.work), "tool_name": "SendMessage",
                 "tool_input": {"to": agent, "message": message},
                 "tool_response": {"success": True}}
-        stop = self.stop_event(verdict, agent, session)
+        submitted = self.verdict_event(verdict, agent, session)
+        stop = self.stop_event(agent, session)
         read_steps = [self.read_event(r, agent, session) for r in (reads or [])]
         if not observed:
-            steps = [*read_steps, stop]
+            steps = [*read_steps, submitted, stop]
         elif order == "async":
-            steps = [send, *read_steps, stop]
+            steps = [send, *read_steps, submitted, stop]
         else:
-            steps = [*read_steps, stop, send]
+            steps = [*read_steps, submitted, stop, send]
         for step in steps:
             rc, out = self.run(EVIDENCE, step)
             assert rc == 0 and not out.strip(), out
@@ -702,20 +724,20 @@ def test_evidence_record_carries_the_design_fields(sb):
 
 
 # --- evidence writer: only real advisor verdicts -----------------------------
-# Break: recording a consult, a non-advisor agent, or an unparseable reply as
-# review evidence.
+# Break: recording a consult, a non-advisor agent, an invalid submission or a
+# free-text reply as review evidence.
+
+def _launch(sb, agent: str, subagent_type: str = "advisor", prompt: str = "scripts/run.sh",
+            response: dict | None = None) -> dict:
+    return {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Agent",
+            "cwd": str(sb.work), "tool_input": {"subagent_type": subagent_type, "prompt": prompt},
+            "tool_response": response or {"status": "async_launched", "agentId": agent}}
+
 
 def test_non_advisor_agent_writes_nothing(sb):
     sb.commit("scripts/run.sh", SCRIPT_BODY)
-    stop = {"session_id": "s1", "hook_event_name": "SubagentStop", "agent_id": "g1",
-            "agent_type": "general-purpose", "cwd": str(sb.work),
-            "last_assistant_message": json.dumps({"verdict": "PASS", "findings": []})}
-    launch = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Agent",
-              "cwd": str(sb.work),
-              "tool_input": {"subagent_type": "general-purpose", "prompt": "scripts/run.sh"},
-              "tool_response": {"status": "async_launched", "agentId": "g1"}}
-    sb.run(EVIDENCE, launch)
-    sb.run(EVIDENCE, stop)
+    sb.run(EVIDENCE, _launch(sb, "g1", subagent_type="general-purpose"))
+    sb.run(EVIDENCE, sb.verdict_event("PASS", "g1", agent_type="general-purpose"))
     assert sb.records() == []
 
 
@@ -725,17 +747,36 @@ def test_consult_dispatch_is_not_review_evidence(sb):
     assert sb.records() == []
 
 
-def test_unparseable_verdict_is_not_evidence(sb):
+@pytest.mark.parametrize("body", [
+    {"verdict": "PASS", "findings": []},                          # missing key
+    {"verdict": "PASS", "verdict_reason": "",
+     "findings": [dict(FINDING, severity="HIGH")]},               # disagrees
+    "PASS",                                                       # not an object
+])
+def test_a_submission_the_schema_refuses_is_not_evidence(sb, body):
+    # The server refuses these too; the hook must not depend on whether
+    # PostToolUse fires for a refused (isError) call.
     sb.commit("scripts/run.sh", SCRIPT_BODY)
-    launch = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Agent",
-              "cwd": str(sb.work),
-              "tool_input": {"subagent_type": "advisor", "prompt": "scripts/run.sh"},
-              "tool_response": {"status": "async_launched", "agentId": "a9"}}
-    stop = {"session_id": "s1", "hook_event_name": "SubagentStop", "agent_id": "a9",
-            "agent_type": "advisor", "cwd": str(sb.work),
-            "last_assistant_message": "Looks good to me!"}
-    sb.run(EVIDENCE, launch)
-    sb.run(EVIDENCE, stop)
+    sb.run(EVIDENCE, _launch(sb, "a9"))
+    ev = sb.verdict_event("PASS", "a9")
+    ev["tool_input"] = body
+    sb.run(EVIDENCE, ev)
+    assert sb.records() == []
+
+
+def test_a_free_text_verdict_is_not_evidence(sb):
+    # One channel: the tool call. A JSON verdict in the reply (SubagentStop's
+    # last_assistant_message, or a foreground dispatch's inline result) is not.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    text = json.dumps(verdict_body("PASS"))
+    sb.run(EVIDENCE, sb.read_event("scripts/run.sh", "a8"))
+    sb.run(EVIDENCE, sb.stop_event("a8", text=text))
+    sb.run(EVIDENCE, _launch(sb, "a8", response={
+        "status": "completed", "agentId": "a8", "agentType": "advisor",
+        "content": [{"type": "text", "text": text}]}))
+    sb.run(EVIDENCE, _launch(sb, "a7"))
+    sb.run(EVIDENCE, sb.read_event("scripts/run.sh", "a7"))
+    sb.run(EVIDENCE, sb.stop_event("a7", text=text))
     assert sb.records() == []
 
 
@@ -744,6 +785,24 @@ def test_one_verdict_is_recorded_once_in_either_order(sb):
     sb.review("PASS", agent="a1", order="async")
     sb.review("PASS", agent="a2", order="sync")
     assert [r["agent_id"] for r in sb.records()] == ["a1", "a2"]
+    assert [r["verdict_sha256"] for r in sb.records()] == \
+        [artl_gate.sha256(json.dumps(verdict_body("PASS"), sort_keys=True))] * 2
+
+
+@pytest.mark.parametrize("order", ["async", "sync"])
+def test_a_second_submission_in_one_round_is_not_recorded(sb, order):
+    # The first accepted verdict answers the dispatch, whichever event lands first.
+    sb.commit("scripts/run.sh", SCRIPT_BODY)
+    reads = [sb.read_event("scripts/run.sh", "a1")]
+    second = sb.verdict_event("PASS", "a1")
+    if order == "async":
+        steps = [_launch(sb, "a1"), *reads, sb.verdict_event("BLOCKS", "a1"), second]
+    else:
+        steps = [*reads, sb.verdict_event("BLOCKS", "a1"), second, _launch(sb, "a1", response={
+            "status": "completed", "agentId": "a1", "agentType": "advisor", "content": []})]
+    for step in steps:
+        sb.run(EVIDENCE, step)
+    assert [r["verdict"] for r in sb.records()] == ["BLOCKS"]
 
 
 # --- the ask backstop and its grant ------------------------------------------
@@ -969,8 +1028,9 @@ def test_every_gate_event_is_wired_to_an_existing_script():
     assert _registered("PreToolUse", "pr-open-gate.py") == ["^(Bash|mcp__github__create_pull_request)$"]
     assert _registered("PermissionRequest", "pr-open-gate.py")
     assert _registered("UserPromptSubmit", "pr-open-gate.py")
-    assert _registered("PostToolUse", "artl-evidence.py") == ["^(Agent|Read|SendMessage)$"]
-    assert _registered("SubagentStop", "artl-evidence.py")
+    assert _registered("PostToolUse", "artl-evidence.py") == [
+        "^(Agent|Read|SendMessage|mcp__artl_verdict__submit_verdict)$"]
+    assert _registered("SubagentStop", "artl-evidence.py") == []
 
 
 def test_f2_the_hook_never_answers_allow_without_a_grant(sb):

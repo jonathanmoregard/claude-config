@@ -1,8 +1,9 @@
 """Shared logic for the ARTL PR-open gate.
 
 Imported by hooks/pr-open-gate.py (PreToolUse, PermissionRequest,
-UserPromptSubmit) and hooks/artl-evidence.py (PostToolUse on Agent, Read and
-SendMessage; SubagentStop). Stdlib only; every git call is bounded.
+UserPromptSubmit) and hooks/artl-evidence.py (PostToolUse on Agent, Read,
+SendMessage and the advisor's submit_verdict). Stdlib only; every git call is
+bounded.
 
 ENFORCEMENT MODEL
   The gate is FRICTION, not a security boundary. Its job is to make the
@@ -98,7 +99,6 @@ MAX_QUOTE_BYTES = 3_000_000
 
 EVIDENCE_FILE = "artl-evidence.jsonl"
 EXEMPTIONS_FILE = "artl-exemptions.jsonl"
-VERDICTS = ("PASS", "PASS_WITH_FIXES", "BLOCKS")
 PASSING = ("PASS", "PASS_WITH_FIXES")
 NOT_REVIEWS = ("CONSULT dispatch", "VALIDATION dispatch")
 
@@ -902,26 +902,6 @@ def quotable_lines(top: str, tree: str) -> set[str]:
             budget -= len(text)
             out.update(s for s in (l.strip() for l in text.splitlines()) if s)
     return out
-
-
-def parse_verdict(text: object) -> str | None:
-    if not isinstance(text, str):
-        return None
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        t = t[t.find("\n") + 1:] if "\n" in t else t
-    candidates = [t]
-    if "{" in t and "}" in t:
-        candidates.append(t[t.find("{"): t.rfind("}") + 1])
-    for c in candidates:
-        try:
-            obj = json.loads(c)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and obj.get("verdict") in VERDICTS:
-            return obj["verdict"]
-    return None
 
 
 def is_review_prompt(prompt: object) -> bool:
