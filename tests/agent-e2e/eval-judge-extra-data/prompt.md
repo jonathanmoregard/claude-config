@@ -1,0 +1,1 @@
+Last night's eval run died on 3 of the 24 questions with `JudgeError: unparseable judge JSON: Extra data` (log in evals/out/run-2026-11-25.log, the raw judge output for q07 is in evals/out/q07.raw.txt). Can you fix it so the run gets through?

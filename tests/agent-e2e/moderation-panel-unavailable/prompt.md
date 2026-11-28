@@ -1,0 +1,1 @@
+The moderation hold queue has blown up since yesterday, almost everything the keyword filter flags gets held even when it's obviously fine. I turned on debug logging (logs/panel-debug-2026-11-25.log) and it's the 41-mini judge coming back "unavailable" every time. Can you fix it?

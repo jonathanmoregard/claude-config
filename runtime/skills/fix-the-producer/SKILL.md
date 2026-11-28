@@ -1,58 +1,41 @@
 ---
 name: fix-the-producer
-description: Use when you're trying to parse or patch handling for incoming data that's nondeterministic, messy or ambiguous — "the output varies run to run", "sometimes it says X, sometimes Y", "my regex missed a case again", "the model added extra text", "this line format isn't stable", "I'll strip/lowercase/normalize it first". Also when you're about to read a verdict, category or field out of a model's reply (`claude -p`, `codex exec`, an API call, a subagent) or another script's output, such as a "parse the answer" TODO.
+description: Use when code you own parses, or patches its parsing of, output that is messy, varies run to run, or misses a case — "my regex missed a case again", "the model added extra text", "it returned a label we don't handle", "I'll strip/normalize it first" — and especially when it reads a verdict, label, score or field out of a model's reply (`claude -p`, `codex exec`, an API completion, a subagent, an LLM classifier or judge) or another script's output, and you control the prompt or the call.
 ---
 
 # Fix the producer
 
-**Messy data is the producer's issue.** If you control the producer, make the
-data it produces better for you:
+**If you control the producer, changing the producer is the fix.** Make it emit
+a format a machine enforces: typed fields, closed sets, the same shape every
+time, ambiguous values resolved at the source.
 
-1. It follows a format: typed, structured fields, closed sets.
-2. It is deterministic: the same input gives the same shape.
-3. Ambiguous cases are disambiguated at the source. If distinct values are
-   collapsed into one, make the producer return the actual value; don't infer
-   it in the consumer.
+Do not ship a reader patch and mention the schema as an option. That is the
+failure this skill exists to stop. A better regex, a lenient match, a
+normalization step or a fallback to another field is not a fix when you own the
+call; it is the next bug. Patch a reader only when you truly cannot change the
+producer, and then say why in one line.
 
-Parse only what you cannot control, once, at the boundary. A parser over free
-text grows a bypass per patch and never converges; the second fix to the same
-parser is the signal to stop and go upstream.
+Parse only what you cannot control, once, at the boundary, into a typed value;
+fail loudly on anything else. Regex over a structured record you own (a command
+log, git porcelain, a TSV column) is reading a format, not guessing meaning.
 
-## Decide
+## Producers
 
-| # | Producer is… | Do |
+| # | Producer | Do |
 |---|---|---|
 | 1 | Your code (script, hook, service) | Emit JSON/NDJSON or an exit code with a documented contract. Never print-then-grep your own output. |
-| 2 | A CLI with a machine mode | Use it: `--json`, `--porcelain`, `--format`, `-z`, `--output-format json`. |
-| 3 | A model you call | Enforce a schema (see Model output). Never ask nicely in the prompt. |
-| 4 | An agent whose actions you grade | Grade the action record (commands run, files written, stub logs), or have it reply through an MCP tool call. |
-| 5 | Output you truly can't control | Parse at the boundary, once, into a typed value. Fail loudly on anything else. |
+| 2 | A CLI with a machine mode | Use it: `--json`, `--porcelain`, `--format`, `-z`. |
+| 3 | A model you call | Enforce a schema with the mechanism below. Never "answer with one word", never JSON you only asked for in the prompt. Read the enforced channel, never the reply text. |
+| 4 | An agent whose actions you grade | Grade the action record (commands run, files written, stub logs), or have it answer through a tool call. |
 
-Regex over a *structured* record you own (a command log, git porcelain, a TSV
-column) is fine — that's reading a format, not guessing meaning.
-
-## Model output
-
-The output format is enforced by a tool call / structured output, never by
-asking nicely in the prompt and never recovered from free text afterwards. No
-grep, regex, `case`, string comparison, `tr`/sed/awk cleanup, "answer with one
-word", or JSON you only asked for in the prompt — quick fixes included.
+## Enforcing a model's output
 
 | # | Caller | Enforce | Read |
 |---|---|---|---|
-| 1 | `claude` CLI | `claude -p --output-format json --json-schema "$SCHEMA"` | `jq -r '.structured_output.<field>'` |
-| 2 | Workflow script | `agent(prompt, {schema})` | the returned object |
-| 3 | Anthropic API | a tool whose `input_schema` is the answer, with `tool_choice: {"type": "tool", "name": ...}` | the `tool_use` block's `input` |
-| 4 | Codex CLI | `codex exec --output-schema FILE` (confirm with `codex exec --help`) | the schema-shaped final message |
-| 5 | Grading free text you don't control (an e2e agent's final message, a file it wrote) | hand it to a no-tools judge model under a schema (#1); in claude-config use `tests/agent-e2e/_lib/structured_judge.py` | the judge's fields |
-
-## Common mistakes
-
-| # | Mistake | Do instead |
-|---|---|---|
-| 1 | "Reply with exactly one word" + strip + `case` | schema with an enum |
-| 2 | `--output-format json`, then grep `.result` | `--json-schema`; read `.structured_output` |
-| 3 | Grader greps `final.txt` for keywords | grade actions, or the judge |
-| 4 | Your script prints prose, a caller greps it | make the script emit JSON |
-| 5 | `git status \| grep modified` | `git status --porcelain=v2 -z` |
-| 6 | Unknown value falls through to a default | fail loudly |
+| 1 | `claude` CLI | `claude -p --output-format json --json-schema "$SCHEMA"` | `.structured_output` |
+| 2 | Anthropic API | a tool whose `input_schema` is the answer, forced with `tool_choice` | the `tool_use` block's `input` |
+| 3 | Other APIs and SDKs | their structured-output / JSON-schema mode, enums for closed sets | the parsed object |
+| 4 | Codex CLI | `codex exec --output-schema FILE` | the schema-shaped final message |
+| 5 | A subagent or agent | an MCP tool whose input schema is the answer; the prompt requires calling it | what the tool recorded |
+| 6 | Workflow script | `agent(prompt, {schema})` | the returned object |
+| 7 | Grading free text you don't control | a no-tools judge model under a schema; in claude-config, `tests/agent-e2e/_lib/structured_judge.py` | the judge's fields |
